@@ -1,0 +1,37 @@
+device_profile_id: ascend_910b
+generated_at: '2026-11-15T04:46:09+00:00'
+source: out/steady（4 个 Workload）
+notes:
+- 从 4 个 Workload 推导；计算类样本 16，搬运类样本 41
+- 标定只改阈值不改规则；CONFIRMED 仍需端到端验证（见 feedback）
+- 分位数取自同一批诊断数据（in-sample）：余量 <10% 的命中应视为 provisional，建议用留出数据或复采数据复核
+- host_* 两项来自 4 份 timeline.json（idle 样本 4，submit/busy 样本 4）
+thresholds:
+  compute_pipe_time_fraction_ceiling:
+    value: 0.05
+    unit: ratio
+    provenance: measured
+    basis: 搬运类算子的计算流水占比（未饱和上界）; p50=0.00, p75=0.02, max=0.83; n=41; 留一验证 stable
+  compute_pipe_time_fraction_saturated:
+    value: 0.95
+    unit: ratio
+    provenance: measured
+    basis: 计算类算子的计算流水占比; p50=0.87, p75=0.89, max=0.97; n=16; 留一验证 drift
+  mac_pipe_time_fraction_high:
+    value: 0.25
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子的 mac 流水占比 得 0.25（p50=0.19, p75=0.24, max=0.67; n=16），留一验证
+      unstable（最大漂移 700%），不作为实测值声称；Workload 数量增加后重标
+  memory_pipe_time_fraction_ceiling:
+    value: 0.6
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子的搬运流水占比（未饱和上界） 得 0.60（p50=0.58, p75=0.61, max=0.92; n=16），留一验证
+      unstable（最大漂移 433%），不作为实测值声称；Workload 数量增加后重标
+  memory_pipe_time_fraction_saturated:
+    value: 0.3
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：搬运类算子的搬运流水占比 得 0.30（p50=0.11, p75=0.26, max=0.82; n=41），留一验证 unstable（最大漂移
+      33%），不作为实测值声称；Workload 数量增加后重标

@@ -1,0 +1,55 @@
+# Workload 描述：Qwen3.5-35B-A3B / Ascend 910B x2 / Prefill / Graph
+#
+# 依据 $PROF_ROOT/qwen35-prefill-graph-noex/workload.log（2026-11-14 核对）：
+#   non-default args: dtype=bfloat16 seed=42 max_model_len=8192
+#                     tensor_parallel_size=2 max_num_seqs=32
+#                     enable_chunked_prefill=True enable_prefix_caching=False
+#   enforce_eager=False, compilation_config.mode=None,
+#   cudagraph_mode=FULL_AND_PIECEWISE(2), custom_ops=[]
+#   PROMPT_TOKENS 1024, LOAD_SECONDS 137.0
+#   vLLM 0.28.1.post1.dev143+gf18cf803c
+#   目录名 "noex" 表示 npugraph_ex 未启用
+workload_id: qwen35-35b-a3b-prefill-graph
+
+model:
+  name: Qwen3.5-35B-A3B
+  dtype: bfloat16
+  is_moe: true
+  architecture: Qwen3_5MoeForConditionalGeneration
+
+hardware:
+  device: Ascend 910B
+  device_count: 2
+  device_profile_id: ascend_910b
+
+execution:
+  phase: prefill
+  mode: graph
+  graph_mode: full_and_piecewise
+  npugraph_ex: false
+
+input:
+  batch_size: 1
+  input_length: 1024
+  output_length: 1
+  num_requests: 5
+  # 2026-11-15 统一补采：四组均为 32
+  max_num_seqs: 32
+  # 图捕获尺寸（脚本里 cudagraph_capture_sizes）
+  cudagraph_capture_sizes: [16, 32, 1024]
+  concurrency: 1
+
+environment:
+  vllm_version: 0.28.1.post1.dev143+gf18cf803c
+  vllm_ascend_commit: null
+  torch_version: null
+  cann_version: null
+
+verified: true
+notes:
+  - 与 prefill_eager 的差异只有 enforce_eager / cudagraph_mode 与 max_num_seqs
+  - 未启用 npugraph_ex（目录名 noex）
+labels:
+  stage: profiling
+  tp: "2"
+  export_dir: qwen35-prefill-graph-noex

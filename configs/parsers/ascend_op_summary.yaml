@@ -1,0 +1,186 @@
+# msprof 逐算子实例明细 CSV 的列映射（已与真实导出口径核对）
+#
+# 核对依据（2026-11-14，$PROF_ROOT/qwen35-prefill）：
+#   PROF_*/mindstudio_profiler_output/op_summary_*.csv（46 列，约 33600 行/Device）
+#
+# 已知口径（实测确认）：
+#   1. 每行 = 一次算子执行实例，所以 calls 由行数得到，duration 逐行求和。
+#   2. 只有本文件包含 HCCL 通信算子（hcom_allReduce_ / hcom_allGather_），
+#      其 Task Type = COMMUNICATION，通信时间即该任务时长。
+#   3. 大量单元格为 N/A（如 Context ID / Output Shapes），解析器一律视为未采集。
+#   4. AI Core 与 Vector 的流水时间分列（aic_* / aiv_*），同一条流水需要合并：
+#        aic_mte2_time + aiv_mte2_time -> mte2_time_us
+#   5. Task Wait Time 是排队/等待时长，逐实例求和后可跨流重叠，
+#      因此单独命名 task_wait_time_us，不与同步等待混用。
+#   6. cube_utilization(%) 取值 0~99.795，确认为百分比；多实例取算术平均。
+#
+# 与 op_statistic 的口径差异（实测）：
+#   sum(Task Duration) = 7.77s vs op_statistic Total Time = 5.41s，
+#   差值 ≈ hcom_allReduce_ 的 2.36s，即 op_statistic 缺少通信算子。
+
+parser: ascend_op_summary_csv
+parser_version: "0.2"
+needs_verification: false
+row_semantics: instance
+
+verified_against:
+  source: "PROF_000001_20261108093245157_*/mindstudio_profiler_output/op_summary_*.csv"
+  checked_on: "2026-11-14"
+  observed_columns: "46 列，含 Task Duration(us)/Task Wait Time(us)/aic_*/aiv_*/cube_utilization(%)"
+  # 2026-11-16 复核：2026-11-15 统一重采产物为 33 列精简格式
+  # （无 aic_mte*/aiv_vec_time/cube_utilization 分列，新增 Block Num/aic_cube_fops/aiv_vector_fops）；
+  # 旧 46 列专属的 extra_metrics 在新格式下自动缺失，不阻塞解析。
+
+csv:
+  delimiter: ","
+  encoding: utf-8
+
+aggregate:
+  # 与 op_statistic 保持同样的拆分口径：同名算子按 Task Type 再分，
+  # 否则 MatMulV3 的 AI_CORE 与 MIX_AIC 两种执行形态会被合并，跨文件对比失真
+  by: [operator, task_type_raw]
+
+labels:
+  task_type_raw:
+    names: ["Task Type"]
+  device_id:
+    names: ["Device_id"]
+
+columns:
+  operator:
+    names: ["OP Type"]
+    required: true
+  task_type:
+    names: ["Task Type"]
+  # 逐实例时长：聚合时求和
+  total_time_us:
+    names: ["Task Duration(us)"]
+    unit: us
+    required: true
+  shape:
+    names: ["Input Shapes"]
+  dtype:
+    names: ["Input Data Types"]
+  # 仅用于稳态窗口筛选，不进入算子记录
+  row_start_time:
+    names: ["Task Start Time(us)"]
+    unit: us
+
+extra_metrics:
+  - name: task_wait_time_us
+    columns: ["Task Wait Time(us)"]
+    unit: us
+    agg: sum
+  - name: aicore_time_us
+    columns: ["aicore_time(us)"]
+    unit: us
+    agg: sum
+  - name: mac_time_us
+    columns: ["aic_mac_time(us)"]
+    unit: us
+    agg: sum
+  - name: mte2_time_us
+    # 同一条搬运流水在 AI Core 与 Vector 上分列，必须相加
+    columns: ["aic_mte2_time(us)", "aiv_mte2_time(us)"]
+    unit: us
+    agg: sum
+    combine: sum
+  - name: vec_time_us
+    columns: ["aiv_vec_time(us)"]
+    unit: us
+    agg: sum
+  - name: mte3_time_us
+    columns: ["aiv_mte3_time(us)"]
+    unit: us
+    agg: sum
+  - name: mte1_time_us
+    columns: ["aic_mte1_time(us)"]
+    unit: us
+    agg: sum
+  - name: fixpipe_time_us
+    columns: ["aic_fixpipe_time(us)"]
+    unit: us
+    agg: sum
+  - name: scalar_time_us
+    # 标量流水同样分列在 AI Core / Vector 两侧
+    columns: ["aic_scalar_time(us)", "aiv_scalar_time(us)"]
+    unit: us
+    agg: sum
+    combine: sum
+  - name: cube_utilization
+    columns: ["cube_utilization(%)"]
+    unit: "%"
+    agg: mean
+  - name: communication_time_us
+    # 通信任务的设备时长就是通信时间；仅对 COMMUNICATION 行采集
+    columns: ["Task Duration(us)"]
+    unit: us
+    agg: sum
+    when:
+      task_type: [communication]
+  # -- 设备能力校准所需（2026-11-16 新增，33 列导出实测核对） ------------
+  # 2026-11-15 统一重采的导出为 33 列精简格式：只有 aicore_time/aiv_time
+  # 两条流水时间与 flops 计数，无 mte/mac/fixpipe 分列。
+  - name: block_num
+    # 每实例使用的 AI Core 块数；active_core_ratio = block_num / ai_core_count
+    columns: ["Block Num"]
+    unit: count
+    agg: mean
+  - name: flops
+    # Cube 浮点运算数，实测单位为 FLOPs（8192³ bf16 MatMul 与 micro-benchmark 对齐）
+    columns: ["aic_cube_fops"]
+    unit: flop
+    agg: sum
+  - name: vector_flops
+    # Vector 核运算数，单位 FLOPs（口径同上，未单独 micro-benchmark）
+    columns: ["aiv_vector_fops"]
+    unit: flop
+    agg: sum
+  - name: aiv_time_us
+    # Vector 流水时间；与 aicore_time 分别对应两种执行单元
+    columns: ["aiv_time(us)"]
+    unit: us
+    agg: sum
+  - name: bytes_moved
+    # 逐实例按 shape×dtype 估算搬运字节（读 input + 写 output，读写合计口径，
+    # 与设备档案 peak_hbm_gbps 的 1GiB copy 微基准一致）。
+    # 忽略 L2/片上缓存复用，是 HBM 流量的上界近似；动态维/未定义 dtype 的组跳过。
+    # 仅对 kernel 行采集：COMMUNICATION 行走链路不走 HBM，shape 也不代表搬移量。
+    computed: bytes_from_shapes
+    columns: ["Input Shapes", "Input Data Types", "Output Shapes", "Output Data Types"]
+    unit: b
+    agg: sum
+    when:
+      task_type: [kernel]
+  - name: bytes_moved_time_us
+    # 与 bytes_moved 配对的时长：只累计成功估算出字节的实例的任务时长，
+    # 保证 带宽 = bytes_moved / bytes_moved_time_us 的分子分母来自同一批实例
+    computed: bytes_time_for
+    columns: ["Task Duration(us)"]
+    unit: us
+    agg: sum
+    when:
+      task_type: [kernel]
+
+defaults:
+  task_type: kernel
+
+task_type_map:
+  AI_CORE: kernel
+  AI_VECTOR_CORE: kernel
+  MIX_AIC: kernel
+  MIX_AIV: kernel
+  DSA_SQE: other
+  COMMUNICATION: communication
+
+notes: |
+  - 本文件不做「图/即时」区分，Eager vs Graph 的差异要靠 Workload 描述与
+    Kernel 名称/数量变化体现，不能只看本文件。
+  - 逐实例明细是后续 Timeline / 关键路径分析的基础数据源。
+
+# 按行判定的布尔标记：Model ID 有效表示该任务在已捕获的图内执行。
+# eager 模式下该列恒为 4294967295，因此 in_graph_ratio 自然为 0。
+row_flags:
+  - name: in_graph
+    columns: ["Model ID"]
+    exclude_values: ["4294967295", "-1", "N/A"]

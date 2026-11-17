@@ -1,0 +1,53 @@
+# Workload 描述：Qwen3.5-35B-A3B / Ascend 910B x2 / Decode / Eager
+#
+# 依据 $PROF_ROOT/qwen35-decode/workload.log（2026-11-14 核对）：
+#   non-default args: dtype=bfloat16 seed=42 max_model_len=8192
+#                     tensor_parallel_size=2 enforce_eager=True
+#                     enable_chunked_prefill=True enable_prefix_caching=False
+#   PROMPT_TOKENS 1, LOAD_SECONDS 77.5
+#   vLLM 0.28.1.post1.dev143+gf18cf803c
+#   ACTIVE_ROUND 每轮约 17.4s
+workload_id: qwen35-35b-a3b-decode-eager
+
+model:
+  name: Qwen3.5-35B-A3B
+  dtype: bfloat16
+  is_moe: true
+  architecture: Qwen3_5MoeForConditionalGeneration
+
+hardware:
+  device: Ascend 910B
+  device_count: 2
+  device_profile_id: ascend_910b
+
+execution:
+  phase: decode
+  mode: eager
+  graph_mode: none
+  npugraph_ex: false
+
+input:
+  batch_size: 1
+  input_length: 1
+  # 每轮生成的 token 数未从日志确认
+  output_length: null
+  num_requests: 5
+  # 2026-11-15 统一补采：四组均显式设置 32
+  max_num_seqs: 32
+  # harness 每次 generate 只传 1 个 prompt（见 $NPU_STACK/*.py）
+  concurrency: 1
+
+environment:
+  vllm_version: 0.28.1.post1.dev143+gf18cf803c
+  vllm_ascend_commit: null
+  torch_version: null
+  cann_version: null
+
+verified: true
+notes:
+  - decode 的 op_summary 按 1e6 行切片，解析时需合并 slice
+  - output_length（每轮生成 token 数）未确认，保持 null
+labels:
+  stage: profiling
+  tp: "2"
+  export_dir: qwen35-decode

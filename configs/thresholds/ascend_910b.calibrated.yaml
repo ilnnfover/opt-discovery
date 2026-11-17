@@ -1,0 +1,73 @@
+device_profile_id: ascend_910b
+generated_at: '2026-11-16T01:57:43+00:00'
+source: out/steady-calib4（4 个 Workload）
+notes:
+- 从 4 个 Workload 推导；计算类样本 17，搬运类样本 0
+- 标定只改阈值不改规则；CONFIRMED 仍需端到端验证（见 feedback）
+- 分位数取自同一批诊断数据（in-sample）：余量 <10% 的命中应视为 provisional，建议用留出数据或复采数据复核
+- host_* 两项来自 4 份 timeline.json（idle 样本 4，submit/busy 样本 4）
+- 设备档案：peak_bf16=282.5 TFLOPS、ai_core_count=24、roofline=230.3 FLOP/Byte（micro-benchmark
+  实测）；aicore_utilization_* / low_core_ratio / arithmetic_intensity_low 由其标定
+- 带宽利用率基于 shape×dtype 字节估算（读写合计口径，忽略缓存复用，上界近似），峰值 1226.5 GB/s 来自 1GiB copy 微基准；待采集逐算子真实字节后复核
+- 2026-11-16 带宽阈值说明：bytes_moved 为 shape×dtype 估算（读写合计、忽略缓存复用），ZerosLike 等只写算子被高估约
+  2 倍，p90 撞夹取上限 1.0；该阈值为上界性质，采集逐算子真实 HBM 字节后应重标
+thresholds:
+  aicore_utilization_ceiling:
+    value: 0.1
+    unit: ratio
+    provenance: measured
+    basis: 搬运类算子 Cube 利用率（未饱和上界）; p50=0.10, p75=0.11, max=0.19; n=12; 留一验证 stable
+  aicore_utilization_saturated:
+    value: 0.55
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子 Cube 利用率（flops/aicore_time/实测峰值） 得 0.55（p50=0.11, p75=0.34,
+      max=0.88; n=17），留一验证 insufficient，不作为实测值声称；Workload 数量增加后重标
+  arithmetic_intensity_low:
+    value: 230.3
+    unit: ratio
+    provenance: measured
+    basis: 设备 roofline 拐点（micro-benchmark 实测 peak_flops / peak_bw）; peak_bf16_tflops=282.50;
+      n=0; 留一验证 stable
+  bandwidth_utilization_saturated:
+    value: 1.0
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：搬运类算子估算带宽利用率（shape 估算字节/时长/实测峰值，读写合计口径） 得 1.00（p50=0.21, p75=1.06,
+      max=48.61; n=39），留一验证 insufficient，不作为实测值声称；Workload 数量增加后重标
+  compute_pipe_time_fraction_ceiling:
+    value: 0.05
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：搬运类算子的计算流水占比（未饱和上界） 得 0.05（p50=0.00, p75=0.00, max=0.95; n=40），留一验证
+      unstable（最大漂移 67%），不作为实测值声称；Workload 数量增加后重标
+  compute_pipe_time_fraction_saturated:
+    value: 0.95
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子的计算流水占比 得 0.95（p50=0.88, p75=0.89, max=0.97; n=17），留一验证 unstable（最大漂移
+      46%），不作为实测值声称；Workload 数量增加后重标
+  low_core_ratio:
+    value: 0.95
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：kernel 算子活跃核占比（Block Num/24） 得 0.95（p50=0.97, p75=1.96, max=2.00;
+      n=208），留一验证 unstable（最大漂移 233%），不作为实测值声称；Workload 数量增加后重标
+  mac_pipe_time_fraction_high:
+    value: 0.25
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子的 mac 流水占比 得 0.25（p50=0.19, p75=0.24, max=0.67; n=16），留一验证
+      unstable（最大漂移 700%），不作为实测值声称；Workload 数量增加后重标
+  memory_pipe_time_fraction_ceiling:
+    value: 0.6
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：计算类算子的搬运流水占比（未饱和上界） 得 0.60（p50=0.58, p75=0.61, max=0.92; n=16），留一验证
+      unstable（最大漂移 433%），不作为实测值声称；Workload 数量增加后重标
+  memory_pipe_time_fraction_saturated:
+    value: 0.3
+    unit: ratio
+    provenance: declared
+    basis: 人工冻结为固定值：搬运类算子的搬运流水占比 得 0.30（p50=0.11, p75=0.26, max=0.82; n=41），留一验证 unstable（最大漂移
+      33%），不作为实测值声称；Workload 数量增加后重标

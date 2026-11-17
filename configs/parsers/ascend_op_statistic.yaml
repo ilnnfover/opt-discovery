@@ -1,0 +1,82 @@
+# msprof 算子统计 CSV 的列映射（已与真实导出口径核对）
+#
+# 核对依据（2026-11-14，$PROF_ROOT/qwen35-prefill）：
+#   PROF_*/mindstudio_profiler_output/op_statistic_*.csv
+#   表头：Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),
+#         Avg Time(us),Max Time(us),Ratio(%)
+#
+# 已知口径（实测确认，不要再用猜测覆盖）：
+#   1. 同一个 OP Type 会按 Core Type 拆成多行（例：MatMulV3 在 AI_CORE 717 次
+#      + MIX_AIC 54 次），因此必须按 operator+core_type 聚合，不能取单行。
+#   2. 该文件不包含 HCCL 通信算子（hcom_*），通信只出现在 op_summary /
+#      communication_statistic 中。用本文件算出的 time_share 分母是
+#      “AI Core 算子总时间”，不含通信。
+#   3. 没有 dtype / shape / Task Type 列，因此这些字段为 null。
+#
+# 若换用其他 CANN/Profiler 版本，请重新核对表头后修改 columns。
+
+parser: ascend_op_statistic_csv
+parser_version: "0.2"
+needs_verification: false
+row_semantics: aggregate
+
+verified_against:
+  source: "PROF_000001_20261108093245157_*/mindstudio_profiler_output/op_statistic_*.csv"
+  checked_on: "2026-11-14"
+  observed_columns: "Device_id,OP Type,Core Type,Count,Total Time(us),Min Time(us),Avg Time(us),Max Time(us),Ratio(%)"
+
+csv:
+  delimiter: ","
+  encoding: utf-8
+
+aggregate:
+  # operator 必须存在；core_type 来自 labels，用于区分同名的不同执行形态
+  by: [operator, core_type]
+
+labels:
+  core_type:
+    names: ["Core Type"]
+  device_id:
+    names: ["Device_id"]
+
+columns:
+  operator:
+    names: ["OP Type"]
+    required: true
+  calls:
+    names: ["Count"]
+    cast: int
+    required: true
+  total_time_us:
+    names: ["Total Time(us)"]
+    unit: us
+  min_time_us:
+    names: ["Min Time(us)"]
+    unit: us
+  max_time_us:
+    names: ["Max Time(us)"]
+    unit: us
+  # 平均时间不直接采用：聚合后由 total/calls 重新推导，避免二次平均
+  avg_time_us:
+    names: ["Avg Time(us)"]
+    unit: us
+  # 该文件没有 task_type 列，用 Core Type 反推任务类型
+  task_type:
+    names: ["Core Type"]
+
+defaults:
+  task_type: kernel
+
+task_type_map:
+  AI_CORE: kernel
+  AI_VECTOR_CORE: kernel
+  MIX_AIC: kernel
+  MIX_AIV: kernel
+  DSA_SQE: other
+  COMMUNICATION: communication
+
+notes: |
+  - Ratio(%) 是 Profiler 自算的占比，分母为本文件内所有行的累计时间之和；
+    本工具用 time_share = total / sum(total) 重新计算，可与该列交叉验证。
+  - 多 Device 导出（device_0/device_1）应分别解析为两个 Workload 视图，
+    当前不做跨 Device 合并，避免重复计数。

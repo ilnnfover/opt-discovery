@@ -1,0 +1,66 @@
+# 统一采集契约：消除历史四组的参数不一致。
+#
+# 唯一允许不同的变量（自变量）：
+#   execution.mode        eager | graph
+#   execution.graph_mode  none | full_and_piecewise
+#   input.output_length   1 (prefill) | 64 (decode)
+#
+# 其余全部由本文件固定；采集脚本会把它写进每组的 collection_manifest.json，
+# 供 check-runs 自动校验，不再依赖人工填 YAML。
+
+contract_id: qwen35-35b-a3b-910b-unified-v1
+purpose: 建立 Prefill/Decode × Eager/Graph 四组可比的干净基线
+
+fixed:
+  model_path: ${MODEL_PATH}   # 由环境变量提供（任意本地模型目录，需与 config.json 一致）
+  dtype: bfloat16
+  tensor_parallel_size: 2
+  seed: 42
+  max_model_len: 8192
+  gpu_memory_utilization: 0.85
+  max_num_seqs: 32                        # 关键：四组统一（历史仅 Graph 设了 32）
+  enable_prefix_caching: false
+  enable_chunked_prefill: true
+  warmup_rounds: 5
+  active_rounds: 5
+  window_rounds: [0, 1, 2, 3]
+  concurrency: 1                          # 每次 generate 只传 1 个 prompt
+  python: $VENV/vllm-ascend-npu/bin/python
+  temperature: 0.0
+
+# 清掉 ABBA/其它实验遗留的开关，避免"同一个模型、不同融合路径"混进对比
+unset_environment:
+  - VLLM_HUST_GDN_OUTPUT_NORM_FUSED
+  - VLLM_MSTX_PATCH
+  - VLLM_USE_BREAKABLE_CUDAGRAPH
+
+profiling:
+  msprof: /usr/local/Ascend/cann-9.1.0/bin/msprof
+  # 四组必须用同一套仪表；否则采集开销本身就是新变量
+  switches:
+    - --aic-metrics=ArithmeticUtilization
+    - --sys-hardware-mem=on
+  msproftx: "off"                           # 该开关在当前 CANN/驱动下未落 MsprofTx 表，先关掉
+  summary_format: csv
+
+runs:
+  - id: prefill-eager
+    harness: qwen35-prefill-only.py
+    output_length: 1
+    mode: eager
+    graph_mode: none
+  - id: prefill-graph
+    harness: qwen35-prefill-graph-noex.py
+    output_length: 1
+    mode: graph
+    graph_mode: full_and_piecewise
+  - id: decode-eager
+    harness: qwen35-decode-only.py
+    output_length: 64
+    mode: eager
+    graph_mode: none
+  - id: decode-graph
+    harness: qwen35-decode-graph-noex.py
+    output_length: 64
+    mode: graph
+    graph_mode: full_and_piecewise

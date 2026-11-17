@@ -1,0 +1,11 @@
+{
+  "device": "Ascend910B2",
+  "measured_at": "2026-11-15",
+  "method": "torch_npu 单卡 micro-benchmark（8192^3 bf16 MatMul / 1GiB HBM copy，各取中位数）",
+  "peak_bf16_tflops": 282.5,
+  "peak_hbm_gbps": 1226.5,
+  "peak_hbm_convention": "读写合计口径（1GiB copy 实际搬移 2GiB）；2026-11-16 卡释放后无法复测，该假设待卡可用后用两种口径分别计时复核",
+  "roofline_flop_per_byte": 230.3,
+  "ai_core_count_note": "实测 op_summary 的 Block Num 最大为 24，据此作为核数上限",
+  "ai_core_count": 24
+}

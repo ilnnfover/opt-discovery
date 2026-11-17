@@ -1,0 +1,291 @@
+# Bottleneck diagnosis rules v1 -- Ascend 910B (uncalibrated)
+#
+# 重要：本文件中的阈值全部是占位值（provenance: assumed），必须由目标设备上的
+# 基线采集或厂商文档标定后才能升级为 declared / measured。在此之前，规则引擎
+# 会把所有依赖阈值的结论限制在 hypothesis 级别。
+#
+# 规则约定：
+#   required    必要条件，全部满足（且全部指标已采集）才会产生候选
+#   supporting  支持性条件，只影响置信度，不单独成立结论
+#   missing_evidence  该规则还需要哪些指标才能升级结论
+
+version: 1
+device_profile_id: ascend_910b
+status: uncalibrated
+provenance_notes: |
+  所有阈值均为占位值，仅用于打通流水线与规则结构。
+  标定方式：在目标设备上运行基线算子集，记录实际耗时分位数与设备可达峰值，
+  再把对应阈值的 provenance 改为 declared/measured 并补充 basis。
+
+thresholds:
+  compute_pipe_time_fraction_saturated:
+    value: 0.85
+    unit: ratio
+    provenance: assumed
+    basis: 占位：AI Core 流水时间占比达到 85% 视为计算流水饱和
+  mac_pipe_time_fraction_high:
+    value: 0.70
+    unit: ratio
+    provenance: assumed
+    basis: 占位：MAC(Cube) 流水占比高于 70% 视为矩阵计算为主
+  memory_pipe_time_fraction_ceiling:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：搬运流水占比低于 50% 视为未成为主要流水
+  memory_pipe_time_fraction_saturated:
+    value: 0.75
+    unit: ratio
+    provenance: assumed
+    basis: 占位：搬运流水占比高于 75% 视为访存流水主导
+  aicore_utilization_saturated:
+    value: 0.80
+    unit: ratio
+    provenance: assumed
+    basis: 占位：相对设备峰值的计算利用率
+  aicore_utilization_ceiling:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：计算利用率低于 50% 视为计算未饱和
+  bandwidth_utilization_saturated:
+    value: 0.80
+    unit: ratio
+    provenance: assumed
+    basis: 占位：相对可达带宽的利用率
+  arithmetic_intensity_low:
+    value: 20.0
+    unit: flop/byte
+    provenance: assumed
+    basis: 占位：低于该算术强度时更可能访存受限，需结合设备 roofline 标定
+  host_overhead_ratio:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：Host 提交时间 / Device 执行时间
+  host_gap_ratio:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：提交到启动的间隙 / Device 执行时间
+  small_kernel_time_us:
+    value: 20.0
+    unit: us
+    provenance: assumed
+    basis: 占位：单次 Kernel 低于 20us 视为小算子
+  high_call_count:
+    value: 128
+    unit: count
+    provenance: assumed
+    basis: 占位：单 Workload 内调用次数阈值
+  sync_wait_ratio:
+    value: 0.30
+    unit: ratio
+    provenance: assumed
+    basis: 占位：同步等待 / Device 执行时间
+  communication_share_threshold:
+    value: 0.20
+    unit: ratio
+    provenance: assumed
+    basis: 占位：通信任务累计时间占设备侧累计时间的比例
+  compute_pipe_time_fraction_ceiling:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：计算类流水占比低于该值时视为计算未饱和
+  low_core_ratio:
+    value: 0.50
+    unit: ratio
+    provenance: assumed
+    basis: 占位：活跃核比例
+
+rules:
+  - id: compute_bound.pipe_dominant
+    bottleneck: compute_bound
+    description: 计算类流水（AI Core 或 Vector）占比高，且搬运流水占比不高
+    applies_to:
+      task_type: [kernel]
+    required:
+      # 用组合指标而不是某一条具体流水：同一算子可能跑在 AI Core 或 Vector 上
+      - {fact: compute_pipe_time_fraction, op: ">=", threshold: compute_pipe_time_fraction_saturated}
+    supporting:
+      - {fact: mac_time_fraction, op: ">=", threshold: mac_pipe_time_fraction_high}
+      - {fact: memory_pipe_time_fraction, op: "<=", threshold: memory_pipe_time_fraction_ceiling}
+    missing_evidence:
+      - {fact: aicore_utilization, why: "流水时间占比无法说明相对峰值的利用率", how: "采集带峰值标定的硬件指标，或补充 flops/bytes 计算 roofline"}
+      - {fact: flops, why: "缺少运算量无法计算算术强度", how: "由算子 Shape 与 dtype 推导（需在 parser 中显式实现并标记 derived）"}
+    suggested_actions:
+      - 检查 Tiling 与 Cube 指令利用率是否匹配算子的 K 维对齐情况
+      - 确认 dtype 与 Cube 计算形状是否产生额外类型转换
+      - 评估算子融合以减少重复计算与中间结果
+    caveats:
+      - 流水时间占比是占算子自身任务时长的比例，不等于相对设备峰值的利用率
+
+  - id: compute_bound.peak_utilization_saturated
+    bottleneck: compute_bound
+    description: 相对设备峰值的计算利用率已接近饱和
+    applies_to:
+      task_type: [kernel]
+    required:
+      - {fact: aicore_utilization, op: ">=", threshold: aicore_utilization_saturated}
+    supporting:
+      - {fact: mte2_time_fraction, op: "<=", threshold: memory_pipe_time_fraction_ceiling}
+    suggested_actions:
+      - 优先考虑算法层面减少计算量（如低精度、结构化稀疏），而不是继续调 Tiling
+    caveats:
+      - aicore_utilization 必须来自已校准的采集源，否则该结论无效
+
+  - id: memory_bound.bandwidth_saturated
+    bottleneck: memory_bound
+    description: 实测带宽利用率接近可达带宽，且计算利用率不高
+    required:
+      - {fact: memory_bandwidth_utilization, op: ">=", threshold: bandwidth_utilization_saturated}
+    supporting:
+      - {fact: aicore_utilization, op: "<=", threshold: aicore_utilization_ceiling}
+    missing_evidence:
+      - {fact: bytes_moved, why: "缺少实际搬运量无法判断带宽是否被有效利用", how: "由 Shape/dtype 推导或采集 MTE 相关计数"}
+    suggested_actions:
+      - 检查访存是否连续、是否可合并
+      - 检查是否存在冗余读写或中间 Tensor 落盘
+      - 评估融合以减少重复加载
+    caveats:
+      - 带宽利用率低不代表不是访存受限，可能是访问不连续或并行度不足
+
+  - id: memory_bound.memory_pipe_dominant
+    bottleneck: memory_bound
+    description: 搬运类流水（MTE1/MTE2/MTE3 取最大）占比高，计算流水占比低
+    applies_to:
+      task_type: [kernel]
+    required:
+      # 用组合指标：不同任务类型的搬运可能落在 MTE1/MTE2/MTE3 上
+      - {fact: memory_pipe_time_fraction, op: ">=", threshold: memory_pipe_time_fraction_saturated}
+    supporting:
+      - {fact: compute_pipe_time_fraction, op: "<=", threshold: compute_pipe_time_fraction_ceiling}
+    missing_evidence:
+      - {fact: memory_bandwidth_utilization, why: "搬运流水繁忙不等于带宽饱和", how: "采集带峰值标定的带宽指标，或统计实际搬运字节数"}
+    suggested_actions:
+      - 检查是否存在小粒度搬运导致指令开销偏高
+      - 检查数据布局是否要求额外 Layout 转换
+    caveats:
+      - 搬运流水占比高可能来自布局转换而非有效数据搬运
+
+  - id: memory_bound.low_arithmetic_intensity
+    bottleneck: memory_bound
+    description: 算术强度低于阈值，理论上访存受限
+    applies_to:
+      task_type: [kernel]
+    required:
+      - {fact: arithmetic_intensity, op: "<=", threshold: arithmetic_intensity_low}
+    suggested_actions:
+      - 评估算子融合以提高算术强度
+      - 检查是否可以用更低精度减少搬运量
+    caveats:
+      - 需要 flops 与 bytes_moved 同时可用；缺失时该规则应报告为无法判定
+
+  - id: launch_bound.host_submit_dominant
+    bottleneck: launch_bound
+    description: Host 提交时间显著高于 Device 执行时间
+    applies_to:
+      task_type: [kernel]
+    required:
+      - {fact: cpu_submit_over_device, op: ">=", threshold: host_overhead_ratio}
+    supporting:
+      - {fact: avg_time_us, op: "<=", threshold: small_kernel_time_us}
+      - {fact: calls, op: ">=", threshold: high_call_count}
+      - {fact: is_kernel, op: is_true}
+    suggested_actions:
+      - 评估 Graph 执行路径（FULL / PIECEWISE）对该执行阶段的覆盖
+      - 评估相邻小算子融合，减少下发次数
+      - 检查 Python 侧循环与同步点是否产生额外提交
+    caveats:
+      - 提交时间与 Kernel 执行时间可能重叠，需要 Timeline 才能确认是否在关键路径
+
+  - id: launch_bound.small_kernel_many_calls
+    bottleneck: launch_bound
+    description: 大量小算子，疑似下发开销主导（仅假设，未验证）
+    allow_hypothesis_only: true
+    applies_to:
+      task_type: [kernel]
+    supporting:
+      - {fact: calls, op: ">=", threshold: high_call_count}
+      - {fact: avg_time_us, op: "<=", threshold: small_kernel_time_us}
+      - {fact: is_kernel, op: is_true}
+    missing_evidence:
+      - {fact: cpu_submit_time_us, why: "小算子多不等于下发受限，必须看 Host 侧提交耗时", how: "需要 Host 侧算子提交事件（Timeline / host profiling）"}
+      - {fact: host_gap_us, why: "需要确认提交与启动之间是否存在间隙", how: "Timeline 中对比提交事件与 Kernel 开始事件"}
+    suggested_actions:
+      - 先补采 Host 侧时间线，再决定是否走 Graph 或融合
+    caveats:
+      - Kernel 很短不等于 Launch-bound，本规则只能产生假设
+
+  - id: launch_bound.host_gap_dominant
+    bottleneck: launch_bound
+    description: 提交到启动的间隙显著，疑似下发链路排队
+    applies_to:
+      task_type: [kernel]
+    required:
+      - {fact: host_gap_over_device, op: ">=", threshold: host_gap_ratio}
+    missing_evidence:
+      - {fact: cpu_submit_time_us, why: "间隙可能来自排队或同步，需要提交耗时区分", how: "Timeline 采集 Host 提交事件"}
+    suggested_actions:
+      - 检查是否存在单线程提交瓶颈
+      - 检查是否被同步点阻塞
+    caveats:
+      - 间隙可能是设备侧排队，不一定是 Host 问题
+
+  - id: synchronization_bound.wait_dominant
+    bottleneck: synchronization_bound
+    description: 同步等待时间相对 Device 执行时间偏高
+    required:
+      - {fact: sync_wait_over_device, op: ">=", threshold: sync_wait_ratio}
+    supporting:
+      - {fact: aicore_time_fraction, op: "<=", threshold: aicore_utilization_ceiling}
+    missing_evidence:
+      - {fact: wait_time_us, why: "需要区分同步等待与其他等待", how: "Timeline 中统计 Event/Barrier 等待区间"}
+    suggested_actions:
+      - 检查 Stream/Event 依赖是否可放宽
+      - 检查是否可以用异步拷贝或计算通信重叠消除等待
+    caveats:
+      - 等待可能来自上下游依赖，而不是同步原语本身
+
+  - id: parallelism_bound.low_core_occupancy
+    bottleneck: parallelism_bound
+    description: 活跃核比例低，任务划分未占满设备
+    applies_to:
+      task_type: [kernel]
+    required:
+      - {fact: active_core_ratio, op: "<=", threshold: low_core_ratio}
+    supporting:
+      - {fact: is_kernel, op: is_true}
+    missing_evidence:
+      - {fact: aicore_time_fraction, why: "需要确认是否同时存在计算流水空闲", how: "采集各流水时间列"}
+    suggested_actions:
+      - 检查 Tiling 的核数与 Tile Size 是否匹配当前 Shape
+      - 检查是否需要合并小任务或调整切分维度
+    caveats:
+      - 小 Shape 下活跃核低可能是合理现象，需结合 Shape 判断
+
+  - id: communication_bound.share_dominant
+    bottleneck: communication_bound
+    description: 通信任务累计时间占设备侧累计时间的比例高
+    # 只有被归类为 communication 的任务才评估通信规则，否则每个 Kernel 都会因
+    # 「未采集通信指标」而被记为 blocked，产生噪声。
+    # 若你的 Profiler 把通信记录为 Kernel 任务，请在列映射的 task_type_map 中修正。
+    #
+    # 用 time_share 而不是 communication/device 比值：对纯通信任务来说
+    # “通信时间/自身时长”恒等于 1，没有信息量；有信息量的是它占全局的比例。
+    applies_to:
+      task_type: [communication]
+    required:
+      - {fact: time_share, op: ">=", threshold: communication_share_threshold}
+    supporting:
+      - {fact: task_wait_over_device, op: ">=", threshold: host_overhead_ratio}
+    missing_evidence:
+      - {fact: communication_over_device, why: "需要确认通信是否与计算重叠、是否计入等待", how: "采集 Timeline 中通信算子与计算算子的时间区间"}
+    suggested_actions:
+      - 评估通信与计算重叠（分桶、异步流水）
+      - 检查通信算法与分桶大小是否匹配拓扑
+      - 确认 TP 通信是否能与前序计算重叠（需 Timeline 验证）
+    caveats:
+      - time_share 的分母是本次解析到的记录累计时间；op_statistic 不含通信算子，用该文件时本规则不适用
+      - 通信占比高不等于一定可优化，需先用 Timeline 确认是否已与计算重叠
