@@ -7,7 +7,7 @@ whose total time is unknown is reported with ``share=None`` instead of 0.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 from ..schemas.operator import OperatorTable
 
@@ -112,26 +112,26 @@ def hotspot_matrix(
         selected = []
         seen: set[str] = set()
         for workload_id in workload_ids:
-            for hotspot in list(per_workload[workload_id].values())[:top]:
-                if hotspot.operator not in seen:
-                    seen.add(hotspot.operator)
-                    selected.append(hotspot.operator)
+            for top_hotspot in list(per_workload[workload_id].values())[:top]:
+                if top_hotspot.operator not in seen:
+                    seen.add(top_hotspot.operator)
+                    selected.append(top_hotspot.operator)
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     for operator in selected:
-        row = {"operator": operator, "workloads": {}}
+        cells: dict[str, dict[str, Any] | None] = {}
         for workload_id in workload_ids:
-            hotspot = per_workload[workload_id].get(operator)
-            row["workloads"][workload_id] = (
+            found = per_workload[workload_id].get(operator)
+            cells[workload_id] = (
                 {
-                    "share": hotspot.share,
-                    "calls": hotspot.calls,
-                    "avg_us": hotspot.avg_us,
+                    "share": found.share,
+                    "calls": found.calls,
+                    "avg_us": found.avg_us,
                 }
-                if hotspot
+                if found is not None
                 else None
             )
-        rows.append(row)
+        rows.append({"operator": operator, "workloads": cells})
     return {
         "workloads": workload_ids,
         "rows": rows,

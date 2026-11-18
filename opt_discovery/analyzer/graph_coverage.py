@@ -112,8 +112,8 @@ def summarize_coverage(table: OperatorTable, *, top: int = 8) -> GraphCoverage:
             continue  # 该表不是从 op_summary 解析的，没有图标记
         calls = record.calls
         tasks_in = int(flag.value)
-        time_in = (record.extra.get("in_graph_time_us").value
-                   if record.extra.get("in_graph_time_us") else 0.0)
+        in_graph_time = record.extra.get("in_graph_time_us")
+        time_in = in_graph_time.value if in_graph_time is not None else 0.0
         duration = record.total_time_us.value if record.total_time_us else 0.0
         total_calls += calls
         in_graph += tasks_in

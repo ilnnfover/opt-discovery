@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeVar
 
 import yaml
 
@@ -57,13 +57,17 @@ class GraphMode(str, Enum):
     UNKNOWN = "unknown"
 
 
-def _enum_or_unknown(enum_cls: type[Enum], raw: Any) -> Any:
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+
+def _enum_or_unknown(enum_cls: type[_EnumT], raw: Any) -> _EnumT:
+    """枚举解析失败的显式回退：所有 workload 枚举都带 ``unknown`` 成员。"""
     if raw is None:
-        return enum_cls.UNKNOWN
+        return enum_cls("unknown")
     try:
         return enum_cls(str(raw).strip().lower())
     except ValueError:
-        return enum_cls.UNKNOWN
+        return enum_cls("unknown")
 
 
 def _optional_int(raw: Any, name: str) -> int | None:

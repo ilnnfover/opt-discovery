@@ -152,9 +152,6 @@ class SourceIndex:
         if not lookup:
             return {}
 
-        pattern = re.compile(
-            "|".join(re.escape(item) for item in sorted(lookup, key=len, reverse=True))
-        )
         results = {op: self._empty_result(op) for op in names}
         resolved_by_binding: set[str] = set()
         if self.bindings is not None:

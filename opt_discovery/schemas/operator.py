@@ -204,7 +204,9 @@ class ParseMeta:
     unmapped_columns: tuple[str, ...] = ()
     missing_columns: tuple[str, ...] = ()
     is_synthetic: bool = False
-    extra: Mapping[str, Any] = field(default_factory=dict)
+    #: 解析器附加的结构化审计信息（窗口质量、文件切片、通信量等）。
+    #: 使用 dict 而非 Mapping：解析器需要在其上增量写入（见 csv_mapping.parse）。
+    extra: dict[str, Any] = field(default_factory=dict)
 
     #: 同一 code 最多保留的告警数，避免逐行告警淹没报告
     WARNINGS_PER_CODE = 50

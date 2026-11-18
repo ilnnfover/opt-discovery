@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 from ..schemas.operator import OperatorTable
 from ..schemas.workload import WorkloadSpec
 
-__all__ = ["ParserError", "OperatorParser", "ParserCapabilities", "BaseParser"]
+__all__ = ["ParserError", "OperatorParser", "ParserCapabilities"]
 
 
 class ParserError(RuntimeError):

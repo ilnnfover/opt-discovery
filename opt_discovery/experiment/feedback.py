@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..schemas.evidence import ConfidenceLevel, LEVEL_CAP
+from ..schemas.evidence import LEVEL_CAP, ConfidenceLevel
 from ..schemas.opportunity import Opportunity, OpportunityStatus, PriorityScore
 
 __all__ = ["FeedbackResult", "apply_feedback", "load_comparison"]

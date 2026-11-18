@@ -7,10 +7,9 @@ stable without depending on a machine-specific export.
 
 from __future__ import annotations
 
+import pytest
 import yaml
 from conftest import REPO_ROOT
-
-import pytest
 
 from opt_discovery.diagnosis.facts import build_facts
 from opt_discovery.parsers.base import ParserError
@@ -85,6 +84,8 @@ def _instance_payload() -> dict:
                 "columns": ["Task Duration(us)"],
                 "unit": "us",
                 "agg": "sum",
+                # 与官方 mapping 一致：COMMUNICATION 行的 Task Duration 是 ns
+                "scale": 0.001,
                 "when": {"task_type": ["communication"]},
             },
         ],
@@ -209,7 +210,9 @@ def test_instance_rows_are_counted_and_summed(tmp_path, workload):
 
     comm = by_op["hcom_allReduce_"]
     assert comm.task_type is TaskType.COMMUNICATION
-    assert comm.extra["communication_time_us"].value == pytest.approx(600.0)
+    # 源列 600 在 COMMUNICATION 行是 ns -> 0.6 µs（与 total_time_us 同一换算，只做一次）
+    assert comm.extra["communication_time_us"].value == pytest.approx(0.6)
+    assert comm.total_time_us.value == pytest.approx(0.6)
     assert comm.shape is None  # N/A 视为未采集
 
 

@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 
 from opt_discovery.schemas.metrics import Metric, Provenance, weakest_provenance
-from opt_discovery.schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskType
+from opt_discovery.schemas.operator import (
+    OperatorRecord,
+    OperatorSchemaError,
+    OperatorTable,
+    ParseMeta,
+    TaskType,
+)
 from opt_discovery.schemas.units import UnitError, to_bytes, to_ratio, to_us
 from opt_discovery.schemas.workload import WorkloadError, WorkloadSpec
 
@@ -56,13 +62,13 @@ def test_operator_record_derives_avg_and_normalizes_unit():
 
 
 def test_operator_record_rejects_bad_calls():
-    with pytest.raises(Exception):
+    with pytest.raises(OperatorSchemaError):
         OperatorRecord(workload_id="wl", operator="Add", calls=-1)
 
 
 def test_operator_table_rejects_workload_mismatch(workload):
     record = OperatorRecord(workload_id="other", operator="Add", calls=1)
-    with pytest.raises(Exception):
+    with pytest.raises(OperatorSchemaError):
         OperatorTable(workload=workload, records=[record], meta=ParseMeta(parser="t"))
 
 

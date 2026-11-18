@@ -194,7 +194,7 @@ class Opportunity:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Opportunity":
-        known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
+        known = set(cls.__dataclass_fields__)
         plan = data.get("validation_plan")
         scores = data.get("scores")
         return cls(

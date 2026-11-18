@@ -399,16 +399,41 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                119 个用例（含 15 个真实数据集成用例，缺数据自动 skip）
+tests/                230 个用例（213 个 CPU 用例，含 2 个 strict xfail 缺口 + 17 个真实数据集成用例）
+tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
 ## 开发
 
 ```bash
-python -m pytest -q            # 104 passed, 15 skipped（真实数据集成用例缺数据自动跳过）
-python -m opt_discovery.cli validate    # 规则/阈值/Workload/列映射自检
-python -m opt_discovery.cli demo        # 合成数据跑通全链路（不代表真实性能）
+# 全新 CPU 环境：安装开发依赖（Python >=3.10，CI 覆盖 3.10 / 3.12）
+python -m pip install -e ".[dev]"
+
+make check        # ruff + mypy + CLI validate（无需 NPU / 真实数据）
+make verify       # 普通测试 + 回归 + synthetic demo
+make verify-real  # 真实数据回归；缺数据打印 BLOCKED 且退出码 2（不是 PASS）
+
+# 干净环境验证：复制工作树 + 新建 venv + 从零安装 + 全部检查
+make clean-env-check PYTHON=python3        # 默认解释器
+make clean-env-check PYTHON=python3.10     # 最低支持版本
+# 本机没有 3.10 时：python -m pip install uv && uv python install 3.10
 ```
+
+底层命令仍可单独执行：
+
+```bash
+python -m pytest -q                      # 211 passed, 17 skipped, 2 xfailed（缺真实导出时）
+python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
+python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
+python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
+python -m opt_discovery.cli demo         # 合成数据跑通全链路（不代表真实性能）
+```
+
+`verify-real` 需要设置 `OPT_DISCOVERY_DATA_ROOT` 指向四组统一补采的根目录；目录不全会
+直接 `BLOCKED`。判定基于 pytest 的 `--junitxml` 结构化计数（不解析文本摘要）：全部/部分用例
+skip 时退出码为 3，未收集到用例或失败为 1，绝不把跳过显示为 PASS。CI 用
+`--expect-blocked` 断言「缺数据时必须 BLOCKED」（内部状态判定，与 pytest 退出码 2 解耦）。
+回归矩阵（历史问题 → 测试节点 → 独立预期）见 `docs/engineering/regression-matrix.md`。
 
 加一个 Workload：在 `configs/workloads/<model>/` 放 YAML，填 `labels.export_dir`，
 填完采集条件后置 `verified: true`（未核对的组会被判"不可比"）。

@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 out/
 
 # profiler 导出的临时产物（MSTX 探针等）

@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from ..schemas.bottleneck import BottleneckType
 from ..schemas.evidence import (
     LEVEL_CAP,
     ConfidenceLevel,

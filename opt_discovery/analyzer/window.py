@@ -23,7 +23,7 @@ __all__ = [
     "WindowError",
     "select_rounds_window",
     "DEFAULT_MAX_GAP_US",
-    "DEFAULT_MAX_UNDERFEED",
+    "DEFAULT_MIN_BUSY_RATIO",
 ]
 
 #: 窗口内允许的最大空闲空洞；超过则判定窗口质量下降
