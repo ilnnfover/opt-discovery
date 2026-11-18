@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -175,16 +176,17 @@ def new_run_id(prefix: str = "run") -> str:
     return f"{prefix}-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def sha256_of(path: Path) -> str:
+def sha256_of(path: str | Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def artifact_record(path: Path, root: Path, label: str | None = None) -> dict[str, Any]:
-    relative = path.resolve().relative_to(root.resolve()).as_posix()
+    # 清单可以放在输出目录之外；用相对路径（允许 ../）保持可校验且不泄露绝对路径
+    relative = os.path.relpath(path.resolve(), root.resolve()).replace(os.sep, "/")
     return {
         "name": label or relative,
         "path": relative,
@@ -219,11 +221,28 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
 
 
 def verify_manifest(path: str | Path) -> list[str]:
-    """校验清单里的产物仍然存在且哈希一致；返回问题列表（空表示通过）。"""
+    """校验清单结构与产物哈希；返回问题列表（空表示通过）。
+
+    结构不合法（空 JSON、版本/状态缺失、artifacts 不是列表）同样返回问题，
+    不能因为“没有可校验的产物”就当作通过。
+    """
     manifest_path = Path(path)
     payload = read_manifest(manifest_path)
     root = manifest_path.parent
     problems: list[str] = []
+
+    if not isinstance(payload, dict):
+        return [f"清单不是 JSON 对象: {type(payload).__name__}"]
+    if str(payload.get("schema_version")) != SCHEMA_VERSION:
+        problems.append(f"schema_version 不是 {SCHEMA_VERSION}: {payload.get('schema_version')!r}")
+    if payload.get("status") not in STATUSES:
+        problems.append(f"status 不合法: {payload.get('status')!r}")
+    if not payload.get("run_id"):
+        problems.append("缺少 run_id")
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        problems.append("artifacts 不是列表")
+        return problems
     for item in payload.get("artifacts") or ():
         relative = item.get("path")
         if not relative:

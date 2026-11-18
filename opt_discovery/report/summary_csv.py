@@ -146,15 +146,25 @@ def _operator_rows(workload_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def write_summaries(out_dir: str | Path) -> tuple[Path, Path]:
-    """Read an ``analyze`` output directory and write both CSV files."""
+def write_summaries(
+    out_dir: str | Path, *, include: set[str] | None = None
+) -> tuple[Path, Path]:
+    """Read an ``analyze`` output directory and write both CSV files.
+
+    ``include``：只统计本次运行成功写出的 workload 目录（避免复用输出目录时
+    把上一次的旧 workload 行混进本轮 CSV）。
+    """
     root = Path(out_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"{root}: 目录不存在")
 
     workload_rows: list[dict[str, Any]] = []
     operator_rows: list[dict[str, Any]] = []
-    for workload_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+    for workload_dir in sorted(
+        p
+        for p in root.iterdir()
+        if p.is_dir() and (include is None or p.name in include)
+    ):
         row = _workload_row(workload_dir)
         if row is not None:
             workload_rows.append(row)

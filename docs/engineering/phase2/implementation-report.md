@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**222 passed, 17 skipped**（239 用例，无 xfail）。
+全量：**236 passed, 17 skipped**（253 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 222 passed, 17 skipped（239 用例） |
-| `python -m pytest tests/regression` | 0 | 61 passed |
+| `python -m pytest` | 0 | 236 passed, 17 skipped（253 用例） |
+| `python -m pytest tests/regression` | 0 | 66 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 222 passed, 17 skipped |
+| 3.11 全量 | 0 | 236 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -194,3 +194,24 @@ if blocking_flags:
 | 分支 | `feat/ae-03-run-contract`（基于 `main` @ `e7d8aae`） |
 | 提交 | 见 `git log -1`（独立提交，不混入 AE-00~AE-02 历史） |
 | 远程 | 未 push（待确认） |
+
+## 10. 复审问题修复（2026-11-19）
+
+复审报告：`docs/engineering/phase2/review-report.md`（FAIL）。逐项处置：
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1-1 | strict 假成功：缺日志/缺导出/timeline 缺 DB 仍 success | 按 workload YAML 枚举应存在的导出（`missing_export`）；缺日志 `missing_run_log`、窗口/rank `window_or_rank`、缺 DB `timeline:missing_db` 均计入 partial；无导出时 parse 阶段 `not_requested`；状态从阶段结果派生 | `test_missing_workload_log_...`、`test_missing_export_dir_...`、`test_failed_timeline_...` |
+| P1-2 | rank 期望值取自“发现的 rank”，多 rank/部分 DB 未覆盖 | `expected_ranks = hardware.device_count`；声明与实际不符 → `rank_merge_unverified`（blocking）；任一 rank 解析问题保留；>2 rank 逐一与基线比较；部分 DB → `rank_timeline_incomplete`（blocking） | `test_declared_tp_rank_missing_...`、`test_partial_timeline_db_...`、`test_more_than_two_ranks_...` |
+| P1-3 | 比较入口绕过采集契约 | `compare_tables` 内嵌 `compare_contracts`（与 `check-runs` 同一实现）；`incomparable` → `comparable=False` + 原因，strict 退出 4 | `test_contract_mismatch_blocks_compare`、`test_incomparable_analysis_returns_4` |
+| P1-4 | 不可比仍输出 `total_ratio` 与终端比值 | `to_dict` 仅在 `comparable=True` 时给 `total_ratio`；`_fmt_ratio` 不可比返回 `-` | `test_incomparable_analysis_returns_4`（JSON + `total_ratio=-`） |
+| P1-5 | 旧 timeline/旧 workload 进入本轮清单与 CSV | 产物只登记**本轮实际写出**的路径；`write_summaries(include=selected_ids)` 只汇总本轮成功 workload | `test_reused_output_dir_does_not_masquerade_old_artifacts`（真实同名 timeline + 缺日志第二轮） |
+| P1-6 | 配置/写出失败后保留旧 success 清单 | 配置加载、诊断、写出、比较各自结算；失败必写本轮 failed/partial 清单（覆盖旧 run_id） | `test_config_failure_replaces_previous_success_manifest`、`test_artifact_write_failure_is_settled`、`test_parse_error_details_are_redacted` |
+| P1-7 | 非法 severity 被静默丢弃 | `parse_meta_flags` 返回问题列表；存在但不可解析 → `quality_flag_invalid`（blocking）；缺 severity 的已知阻断码按 blocking | `test_invalid_quality_flag_is_blocking`、`test_known_blocking_code_without_severity_is_blocking` |
+| P2-1 | manifest 写在输出目录外时校验失败；空 JSON 返回 0 | 产物路径改为相对**清单父目录**（允许 `../`）；`verify_manifest` 校验 schema_version/status/run_id/artifacts 结构 | `test_custom_manifest_path_outside_out_dir_is_verifiable`、`test_empty_manifest_is_rejected` |
+| P2-2 | 输入指纹不足、错误详情含绝对路径 | compare 记录 `a/b` 的 sha256；analyze 指纹覆盖 workload YAML/映射/规则/阈值/设备档案；错误详情把数据根/工作目录替换为 `<path>` | `test_compare_cli_strict_refuses_incomparable`（sha256）、`test_parse_error_details_are_redacted` |
+| P2-3 | 质量测试手工挂标记，未锁定传播 | 新增 `test_quality_end_to_end.py`：真实 CSV+log+db → analyze → 落盘 JSON → 独立 compare 读盘并退出 4 | `test_rank_and_duration_flags_propagate_to_compare` |
+| P3-1 | `quality_flags` 插在旧字段中间，位置参数有风险 | 移到 `ComparisonReport` 末尾（`generated_at` 之后）；仓库内构造均为关键字参数 | 全部 compare 测试 |
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **236 passed, 17 skipped**（253 用例，66 个回归）；
+真实数据 16 passed / 1 skipped；`verify-real --expect-blocked` 0。

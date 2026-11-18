@@ -22,6 +22,7 @@ from ..schemas.quality import (
     RANK_MERGE_INCONSISTENT,
     RANK_MERGE_UNVERIFIED,
     RANK_SCOPE_MISMATCH,
+    RANK_TIMELINE_INCOMPLETE,
     QualityFlag,
 )
 
@@ -128,32 +129,16 @@ def unverified_flags(
     )
 
 
-def assess_rank_tables(
-    tables: Mapping[int, OperatorTable],
-    sources: Mapping[int, str],
-    scopes: Mapping[int, str],
-) -> RankMergeAssessment:
-    """按历史 CLI 口径比较前两个 rank（同口径比 calls/total，跨口径比单次耗时）。"""
-    ranks = tuple(sorted(tables))[:2]
-    base, peer = tables[ranks[0]], tables[ranks[1]]
+def _pair_rows_and_ratios(
+    base: OperatorTable,
+    peer: OperatorTable,
+    *,
+    same_scope: bool,
+) -> tuple[list[RankRow], float | None, float | None, float | None]:
     total_base = base.total_operator_time_us() or 0.0
     total_peer = peer.total_operator_time_us() or 0.0
     calls_base = sum(record.calls for record in base.records)
     calls_peer = sum(record.calls for record in peer.records)
-    same_scope = scopes[ranks[0]] == scopes[ranks[1]]
-
-    digests = tuple(
-        RankDigest(
-            rank=index,
-            source=sources[index],
-            scope=scopes[index],
-            records=len(tables[index].records),
-            calls=sum(record.calls for record in tables[index].records),
-            total_us=tables[index].total_operator_time_us() or 0.0,
-        )
-        for index in sorted(tables)
-    )
-
     base_map = {record.operator: record for record in base.records}
     rows: list[RankRow] = []
     for record in peer.records:
@@ -173,40 +158,80 @@ def assess_rank_tables(
             )
         )
     rows.sort(key=lambda item: -item.share_base)
-
     calls_ratio = calls_peer / calls_base if calls_base else None
     total_ratio = total_peer / total_base if total_base else None
-    median_avg_ratio: float | None = None
-    reasons: list[str] = []
-    if same_scope:
-        consistent = (
-            calls_ratio is not None
-            and total_ratio is not None
-            and CALLS_RATIO_RANGE[0] <= calls_ratio <= CALLS_RATIO_RANGE[1]
-            and TOTAL_RATIO_RANGE[0] <= total_ratio <= TOTAL_RATIO_RANGE[1]
-        )
-        if not consistent:
-            reasons.append(
-                f"calls_ratio={calls_ratio if calls_ratio is not None else 'NA'}、"
-                f"total_ratio={total_ratio if total_ratio is not None else 'NA'} "
-                f"超出允许范围 {CALLS_RATIO_RANGE}/{TOTAL_RATIO_RANGE}"
-            )
-    else:
+    median_avg_ratio = None
+    if not same_scope:
         ratios = [row.avg_ratio for row in rows[:MEDIAN_TOP_N] if row.avg_ratio is not None]
         median_avg_ratio = sorted(ratios)[len(ratios) // 2] if ratios else None
-        consistent = bool(
-            median_avg_ratio is not None
-            and MEDIAN_AVG_RATIO_RANGE[0] <= median_avg_ratio <= MEDIAN_AVG_RATIO_RANGE[1]
+    return rows, calls_ratio, total_ratio, median_avg_ratio
+
+
+def assess_rank_tables(
+    tables: Mapping[int, OperatorTable],
+    sources: Mapping[int, str],
+    scopes: Mapping[int, str],
+) -> RankMergeAssessment:
+    """比较全部 rank（以排序后的第一个为基线）；任一 peer 不一致即整体不一致。"""
+    ranks = tuple(sorted(tables))
+    base = tables[ranks[0]]
+    same_scope = len({scopes[index] for index in ranks}) == 1
+
+    digests = tuple(
+        RankDigest(
+            rank=index,
+            source=sources[index],
+            scope=scopes[index],
+            records=len(tables[index].records),
+            calls=sum(record.calls for record in tables[index].records),
+            total_us=tables[index].total_operator_time_us() or 0.0,
         )
-        if not consistent:
-            reasons.append(
-                "单次耗时比中位数="
-                f"{median_avg_ratio if median_avg_ratio is not None else 'NA'} "
-                f"超出允许范围 {MEDIAN_AVG_RATIO_RANGE}"
+        for index in ranks
+    )
+
+    rows: list[RankRow] = []
+    calls_ratio: float | None = None
+    total_ratio: float | None = None
+    median_avg_ratio: float | None = None
+    consistent = True
+    reasons: list[str] = []
+
+    for position, peer_rank in enumerate(ranks[1:]):
+        peer_rows, peer_calls, peer_total, peer_median = _pair_rows_and_ratios(
+            base, tables[peer_rank], same_scope=same_scope
+        )
+        if position == 0:
+            rows = peer_rows
+            calls_ratio, total_ratio, median_avg_ratio = peer_calls, peer_total, peer_median
+        if same_scope:
+            ok = (
+                peer_calls is not None
+                and peer_total is not None
+                and CALLS_RATIO_RANGE[0] <= peer_calls <= CALLS_RATIO_RANGE[1]
+                and TOTAL_RATIO_RANGE[0] <= peer_total <= TOTAL_RATIO_RANGE[1]
             )
+            if not ok:
+                reasons.append(
+                    f"rank{ranks[0]} vs rank{peer_rank}: "
+                    f"calls_ratio={peer_calls if peer_calls is not None else 'NA'}、"
+                    f"total_ratio={peer_total if peer_total is not None else 'NA'} "
+                    f"超出允许范围 {CALLS_RATIO_RANGE}/{TOTAL_RATIO_RANGE}"
+                )
+        else:
+            ok = bool(
+                peer_median is not None
+                and MEDIAN_AVG_RATIO_RANGE[0] <= peer_median <= MEDIAN_AVG_RATIO_RANGE[1]
+            )
+            if not ok:
+                reasons.append(
+                    f"rank{ranks[0]} vs rank{peer_rank}: 单次耗时比中位数="
+                    f"{peer_median if peer_median is not None else 'NA'} "
+                    f"超出允许范围 {MEDIAN_AVG_RATIO_RANGE}"
+                )
+        consistent = consistent and ok
 
     return RankMergeAssessment(
-        ranks=(ranks[0], ranks[1]),
+        ranks=(ranks[0], ranks[1] if len(ranks) > 1 else ranks[0]),
         digests=digests,
         same_scope=same_scope,
         calls_ratio=calls_ratio,
@@ -250,6 +275,15 @@ def load_rank_tables(
     return tables, sources, scopes, tuple(problems)
 
 
+def expected_ranks(bundle) -> int:
+    """采集契约声明的 rank 数（TP 数）；至少 1。"""
+    try:
+        count = int(getattr(bundle.workload.hardware, "device_count", 1) or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return max(1, count)
+
+
 def assess_bundle(
     bundle,
     parser,
@@ -258,30 +292,63 @@ def assess_bundle(
 ) -> tuple[RankMergeAssessment | None, tuple[QualityFlag, ...], dict[int, OperatorTable]]:
     """端到端评估一个 bundle 的 rank 合并质量。
 
-    * 只声明 1 个 rank：没有可合并对象，返回 ``(None, (), tables)``；
-    * 声明多个 rank 但可解析不足 2 个：``rank_merge_unverified``（blocking）；
-    * 两个 rank 都可用：返回评估结果 + 相应标记（不一致为 blocking）。
+    * ``expected = hardware.device_count`` 是采集契约声明的 TP 数；
+    * 声明的 rank 未全部交付（例如只找到 rank0）即为 ``rank_merge_unverified``（blocking）；
+    * 任一 rank 解析失败、或可解析数不足 expected，同样阻断；
+    * 全部可用时按基线比较每个 peer，任一不一致即整体不一致。
     """
     tables, sources, scopes, problems = load_rank_tables(
         bundle, parser, sqlite_parser, window
     )
-    declared = len(bundle.ranks)
-    if len(tables) < 2:
-        if declared <= 1:
-            return None, (), tables
-        detail = {
-            "declared_ranks": declared,
-            "parsed_ranks": sorted(tables),
-            "problems": list(problems),
-        }
-        reason = (
-            f"声明 {declared} 个 rank，仅 {len(tables)} 个可解析"
-            + (f"（{problems[0]}）" if problems else "")
+    expected = expected_ranks(bundle)
+    flags: list[QualityFlag] = []
+
+    if problems:
+        flags.extend(
+            unverified_flags(
+                "；".join(problems),
+                details={"expected_ranks": expected, "problems": list(problems)},
+            )
         )
-        return None, unverified_flags(reason, details=detail), tables
+    if len(tables) < expected:
+        flags.extend(
+            unverified_flags(
+                f"采集契约声明 {expected} 个 rank，实际可解析 {len(tables)} 个",
+                details={
+                    "expected_ranks": expected,
+                    "parsed_ranks": sorted(tables),
+                    "declared_in_export": len(bundle.ranks),
+                },
+            )
+        )
+
+    if len(tables) < 2:
+        if expected <= 1 and len(tables) == 1 and not flags:
+            return None, (), tables
+        if not flags:
+            flags.extend(unverified_flags(f"只有 {len(tables)} 个 rank 可比较"))
+        return None, tuple(flags), tables
 
     assessment = assess_rank_tables(tables, sources, scopes)
-    return assessment, assessment.quality_flags(), tables
+    return assessment, assessment.quality_flags() + tuple(flags), tables
+
+
+def timeline_coverage_flags(found_db_ranks: int, expected: int) -> tuple[QualityFlag, ...]:
+    """TP>1 但只找到部分 timeline 数据库时，busy/idle 与重叠结论不完整。"""
+    if expected <= 1 or found_db_ranks >= expected:
+        return ()
+    return (
+        QualityFlag(
+            code=RANK_TIMELINE_INCOMPLETE,
+            severity=BLOCKING,
+            message=(
+                f"采集契约声明 {expected} 个 rank，但只有 {found_db_ranks} 个 timeline 数据库；"
+                "busy/idle 与通信重叠结论不完整"
+            ),
+            source="timeline",
+            details={"expected_ranks": expected, "db_ranks": found_db_ranks},
+        ),
+    )
 
 
 def rank_quality_from_timeline(summary) -> tuple[QualityFlag, ...]:
@@ -318,7 +385,9 @@ __all__ = [
     "TOTAL_RATIO_RANGE",
     "assess_bundle",
     "assess_rank_tables",
+    "expected_ranks",
     "load_rank_tables",
     "rank_quality_from_timeline",
+    "timeline_coverage_flags",
     "unverified_flags",
 ]

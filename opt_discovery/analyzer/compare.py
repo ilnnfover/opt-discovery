@@ -19,9 +19,15 @@ from pathlib import Path
 from typing import Any
 
 from ..schemas.operator import OperatorTable
-from ..schemas.quality import QualityFlag, blocking, degraded, flags_from_meta
+from ..schemas.quality import (
+    QualityFlag,
+    blocking,
+    degraded,
+    invalid_flag,
+    parse_meta_flags,
+)
 from ..schemas.workload import WorkloadSpec
-from .contract import GRAPH_ONLY_PARAMS
+from .contract import GRAPH_ONLY_PARAMS, compare_contracts
 
 __all__ = ["OperatorDelta", "ComparisonReport", "compare_tables"]
 
@@ -69,9 +75,9 @@ class ComparisonReport:
     total_b_us: float | None = None
     deltas: list[OperatorDelta] = field(default_factory=list)
     observations: tuple[str, ...] = ()
+    generated_at: str = ""
     #: 两侧表携带的质量标记（blocking 时 comparable 必为 False）
     quality_flags: tuple[QualityFlag, ...] = ()
-    generated_at: str = ""
 
     def __post_init__(self) -> None:
         if not self.generated_at:
@@ -89,9 +95,10 @@ class ComparisonReport:
             "window": self.window,
             "total_a_us": self.total_a_us,
             "total_b_us": self.total_b_us,
+            # 不可比时不得提供可直接引用的比值（保留两侧原始量）
             "total_ratio": (
                 self.total_b_us / self.total_a_us
-                if self.total_a_us and self.total_b_us is not None
+                if self.comparable and self.total_a_us and self.total_b_us is not None
                 else None
             ),
             "observations": list(self.observations),
@@ -138,6 +145,11 @@ def _summarize(table: OperatorTable) -> dict[str, dict[str, float | None]]:
     return summary
 
 
+def _meta_payload(table: OperatorTable) -> dict:
+    """契约只读 ``meta.extra``，不要为此序列化全部算子记录。"""
+    return {"extra": dict(table.meta.extra or {})}
+
+
 def _window_of(table: OperatorTable) -> dict | None:
     return (table.meta.extra or {}).get("window")
 
@@ -173,7 +185,13 @@ def compare_tables(
     warnings: list[str] = []
 
     # 质量闸门：rank 不可合并 / 时长截断等阻断型标记必须先于任何差异计算。
-    quality_flags = flags_from_meta(a.meta) + flags_from_meta(b.meta)
+    flags_a, problems_a = parse_meta_flags(a.meta)
+    flags_b, problems_b = parse_meta_flags(b.meta)
+    quality_flags = flags_a + flags_b
+    for label, problems in ((a.workload_id, problems_a), (b.workload_id, problems_b)):
+        invalid = invalid_flag(problems, source=label)
+        if invalid is not None:
+            quality_flags = quality_flags + (invalid,)
     blocking_flags = blocking(quality_flags)
     if blocking_flags:
         comparable = False
@@ -182,6 +200,18 @@ def compare_tables(
         )
     for flag in degraded(quality_flags):
         warnings.append(f"质量提示（{flag.code}）：{flag.message}")
+
+    # 采集契约 gate：与独立 check-runs 使用同一实现，比较入口不再绕过。
+    contract = compare_contracts(
+        {"workload": a.workload.to_dict(), "meta": _meta_payload(a)},
+        {"workload": b.workload.to_dict(), "meta": _meta_payload(b)},
+    )
+    if contract.verdict == "incomparable":
+        comparable = False
+        reasons.extend(
+            f"采集契约不通过（{item.name}）：{item.a} vs {item.b}（{item.note}）"
+            for item in contract.failures
+        )
 
     if a.workload.execution.phase is not b.workload.execution.phase:
         warnings.append(

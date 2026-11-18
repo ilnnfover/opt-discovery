@@ -168,4 +168,7 @@ cli.py                       22 个子命令（编排层）
 | R05/R10 strict xfail | 改为正式断言；R05 另覆盖 `check-ranks --strict` 退出 3 | `docs/engineering/regression-matrix.md` |
 | 旧产物复用 | 独立 `run_id` + 产物相对路径 + sha256；`check-manifest` 校验 | `test_reused_output_dir_does_not_masquerade_old_artifacts` |
 
+复审后补充：比较入口已应用采集契约 gate；非法 `quality_flags` 按 `quality_flag_invalid` 阻断；
+manifest 产物路径改为相对清单目录（支持清单写在输出目录外）并校验结构。
+
 剩余（新登记）：人工构造表绕过 `analyze` 时质量标记可缺失；`compare --strict` 目前不强制要求标记存在（避免破坏既有 JSON 工作流）。

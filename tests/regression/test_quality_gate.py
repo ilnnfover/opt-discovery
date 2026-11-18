@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from _helpers import make_workload
 from opt_discovery.analyzer.compare import compare_tables
 from opt_discovery.analyzer.rank_quality import assess_rank_tables
 from opt_discovery.cli import main
-from opt_discovery.experiment.run_manifest import verify_manifest
+from opt_discovery.experiment.run_manifest import sha256_of, verify_manifest
 from opt_discovery.schemas.metrics import Metric, Provenance
 from opt_discovery.schemas.operator import OperatorRecord, OperatorTable, ParseMeta
 from opt_discovery.schemas.quality import (
@@ -155,6 +156,8 @@ def test_compare_cli_strict_refuses_incomparable(tmp_path, capsys) -> None:
     assert manifest["strict"] is True
     assert RANK_MERGE_INCONSISTENT in manifest["quality_flags"]
     assert verify_manifest(out / "run_manifest.json") == []
+    assert manifest["inputs"]["a"]["sha256"] == sha256_of(str(path_a))
+    assert manifest["inputs"]["b"]["sha256"] == sha256_of(str(path_b))
 
     # 普通模式保持兼容：退出 0，但产物仍标记为不可比
     normal_code = main(
@@ -169,3 +172,87 @@ def test_compare_cli_strict_refuses_incomparable(tmp_path, capsys) -> None:
     assert payload["comparable"] is False
     assert payload["deltas"] == []
     capsys.readouterr()
+
+
+def test_contract_mismatch_blocks_compare() -> None:
+    """P1-3：比较入口必须应用采集契约（轮次窗口不同 -> incomparable）。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    target = _table(graph, {"MatMul": 1100.0})
+    base.meta.extra["window"] = {"rounds": [1, 2], "duration_us": 3000.0}
+    target.meta.extra["window"] = {"rounds": [1, 2, 3], "duration_us": 4000.0}
+
+    report = compare_tables(base, target)
+
+    assert report.comparable is False
+    assert any("采集契约不通过" in reason for reason in report.reasons)
+    assert report.deltas == []
+    assert report.to_dict()["total_ratio"] is None
+
+
+def test_invalid_quality_flag_is_blocking(tmp_path: Path) -> None:
+    """P1-7：标记存在但 severity 非法时必须按未验证处理，不能静默丢弃。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    base.meta.extra["quality_flags"] = [
+        {"code": RANK_MERGE_INCONSISTENT, "severity": "bogus", "message": "bad"}
+    ]
+    target = _table(graph, {"MatMul": 1100.0})
+
+    report = compare_tables(base, target)
+
+    assert report.comparable is False
+    assert any("quality_flag_invalid" in reason for reason in report.reasons)
+    assert "quality_flag_invalid" in {flag.code for flag in report.quality_flags}
+    assert report.deltas == []
+
+    # JSON 往返后同样阻断（独立 compare 读取磁盘文件）
+    path_a = base.write_json(tmp_path / "a.json")
+    path_b = target.write_json(tmp_path / "b.json")
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(path_a),
+            "--b",
+            str(path_b),
+            "--out-dir",
+            str(tmp_path / "cmp"),
+            "--strict",
+        ]
+    )
+    assert code == 4
+
+
+def test_more_than_two_ranks_are_all_compared() -> None:
+    """P1-2：超过两个 rank 时，任一 peer 不一致都要判不可合并。"""
+    eager, _graph = _pair()
+    tables = {
+        0: _table(eager, {"MatMul": 1000.0}),
+        1: _table(eager, {"MatMul": 1000.0}),
+        2: _table(eager, {"MatMul": 4000.0}),
+    }
+    assessment = assess_rank_tables(
+        tables,
+        {rank: "op_summary(窗口)" for rank in tables},
+        {rank: "window" for rank in tables},
+    )
+
+    assert assessment.consistent is False
+    assert any("rank2" in reason for reason in assessment.reasons)
+    assert len(assessment.digests) == 3
+
+
+def test_known_blocking_code_without_severity_is_blocking() -> None:
+    """旧表没有 severity 时，已知阻断码必须按阻断处理。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    base.meta.extra["quality_flags"] = [
+        {"code": RANK_MERGE_INCONSISTENT, "message": "rank 不可合并"}
+    ]
+    target = _table(graph, {"MatMul": 1100.0})
+
+    report = compare_tables(base, target)
+
+    assert report.comparable is False
+    assert report.deltas == []

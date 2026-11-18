@@ -32,6 +32,21 @@ RANK_DURATION_INCONSISTENT = "rank_duration_inconsistent"
 WINDOW_DEGRADED = "window_degraded"
 #: 数据来自 sqlite 回填，缺时间戳与流水指标
 SQLITE_FALLBACK = "sqlite_fallback"
+#: 部分 rank 缺少 timeline 数据库，busy/idle 与通信重叠结论不完整
+RANK_TIMELINE_INCOMPLETE = "rank_timeline_incomplete"
+#: 标记本身无法解析（未知 severity/缺字段）：必须按未验证处理，不能静默丢弃
+QUALITY_FLAG_INVALID = "quality_flag_invalid"
+
+#: 这些 code 一旦出现就必须阻断比较（即使 severity 字段缺失或被写成字符串）
+KNOWN_BLOCKING_CODES = frozenset(
+    {
+        RANK_MERGE_UNVERIFIED,
+        RANK_MERGE_INCONSISTENT,
+        RANK_DURATION_INCONSISTENT,
+        RANK_TIMELINE_INCOMPLETE,
+        QUALITY_FLAG_INVALID,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -64,10 +79,15 @@ class QualityFlag:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "QualityFlag":
+        code = str(data["code"])
+        severity = data.get("severity")
+        if severity is None:
+            # 旧表没有 severity：已知阻断码按阻断处理，其余按提示处理
+            severity = BLOCKING if code in KNOWN_BLOCKING_CODES else DEGRADED
         return cls(
-            code=str(data["code"]),
+            code=code,
             message=str(data.get("message") or ""),
-            severity=str(data.get("severity") or DEGRADED),
+            severity=str(severity),
             source=data.get("source"),
             details=dict(data.get("details") or {}),
         )
@@ -81,18 +101,42 @@ def degraded(flags: Iterable[QualityFlag]) -> tuple[QualityFlag, ...]:
     return tuple(flag for flag in flags if flag.severity == DEGRADED)
 
 
-def flags_from_meta(meta: Any) -> tuple[QualityFlag, ...]:
-    """从 ``ParseMeta.extra['quality_flags']`` 读取标记；坏数据不静默丢弃。"""
+def parse_meta_flags(meta: Any) -> tuple[tuple[QualityFlag, ...], tuple[str, ...]]:
+    """读取标记并返回无法解析的条目（不能静默丢弃，否则阻断标记会消失）。"""
     raw = (getattr(meta, "extra", None) or {}).get("quality_flags") or ()
+    if not isinstance(raw, (list, tuple)):
+        return (), (f"quality_flags 不是列表: {type(raw).__name__}",)
     flags: list[QualityFlag] = []
-    for item in raw:
+    problems: list[str] = []
+    for index, item in enumerate(raw):
         if not isinstance(item, Mapping) or "code" not in item:
+            problems.append(f"quality_flags[{index}] 缺少 code")
             continue
         try:
             flags.append(QualityFlag.from_dict(item))
-        except (ValueError, TypeError):
-            continue
-    return tuple(flags)
+        except (ValueError, TypeError) as exc:
+            problems.append(f"quality_flags[{index}] 无法解析: {exc}")
+    return tuple(flags), tuple(problems)
+
+
+def invalid_flag(problems: Iterable[str], *, source: str = "unknown") -> QualityFlag | None:
+    """把无法解析的标记转成一个阻断型标记；没有问题时返回 None。"""
+    items = tuple(problems)
+    if not items:
+        return None
+    return QualityFlag(
+        code=QUALITY_FLAG_INVALID,
+        severity=BLOCKING,
+        message="质量标记存在但无法解析，按未验证处理（不允许视为可比）",
+        source=source,
+        details={"problems": list(items)},
+    )
+
+
+def flags_from_meta(meta: Any) -> tuple[QualityFlag, ...]:
+    """兼容包装：只返回可解析标记；需要知道坏条目时用 :func:`parse_meta_flags`。"""
+    flags, _problems = parse_meta_flags(meta)
+    return flags
 
 
 def attach(meta: Any, flags: Iterable[QualityFlag]) -> tuple[QualityFlag, ...]:
@@ -113,8 +157,13 @@ __all__ = [
     "RANK_MERGE_INCONSISTENT",
     "RANK_MERGE_UNVERIFIED",
     "RANK_SCOPE_MISMATCH",
+    "RANK_TIMELINE_INCOMPLETE",
     "SQLITE_FALLBACK",
     "SCHEMA_VERSION",
+    "QUALITY_FLAG_INVALID",
+    "KNOWN_BLOCKING_CODES",
+    "invalid_flag",
+    "parse_meta_flags",
     "WINDOW_DEGRADED",
     "QualityFlag",
     "attach",
