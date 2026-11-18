@@ -25,7 +25,7 @@ import re
 import shlex
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -154,7 +154,7 @@ def summarize_run(rounds: Sequence[RoundSample]) -> dict[str, Any]:
             "p90": round(_percentile(durations, 0.9) or 0.0, 6),
         },
         "tokens_per_s": {
-            "median": round(_percentile(tokens, 0.5), 3) if tokens else None,
+            "median": round(_percentile(tokens, 0.5) or 0.0, 3) if tokens else None,
             "min": round(min(tokens), 3) if tokens else None,
             "max": round(max(tokens), 3) if tokens else None,
         },

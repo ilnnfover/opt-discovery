@@ -22,6 +22,7 @@ from typing import Any, Mapping
 from ..diagnosis.engine import DiagnosisEngine
 from ..diagnosis.rules import RuleSet
 from ..diagnosis.thresholds import ThresholdOverlay, apply_overlay
+from ..schemas.metrics import Provenance
 from ..schemas.operator import OperatorTable
 from .calibration import calibrate
 
@@ -241,7 +242,10 @@ def validate_thresholds(
             )
             continue
         ratios = [
-            _rel_drift(fold, hold) for fold, hold in zip(folds_v, holds) if hold is not None
+            # 某个 fold 缺该阈值时两侧长度可能不同：保持原有「按较短的截断」语义
+            _rel_drift(fold, hold)
+            for fold, hold in zip(folds_v, holds, strict=False)
+            if hold is not None
         ]
         worst = max(ratios) if ratios else None
         if worst is None:
@@ -313,7 +317,7 @@ def _diagnose(
             name=name,
             value=value,
             unit=base.unit,
-            provenance="measured",
+            provenance=Provenance.MEASURED,
             basis="fold calibration",
         )
     merged = apply_overlay(

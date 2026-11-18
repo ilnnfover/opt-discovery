@@ -8,6 +8,8 @@ it must state that no real measurement is involved.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..schemas.metrics import Metric, Provenance
 from ..schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskType
 from ..schemas.workload import WorkloadSpec
@@ -17,7 +19,7 @@ __all__ = ["SCENARIOS", "build_synthetic_table", "SyntheticOperatorParser"]
 
 
 #: scenario -> list of record templates.  Values are placeholders.
-SCENARIOS: dict[str, list[dict[str, object]]] = {
+SCENARIOS: dict[str, list[dict[str, Any]]] = {
     "rich": [
         {
             "operator": "MatMul",
@@ -114,12 +116,12 @@ def build_synthetic_table(scenario: str, workload: WorkloadSpec) -> OperatorTabl
     )
     records: list[OperatorRecord] = []
     for template in SCENARIOS[scenario]:
-        calls = int(template["calls"])  # type: ignore[arg-type]
-        total = float(template["total_time_us"])  # type: ignore[arg-type]
+        calls = int(template["calls"])
+        total = float(template["total_time_us"])
         device = template.get("device_time_us")
         extra = {
             name: Metric(float(value), _unit_of(name), Provenance.MEASURED, f"synthetic:{name}")
-            for name, value in dict(template.get("extra") or {}).items()  # type: ignore[arg-type]
+            for name, value in dict(template.get("extra") or {}).items()
         }
         records.append(
             OperatorRecord(
@@ -135,10 +137,10 @@ def build_synthetic_table(scenario: str, workload: WorkloadSpec) -> OperatorTabl
                     if device is not None
                     else None
                 ),
-                kernel=template.get("kernel"),  # type: ignore[arg-type]
-                shape=template.get("shape"),  # type: ignore[arg-type]
+                kernel=template.get("kernel"),
+                shape=template.get("shape"),
                 dtype="bfloat16",
-                task_type=template.get("task_type", TaskType.KERNEL),  # type: ignore[arg-type]
+                task_type=template.get("task_type", TaskType.KERNEL),
                 extra=extra,
                 attributes={"raw_operator": str(template["operator"])},
                 notes=("synthetic placeholder values",),

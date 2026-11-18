@@ -98,9 +98,13 @@ def audit_collection(
             )
         )
 
-    hashes = {item.get("contract_sha256") for item in manifests}
+    # 缺字段时不能静默：既避免 sorted({None, str}) 的 TypeError，也让缺失成为可见失败
+    hashes = sorted(
+        str(item["contract_sha256"]) if item.get("contract_sha256") else "<missing>"
+        for item in manifests
+    )
     items.append(
-        AuditItem("contract_sha256", len(hashes) == 1, f"契约 sha256 = {sorted(hashes)}")
+        AuditItem("contract_sha256", len(set(hashes)) == 1, f"契约 sha256 = {hashes}")
     )
 
     for key in ("fixed", "profiling"):

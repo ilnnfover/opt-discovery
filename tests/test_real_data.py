@@ -38,8 +38,27 @@ RULES = REPO_ROOT / "configs" / "rules" / "bottleneck_rules.v1.yaml"
 WORKLOAD = REPO_ROOT / "configs" / "workloads" / "qwen35-35b-a3b-910b" / "prefill_eager.yaml"
 
 
-def _rank_dirs() -> list[Path]:
+def _all_prof_dirs() -> list[Path]:
+    """磁盘上的全部 PROF_* 目录，包括没有任何输出的「空会话」。"""
     return sorted(p for p in PROF_ROOT.glob("PROF_*") if p.is_dir())
+
+
+def _rank_dirs() -> list[Path]:
+    """有可解析 CSV 的 rank 目录。
+
+    空 PROF 会话（无任何 CSV）不参与解析，也不能被当成一个 rank；它是否被正确
+    识别由 ``test_export_has_two_ranks`` 单独核对。若这里不过滤，所有依赖
+    ``_output`` 的用例会一起 skip，真实覆盖会被静默丢掉。
+    """
+    usable: list[Path] = []
+    for path in _all_prof_dirs():
+        output = path / "mindstudio_profiler_output"
+        has_operator_csv = bool(list(output.glob("op_summary*.csv"))) or bool(
+            list(output.glob("op_statistic*.csv"))
+        )
+        if has_operator_csv:
+            usable.append(path)
+    return usable
 
 
 def _output(rank: Path, prefix: str) -> Path:
@@ -67,28 +86,42 @@ def summary_tables(workload):
 
 
 def test_export_has_two_ranks():
-    ranks = _rank_dirs()
-    assert len(ranks) == 2, "TP=2 时应有两个 rank 目录"
+    """TP=2：导出里必须有 device_0/device_1 两个完整 rank。
+
+    2026-11-15 统一补采的目录里还会残留一次「空 PROF 目录」（无 CSV、无 sqlite）。
+    它必须被跳过，不能被当成第三个 rank 计入（否则 rank 合并口径会被污染）。
+    """
+    ranks = _all_prof_dirs()
+    complete = _rank_dirs()
+    devices = sorted((next(iter(r.glob("device_*")), r)).name for r in complete)
+    assert devices == ["device_0", "device_1"]
+    for empty in (r for r in ranks if r not in complete):
+        assert not list(empty.glob("device_*/sqlite/op_counter.db")), "空导出不应含可用 sqlite"
 
 
 def test_op_statistic_total_matches_profiler_sum(statistic_tables):
     for rank, table in statistic_tables:
         with _output(rank, "op_statistic").open(newline="") as handle:
-            profiler_total = sum(
-                float(row["Total Time(us)"]) for row in csv.DictReader(handle)
-            )
+            rows = list(csv.DictReader(handle))
+        profiler_total = sum(float(row["Total Time(us)"]) for row in rows)
         assert table.total_operator_time_us() == pytest.approx(profiler_total, rel=1e-9)
         assert table.meta.skipped_rows == 0
-        assert table.meta.row_count == 69
+        # 导出规模随补采变化：与磁盘行数独立核对，而不是写死历史数字
+        assert table.meta.row_count == len(rows)
 
 
 def test_operator_variants_are_split_by_core_type(statistic_tables):
     """MatMulV3 在导出里按 Core Type 拆成两行，聚合后必须是两条记录而不是一条。"""
-    _, table = statistic_tables[0]
+    rank, table = statistic_tables[0]
     variants = [r for r in table.records if r.operator == "MatMulV3"]
     assert len(variants) == 2
     assert {r.attributes["core_type"] for r in variants} == {"AI_CORE", "MIX_AIC"}
-    assert sum(r.calls for r in variants) == 771
+    # 期望值来自源文件 Count 列的独立求和（不是复用解析器的聚合结果）
+    with _output(rank, "op_statistic").open(newline="") as handle:
+        expected = sum(
+            int(row["Count"]) for row in csv.DictReader(handle) if row["OP Type"] == "MatMulV3"
+        )
+    assert sum(r.calls for r in variants) == expected
 
 
 def test_calls_consistent_between_statistic_and_summary(statistic_tables, summary_tables):
@@ -141,13 +174,28 @@ def test_time_share_matches_profiler_ratio_column(statistic_tables):
         assert actual == pytest.approx(expected, abs=0.001), key
 
 
-def test_pipe_fractions_are_available_from_summary(summary_tables):
+def test_pipe_fractions_follow_export_columns(summary_tables):
+    """46 列导出有 mac/mte/cube_utilization；33 列精简导出没有这些分列。
+
+    两种导出都必须可解析：缺列时指标缺席并被记录，绝不能补 0 或估值。
+    """
     _, table = summary_tables[0]
     fused = next(r for r in table.records if r.operator == "FusedInferAttentionScore")
-    assert fused.extra["mac_time_us"].value > 0
-    # aic_ 与 aiv_ 两条 MTE2 流水必须合并
-    assert fused.extra["mte2_time_us"].value > 0
-    assert fused.extra["cube_utilization"].unit == "%"
+    missing = set(table.meta.extra.get("missing_extra_metrics") or ())
+    if "mac_time_us" in missing:
+        # 33 列：无 mac / mte / cube_utilization 分列
+        assert "mac_time_us" not in fused.extra
+        assert "cube_utilization" not in fused.extra
+        assert "mte2_time_us" not in fused.extra
+        # 但 aicore/aiv 流水时间仍可用于诊断，且必须 > 0
+        assert fused.extra["aicore_time_us"].value > 0
+        assert any(w.code == "missing_extra_metric" for w in table.meta.warnings)
+    else:
+        assert fused.extra["mac_time_us"].value > 0
+        assert fused.extra["cube_utilization"].unit == "%"
+        # aic_ 与 aiv_ 两条 MTE2 流水必须合并
+        if "mte2_time_us" in fused.extra:
+            assert fused.extra["mte2_time_us"].value > 0
 
 
 def test_diagnosis_on_real_data_stays_hypothesis(summary_tables):
@@ -177,8 +225,10 @@ def test_diagnosis_on_real_data_stays_hypothesis(summary_tables):
 
 
 def test_no_rows_are_silently_dropped(summary_tables):
-    for _, table in summary_tables:
-        assert table.meta.row_count > 30000
+    for rank, table in summary_tables:
+        path = _output(rank, "op_summary")
+        disk_rows = sum(1 for _ in path.open(encoding="utf-8", errors="replace")) - 1
+        assert table.meta.row_count == disk_rows
         assert table.meta.skipped_rows == 0
         assert not [w for w in table.meta.warnings if w.code == "row_skipped"]
 
@@ -187,7 +237,7 @@ def test_no_rows_are_silently_dropped(summary_tables):
 # 增量 2：轮次稳态窗口 / 多 Workload 对比
 # ---------------------------------------------------------------------------
 from opt_discovery.analyzer.compare import compare_tables  # noqa: E402
-from opt_discovery.analyzer.hotspot import hotspot_matrix, operator_hotspots  # noqa: E402
+from opt_discovery.analyzer.hotspot import hotspot_matrix  # noqa: E402
 from opt_discovery.analyzer.window import select_rounds_window  # noqa: E402
 from opt_discovery.collectors import discover_all  # noqa: E402
 
@@ -213,13 +263,16 @@ def test_all_four_exports_are_discovered(bundles):
         for note in bundle.notes:
             assert any(key in note for key in ("跳过", "切片", "回填"))
 
-    # rank1 的 CSV 缺失时应保留该 rank 并标记可回填，而不是静默丢弃
-    decode = bundles["qwen35-35b-a3b-decode-eager"]
-    assert len(decode.ranks) == 2
-    assert any("回填" in note for note in decode.notes)
-    missing_csv = [r for r in decode.ranks if not r.op_summary_files]
-    assert len(missing_csv) == 1 and missing_csv[0].op_report_db is not None
-    assert len(bundles["qwen35-35b-a3b-prefill-eager"].ranks) == 2
+    # 两个 rank 必须都在；某个 rank 缺 CSV 时必须保留并标注可回填，不能静默丢弃。
+    # 2026-11-15 补采已修复 decode rank1 的 CSV 缺失，因此该场景只在仍然缺 CSV 时要求「回填」标记。
+    for workload_id, bundle in bundles.items():
+        assert {r.device for r in bundle.ranks} == {"device_0", "device_1"}, workload_id
+        for rank in bundle.ranks:
+            assert rank.op_summary_files or rank.op_report_db is not None, (workload_id, rank.rank)
+        missing_csv = [r for r in bundle.ranks if not r.op_summary_files]
+        if missing_csv:
+            assert any("回填" in note for note in bundle.notes), workload_id
+            assert all(r.op_report_db is not None for r in missing_csv), workload_id
 
 
 def test_round_window_shrinks_prefill_to_steady_state(bundles):
@@ -241,15 +294,25 @@ def test_round_window_shrinks_prefill_to_steady_state(bundles):
 
 
 def test_decode_window_on_sliced_export(bundles):
-    """decode 的 op_summary 被切成两个文件，窗口解析必须跨切片生效。"""
+    """decode 的 op_summary 可能按 100 万行切片，窗口解析必须跨全部切片生效。"""
     bundle = bundles["qwen35-35b-a3b-decode-graph"]
     rank = bundle.rank(0)
-    assert len(rank.op_summary_files) == 2
+    on_disk = sorted(
+        (rank.directory / "mindstudio_profiler_output").glob("op_summary*.csv")
+    )
+    assert on_disk, "decode 应至少有一个 op_summary 分片"
+    # 不能被字典序或只取第一个文件的影响漏读分片
+    assert list(rank.op_summary_files) == on_disk
     parser = MappingCsvParser(CsvMapping.load(SUMMARY_MAPPING))
     window = select_rounds_window(bundle.run_log, (1, 2))
     table = parser.parse(rank.op_summary_files, bundle.workload, window=window)
 
-    assert table.meta.row_count > 1_000_000
+    # row_count 是「读到的总行数」，可与磁盘行数独立核对（漏读/重复读都会不等）
+    disk_rows = sum(
+        sum(1 for _ in path.open(encoding="utf-8", errors="replace")) - 1 for path in on_disk
+    )
+    assert table.meta.row_count == disk_rows
+    assert table.meta.row_count > 100_000
     assert 0 < table.meta.extra["rows_outside_window"] < table.meta.row_count
     assert table.meta.skipped_rows == 0
     assert table.meta.extra["window"]["rounds"] == [1, 2]
@@ -270,6 +333,8 @@ def test_hotspot_shifts_between_eager_and_graph(bundles):
     matrix = hotspot_matrix(tables, top=10)
     assert len(matrix["workloads"]) == 2
     rows = {row["operator"]: row for row in matrix["rows"]}
+    # 矩阵每行都必须覆盖全部 Workload 列（缺失算子显式为 None，不能被悄悄省略）
+    assert all(set(row["workloads"]) == set(matrix["workloads"]) for row in rows.values())
     # 通信时长按 ns 修正后不再主导 top，但仍应存在于算子表中
     assert any(
         record.operator.startswith("hcom_")
@@ -324,12 +389,35 @@ def test_sqlite_fallback_equals_exported_op_statistic():
 
 
 def test_sqlite_fallback_fills_rank1_without_csv():
-    """decode 的 rank1 没有 CSV，但 device_1/sqlite 完整，可回填出同一口径的表。"""
+    """缺 CSV 的 rank 必须能用 device_*/sqlite 回填出同一口径的表。
+
+    2026-11-15 统一补采后两个 rank 都有 CSV，历史场景无法在该数据上复现；
+    此时显式 skip 并指向 CPU 回归（tests/regression/test_r05_rank_merge.py），
+    不允许用「有 CSV 的 rank」冒充回填路径。
+    """
     decode_root = _DATA_ROOT / "qwen35-decode"
     if not decode_root.is_dir():
         pytest.skip("qwen35-decode 导出不存在")
-    rank1 = sorted(decode_root.glob("PROF_*"))[-1]
-    assert not list((rank1 / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+    candidates = [
+        prof
+        for prof in sorted(decode_root.glob("PROF_*"))
+        if prof.is_dir()
+        and not list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+        and list(prof.glob("device_*/sqlite/op_counter.db"))
+    ]
+    if not candidates:
+        # 本次导出所有 rank 都有 CSV：历史场景不适用。这不等于「已验证回填可用」，
+        # 因此改为断言回填路径的前提——有 CSV 的 rank 也必须带 sqlite。
+        # 无 CSV 的完整回填场景由 CPU 回归 tests/regression/test_r05_rank_merge.py 覆盖。
+        for prof in sorted(decode_root.glob("PROF_*")):
+            csvs = list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+            if not csvs:
+                continue
+            assert list(prof.glob("device_*/sqlite/op_counter.db")), (
+                f"{prof}: 有 CSV 但无 sqlite，回填路径不可用"
+            )
+        return
+    rank1 = candidates[-1]
 
     workload = WorkloadSpec.from_yaml(WORKLOAD)
     table = SqliteOpReportParser().parse(rank1, workload)

@@ -105,19 +105,32 @@ class ComparisonReport:
         return target
 
 
-def _summarize(table: OperatorTable) -> dict[str, dict[str, float]]:
-    """operator -> {share, calls, avg} merged across variants."""
+def _as_int(value: float | None) -> int | None:
+    return int(value) if value is not None else None
+
+
+def _summarize(table: OperatorTable) -> dict[str, dict[str, float | None]]:
+    """operator -> {share, calls, avg} merged across variants.
+
+    ``share``/``avg`` 在缺分母时是 ``None``（未知），不是 0。
+    """
     total = table.total_operator_time_us()
-    summary: dict[str, dict[str, float]] = {}
+    totals: dict[str, dict[str, float]] = {}
     for record in table.records:
         if record.total_time_us is None:
             continue
-        bucket = summary.setdefault(record.operator, {"total": 0.0, "calls": 0})
+        bucket = totals.setdefault(record.operator, {"total": 0.0, "calls": 0.0})
         bucket["total"] += record.total_time_us.value
-        bucket["calls"] += record.calls
-    for bucket in summary.values():
-        bucket["share"] = bucket["total"] / total if total else None
-        bucket["avg"] = bucket["total"] / bucket["calls"] if bucket["calls"] else None
+        bucket["calls"] += float(record.calls)
+    summary: dict[str, dict[str, float | None]] = {}
+    for operator, bucket in totals.items():
+        calls = bucket["calls"]
+        summary[operator] = {
+            "total": bucket["total"],
+            "calls": calls,
+            "share": bucket["total"] / total if total else None,
+            "avg": bucket["total"] / calls if calls else None,
+        }
     return summary
 
 
@@ -239,8 +252,8 @@ def compare_tables(
         share_b = item_b["share"] if item_b else None
         if max(share_a or 0.0, share_b or 0.0) < min_share:
             continue
-        calls_a = int(item_a["calls"]) if item_a else None
-        calls_b = int(item_b["calls"]) if item_b else None
+        calls_a = _as_int(item_a["calls"]) if item_a else None
+        calls_b = _as_int(item_b["calls"]) if item_b else None
         deltas.append(
             OperatorDelta(
                 operator=operator,
@@ -255,7 +268,11 @@ def compare_tables(
                 avg_b=item_b["avg"] if item_b else None,
                 avg_ratio=(
                     item_b["avg"] / item_a["avg"]
-                    if item_a and item_b and item_a["avg"] and item_b["avg"]
+                    if item_a
+                    and item_b
+                    and item_a["avg"] is not None
+                    and item_b["avg"] is not None
+                    and item_a["avg"] > 0
                     else None
                 ),
             )
@@ -272,8 +289,8 @@ def compare_tables(
 def _observations(
     a: OperatorTable,
     b: OperatorTable,
-    left: dict[str, dict[str, float]],
-    right: dict[str, dict[str, float]],
+    left: dict[str, dict[str, float | None]],
+    right: dict[str, dict[str, float | None]],
     deltas: list[OperatorDelta],
 ) -> tuple[str, ...]:
     notes: list[str] = []
@@ -285,8 +302,8 @@ def _observations(
             "（累计时间不是端到端延迟）"
         )
 
-    def total_calls(summary: dict[str, dict[str, float]]) -> int:
-        return int(sum(item["calls"] for item in summary.values()))
+    def total_calls(summary: dict[str, dict[str, float | None]]) -> int:
+        return int(sum(item["calls"] or 0.0 for item in summary.values()))
 
     calls_a, calls_b = total_calls(left), total_calls(right)
     if calls_a and calls_b:

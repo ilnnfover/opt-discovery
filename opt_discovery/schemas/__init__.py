@@ -22,14 +22,14 @@ from .operator import (
     TaskType,
 )
 from .opportunity import (
+    SCHEMA_VERSION as OPPORTUNITY_SCHEMA_VERSION,
+)
+from .opportunity import (
     Opportunity,
     OpportunitySchemaError,
     OpportunityStatus,
     PriorityScore,
     ValidationPlan,
-)
-from .opportunity import (
-    SCHEMA_VERSION as OPPORTUNITY_SCHEMA_VERSION,
 )
 from .workload import (
     EnvironmentSpec,

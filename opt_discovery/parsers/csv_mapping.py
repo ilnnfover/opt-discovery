@@ -19,23 +19,26 @@ In both semantics the output is one record per aggregation key, with
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import yaml
 
-from ..analyzer.window import Window
 from ..schemas.metrics import Metric, Provenance
 from ..schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskType
+from ..schemas.workload import WorkloadSpec
+from .base import ParserCapabilities, ParserError
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查，避免 parsers <-> analyzer 循环导入
+    from ..analyzer.window import Window
 
 #: profiler 的 ``Task Duration(us)`` 列里，COMMUNICATION 行实际是 ns，
 #: 其余类型（AI_CORE / AI_VECTOR_CORE / MIX_AIC ...）是 us。
 #: 实测 decode-eager：9685 行通信累计 3.399e10，按 ns=34s 与 48s 窗口自洽；
 #: 按 us 解释则是 33990s，物理上不可能。
 COMMUNICATION_DURATION_SCALE = 0.001
-from ..schemas.workload import WorkloadSpec
-from .base import ParserCapabilities, ParserError
 
 __all__ = [
     "ColumnSpec",
@@ -115,7 +118,7 @@ def _dtype_size(raw: str) -> float | None:
     return _DTYPE_SIZES.get(text)
 
 
-def _estimate_row_bytes(row: list[str], positions: list[int]) -> float | None:
+def _estimate_row_bytes(row: list[str], positions: Sequence[int]) -> float | None:
     """按 (in_shapes, in_dtypes, out_shapes, out_dtypes) 列估算单实例搬运字节。
 
     约定：读(input numel×dtype) + 写(output numel×dtype)，即读写合计口径，
@@ -169,6 +172,8 @@ class ExtraMetricSpec:
     agg: str = "sum"
     combine: str = "first"
     when_task_types: tuple[TaskType, ...] = ()
+    #: 该列在**本任务类型下**的单位修正系数（例如 COMMUNICATION 的 Task Duration 是 ns）
+    scale: float = 1.0
     #: 非数值列的派生计算（当前支持 "bytes_from_shapes"：shape×dtype 估算搬运字节）
     computed: str = ""
 
@@ -230,14 +235,14 @@ class CsvMapping:
                 raise ParserError(
                     f"{path}: unknown canonical field {key!r}; allowed: {sorted(KNOWN_FIELDS)}"
                 )
-            fields[key] = _parse_column_spec(spec, key, path)
+            fields[key] = _parse_column_spec(spec, key, source)
             if key.endswith("_us") and not fields[key].unit:
                 raise ParserError(f"{path}: time column {key!r} must declare 'unit'")
 
         labels_raw = raw.get("labels") or {}
         if not isinstance(labels_raw, Mapping):
             raise ParserError(f"{path}: 'labels' must be a mapping")
-        labels = {str(k): _parse_column_spec(v, str(k), path) for k, v in labels_raw.items()}
+        labels = {str(k): _parse_column_spec(v, str(k), source) for k, v in labels_raw.items()}
 
         aggregate_raw = raw.get("aggregate") or {}
         if not isinstance(aggregate_raw, Mapping):
@@ -251,8 +256,8 @@ class CsvMapping:
                     f"{path}: aggregate.by entry {key!r} must be declared under 'labels'"
                 )
 
-        extras = tuple(_parse_extra(entry, path) for entry in raw.get("extra_metrics") or ())
-        flags = tuple(_parse_row_flag(entry, path) for entry in raw.get("row_flags") or ())
+        extras = tuple(_parse_extra(entry, source) for entry in raw.get("extra_metrics") or ())
+        flags = tuple(_parse_row_flag(entry, source) for entry in raw.get("row_flags") or ())
 
         csv_cfg = raw.get("csv") or {}
         mapping = cls(
@@ -516,24 +521,40 @@ class MappingCsvParser:
                 )
             meta.add_warning("missing_column", f"可选列 {name!r} 不存在，对应指标视为未采集")
 
+        # 33 列 / 46 列导出差异：extra_metrics 的列缺失时不能静默消失，
+        # 必须在 meta 里留下可机读清单（R09）。缺失只影响该指标，不阻塞解析。
+        normalized_header = {_norm(name) for name in columns.header}
+        missing_extras = tuple(
+            extra.name
+            for extra in self.mapping.extra_metrics
+            if not any(_norm(candidate) in normalized_header for candidate in extra.columns)
+        )
+        meta.extra["missing_extra_metrics"] = list(missing_extras)
+        for name in missing_extras:
+            meta.add_warning(
+                "missing_extra_metric",
+                f"可选指标 {name!r} 的列在该导出中不存在，视为未采集（不填 0）",
+                str(file),
+            )
+
     def _resolve_columns(self, header: list[str]) -> _Columns:
         index: dict[str, int] = {}
         for position, name in enumerate(header):
             index.setdefault(_norm(name), position)
 
         fields: dict[str, int] = {}
-        for canonical, spec in self.mapping.fields.items():
-            for candidate in spec.names:
-                position = index.get(_norm(candidate))
-                if position is not None:
-                    fields[canonical] = position
+        for canonical, field_spec in self.mapping.fields.items():
+            for candidate in field_spec.names:
+                field_pos = index.get(_norm(candidate))
+                if field_pos is not None:
+                    fields[canonical] = field_pos
                     break
         labels: dict[str, int] = {}
-        for label_name, spec in self.mapping.labels.items():
-            for candidate in spec.names:
-                position = index.get(_norm(candidate))
-                if position is not None:
-                    labels[label_name] = position
+        for label_name, label_spec in self.mapping.labels.items():
+            for candidate in label_spec.names:
+                label_pos = index.get(_norm(candidate))
+                if label_pos is not None:
+                    labels[label_name] = label_pos
                     break
         extras: dict[str, tuple[int, ...]] = {}
         for extra in self.mapping.extra_metrics:
@@ -543,11 +564,11 @@ class MappingCsvParser:
             if positions:
                 extras[extra.name] = positions
         flags: dict[str, int] = {}
-        for spec in self.mapping.row_flags:
-            for candidate in spec.columns:
-                position = index.get(_norm(candidate))
-                if position is not None:
-                    flags[spec.name] = position
+        for flag_spec in self.mapping.row_flags:
+            for candidate in flag_spec.columns:
+                flag_pos = index.get(_norm(candidate))
+                if flag_pos is not None:
+                    flags[flag_spec.name] = flag_pos
                     break
         return _Columns(
             fields=fields, labels=labels, extras=extras, header=tuple(header), flags=flags
@@ -597,7 +618,11 @@ class MappingCsvParser:
             groups[group_key] = group
             if len(self.mapping.aggregate.by) > 1:
                 group.labels = {
-                    name: value for name, value in zip(self.mapping.aggregate.by[1:], group_key[1:]) if value
+                    name: value
+                    for name, value in zip(
+                        self.mapping.aggregate.by[1:], group_key[1:], strict=True
+                    )
+                    if value
                 }
 
         group.task_types[task_type] = group.task_types.get(task_type, 0) + 1
@@ -682,7 +707,7 @@ class MappingCsvParser:
                     continue
                 value = part if value is None else value + part
             if value is not None:
-                group.observe_extra(extra, value)
+                group.observe_extra(extra, value * extra.scale)
 
         for spec in self.mapping.row_flags:
             position = columns.flags.get(spec.name)
@@ -820,19 +845,19 @@ class _Group:
 
         attributes = {"raw_operator": self.raw_operator}
         attributes.update(self.labels)
-        for spec in mapping.row_flags:
-            count = self.flag_tasks.get(spec.name, 0)
-            extras[f"{spec.name}_tasks"] = Metric(
-                float(count), "count", Provenance.MEASURED, f"{self.source}:{spec.name} rows"
+        for flag_spec in mapping.row_flags:
+            count = self.flag_tasks.get(flag_spec.name, 0)
+            extras[f"{flag_spec.name}_tasks"] = Metric(
+                float(count), "count", Provenance.MEASURED, f"{self.source}:{flag_spec.name} rows"
             )
-            extras[f"{spec.name}_time_us"] = Metric(
-                self.flag_time.get(spec.name, 0.0),
+            extras[f"{flag_spec.name}_time_us"] = Metric(
+                self.flag_time.get(flag_spec.name, 0.0),
                 "us",
                 Provenance.MEASURED,
-                f"{self.source}:{spec.name} duration sum",
+                f"{self.source}:{flag_spec.name} duration sum",
             )
             if self.calls:
-                attributes[f"{spec.name}_ratio"] = str(round(count / self.calls, 4))
+                attributes[f"{flag_spec.name}_ratio"] = str(round(count / self.calls, 4))
 
 
         if len(self.task_types) > 1:
@@ -970,6 +995,14 @@ def _parse_extra(raw: Any, path: Path) -> ExtraMetricSpec:
             except ValueError as exc:
                 raise ParserError(f"{path}: unknown task_type {value!r} in 'when'") from exc
         when_types = tuple(resolved)
+    scale_raw = raw.get("scale", 1.0)
+    try:
+        scale = float(scale_raw)
+    except (TypeError, ValueError) as exc:
+        raise ParserError(f"{path}: extra metric scale must be numeric, got {scale_raw!r}") from exc
+    if not math.isfinite(scale) or scale <= 0:
+        raise ParserError(f"{path}: extra metric scale must be finite and > 0, got {scale_raw!r}")
+
     computed = str(raw.get("computed", "")).strip().lower()
     if computed and computed not in _COMPUTED_METRICS:
         raise ParserError(
@@ -982,6 +1015,7 @@ def _parse_extra(raw: Any, path: Path) -> ExtraMetricSpec:
         agg=agg,
         combine=combine,
         when_task_types=when_types,
+        scale=scale,
         computed=computed,
     )
 

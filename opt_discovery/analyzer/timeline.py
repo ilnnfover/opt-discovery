@@ -742,14 +742,16 @@ def summarize(
     if host_seg_start is not None:
         host_busy += (host_seg_end or host_seg_start) - host_seg_start
     for index in range(len(big_gaps)):
-        if gap_seg_start[index] is not None:
-            overlaps[index] += (gap_seg_end[index] or gap_seg_start[index]) - gap_seg_start[index]
+        seg_start = gap_seg_start[index]
+        if seg_start is not None:
+            seg_end = gap_seg_end[index]
+            overlaps[index] += (seg_end if seg_end is not None else seg_start) - seg_start
 
     idle_by_class: dict[str, float] = {CLASS_ACL_BUSY: 0.0, CLASS_HOST_SILENT: 0.0, CLASS_MIXED: 0.0}
     gaps_by_class: dict[str, int] = {CLASS_ACL_BUSY: 0, CLASS_HOST_SILENT: 0, CLASS_MIXED: 0}
     idle_analyzed = 0.0
     idle_covered = 0.0
-    for (start, end), overlap in zip(big_gaps, overlaps):
+    for (start, end), overlap in zip(big_gaps, overlaps, strict=True):
         idle_analyzed += end - start
         idle_covered += min(overlap, end - start)
         duration = end - start
@@ -765,7 +767,7 @@ def summarize(
 
     silent_gaps = [
         (start, end)
-        for (start, end), overlap in zip(big_gaps, overlaps)
+        for (start, end), overlap in zip(big_gaps, overlaps, strict=True)
         if (overlap / (end - start) if end > start else 0.0) <= HOST_SILENT_RATIO
     ]
     silent_total = sum(end - start for start, end in silent_gaps)
@@ -774,7 +776,7 @@ def summarize(
     mstx_ranges = []
     mstx_sync = 0.0
     mstx_available = bool(getattr(mstx, "available", False))
-    if mstx_available and getattr(mstx, "ranges", ()):
+    if mstx_available and getattr(mstx, "ranges", None):
         mstx_ranges = sorted(mstx.ranges, key=lambda item: item.start_us)
         mstx_sync = float(getattr(mstx, "sync_us", 0.0))
         per_name: dict[str, float] = {}
@@ -810,11 +812,11 @@ def summarize(
         )[:top_n]
     )
 
-    overlap, overlap_available = load_overlap_totals(db_path, window)
-    compute_us = overlap.get("compute", 0.0)
-    communication_us = overlap.get("communication", 0.0)
-    exposed_us = overlap.get("comm_not_overlapped", 0.0)
-    free_us = overlap.get("free", 0.0)
+    overlap_totals, overlap_available = load_overlap_totals(db_path, window)
+    compute_us = overlap_totals.get("compute", 0.0)
+    communication_us = overlap_totals.get("communication", 0.0)
+    exposed_us = overlap_totals.get("comm_not_overlapped", 0.0)
+    free_us = overlap_totals.get("free", 0.0)
 
     notes: list[str] = [
         "gap 归因基于 Host CANN_API 是否在 gap 内活动：acl_busy=Host 在下发，"

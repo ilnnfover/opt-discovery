@@ -134,7 +134,6 @@ def test_sample_floor_blocks_small_sample_calibration():
 
 
 def test_overlay_roundtrip_preserves_declared(tmp_path):
-    from opt_discovery.schemas.operator import ParseMeta
 
     ruleset = RuleSet.load(RULES)
     tables = {f"wl-{i}": _table(f"wl-{i}") for i in range(3)}

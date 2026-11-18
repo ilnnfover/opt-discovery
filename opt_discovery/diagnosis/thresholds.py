@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +23,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ..schemas.metrics import Provenance
 from .rules import RuleSet, Threshold
 
 __all__ = [
@@ -81,7 +81,7 @@ def load_overlay(path: str | Path) -> ThresholdOverlay:
             name=str(name),
             value=float(spec["value"]),
             unit=str(spec.get("unit", "ratio")),
-            provenance=str(spec.get("provenance", "assumed")),
+            provenance=Provenance(str(spec.get("provenance", "assumed"))),
             basis=str(spec.get("basis", "")),
         )
     return ThresholdOverlay(

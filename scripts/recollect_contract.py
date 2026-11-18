@@ -92,7 +92,9 @@ def build_harnesses(contract: dict) -> dict[str, Path]:
         if len(matches) < 2:
             raise RuntimeError(f"{source}: 找不到 warmup/active 两个循环")
         for match, value in zip(
-            (matches[1], matches[0]), (fixed["active_rounds"], fixed["warmup_rounds"])
+            (matches[1], matches[0]),
+            (fixed["active_rounds"], fixed["warmup_rounds"]),
+            strict=True,
         ):
             text = (
                 text[: match.start()]

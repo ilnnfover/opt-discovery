@@ -7,7 +7,7 @@ metric is never enough to declare a bottleneck.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 __all__ = ["BottleneckType", "BottleneckInfo", "BOTTLENECK_LIBRARY", "get_bottleneck"]

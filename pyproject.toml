@@ -10,7 +10,11 @@ requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
 
 [project.scripts]
 opt-discovery = "opt_discovery.cli:main"
@@ -22,3 +26,30 @@ include = ["opt_discovery*"]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+# 与 requires-python 对齐：CI 在 3.10（最低支持）与 3.12（主要版本）上运行
+target-version = "py310"
+line-length = 110
+# scripts/harness/*.py 是从 $NPU_STACK 复制并注入参数的采集模板（上游 harness 镜像），
+# 不在本项目库代码边界内；格式化它们会让「脚本与上游一致」的核对失效。
+extend-exclude = ["out", "export_only_prof_dir", "scripts/harness"]
+
+[tool.ruff.lint]
+# 只启用确定性高、误报低的规则集；格式化(ruff format)与 E501 暂不纳入阻塞检查，
+# 避免一次性大面积重排与语义变更混在同一个提交里（收敛计划见 docs/engineering/baseline-audit.md）。
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+# tests/regression 的共享构造器与包内代码同属本仓库 first-party
+known-first-party = ["opt_discovery", "_helpers"]
+
+[tool.mypy]
+# 选 mypy 而不是 pyright：纯 Python 实现，随 dev extra 一起安装即可在本地与 CI 得到
+# 同一个版本与结果，不需要额外 Node 运行时；配置集中在 pyproject，避免多份冲突配置。
+python_version = "3.10"
+files = ["opt_discovery"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true

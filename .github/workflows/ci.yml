@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static:
+    name: static (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: mypy
+        run: python -m mypy
+
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 = requires-python 的最低支持版本；3.12 = 主要运行版本
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Unit / contract / regression tests
+        run: python -m pytest -q
+      - name: Config validation
+        run: python -m opt_discovery.cli validate
+      - name: Synthetic pipeline self-test
+        run: python -m opt_discovery.cli demo --out out/demo-ci
+      - name: Real regression must fail closed without data
+        # 公开 runner 没有私有导出：必须得到 BLOCKED(2) 而不是 0（PASS）
+        run: python scripts/verify_real.py || [ $? -eq 2 ]

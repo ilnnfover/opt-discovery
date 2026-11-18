@@ -22,12 +22,12 @@ from pathlib import Path
 
 from .analyzer.collection_audit import audit_collection
 from .analyzer.comm import summarize_comm
+from .analyzer.compare import ComparisonReport, compare_tables
 from .analyzer.contract import compare_contracts, load_table_json
 from .analyzer.graph_coverage import summarize_coverage
-from .analyzer.compare import compare_tables
+from .analyzer.hotspot import hotspot_matrix, matrix_to_text, operator_hotspots
 from .analyzer.timeline import annotate_diagnosis as annotate_with_timeline
 from .analyzer.timeline import summarize as summarize_timeline
-from .analyzer.hotspot import hotspot_matrix, matrix_to_text, operator_hotspots
 from .analyzer.window import Window, select_rounds_window
 from .collectors import discover_all
 from .collectors.mstx import load_mstx
@@ -38,23 +38,23 @@ from .diagnosis.thresholds import apply_overlay, load_overlay, overlay_summary, 
 from .discovery.generator import opportunities_from_diagnosis
 from .experiment.analyzer import compare_benchmarks, load_run
 from .experiment.calibration import DEFAULT_MIN_SAMPLES, calibrate
-from .experiment.validation import validate_thresholds
 from .experiment.feedback import apply_feedback, load_comparison
 from .experiment.runner import run_benchmark
+from .experiment.validation import validate_thresholds
 from .parsers.csv_mapping import CsvMapping, MappingCsvParser
 from .parsers.sqlite_op_report import SqliteOpReportParser
+from .parsers.synthetic import SCENARIOS, build_synthetic_table
 from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
-from .parsers.synthetic import SCENARIOS, build_synthetic_table
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
+from .schemas.workload import WorkloadSpec
 from .source_analysis.mapping import (
     DEFAULT_REPOS,
     attach_to_opportunities,
     build_source_map,
 )
 from .source_analysis.mapping import summarize as summarize_sources
-from .schemas.workload import WorkloadSpec
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RULES = _REPO_ROOT / "configs" / "rules" / "bottleneck_rules.v1.yaml"
@@ -772,10 +772,11 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
     same_scope = scopes[ranks[0]] == scopes[ranks[1]]
 
     print(f"[check-ranks] {bundle.workload_id}  ranks={ranks}")
-    for rank in ranks:
+    for rank_index in ranks:
         print(
-            f"  rank{rank}: {sources[rank]:22s} scope={scopes[rank]:7s} "
-            f"records={len(tables[rank].records):3d} calls={sum(r.calls for r in tables[rank].records):9d}"
+            f"  rank{rank_index}: {sources[rank_index]:22s} scope={scopes[rank_index]:7s} "
+            f"records={len(tables[rank_index].records):3d} "
+            f"calls={sum(r.calls for r in tables[rank_index].records):9d}"
         )
 
     base_map = {r.operator: r for r in base.records}
@@ -1035,15 +1036,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         table_a, table_b = tables.get(key_a), tables.get(key_b)
         if not table_a or not table_b:
             continue
-        report = compare_tables(table_a, table_b, top=args.top)
-        target = report.write_json(out / f"compare_{key_a}_vs_{key_b}.json")
+        comparison = compare_tables(table_a, table_b, top=args.top)
+        target = comparison.write_json(out / f"compare_{key_a}_vs_{key_b}.json")
         print(
-            f"  - {key_a} -> {key_b}: comparable={report.comparable} "
-            f"total_ratio={_fmt_ratio(report)} Δtop={report.deltas[0].operator if report.deltas else '-'}"
+            f"  - {key_a} -> {key_b}: comparable={comparison.comparable} "
+            f"total_ratio={_fmt_ratio(comparison)} "
+            f"Δtop={comparison.deltas[0].operator if comparison.deltas else '-'}"
         )
-        for warning in report.warnings:
+        for warning in comparison.warnings:
             print(f"      ~ {warning}")
-        for note in report.observations[:3]:
+        for note in comparison.observations[:3]:
             print(f"      - {note}")
         print(f"      -> {target}")
     workload_csv, operator_csv = write_summaries(out)
@@ -1052,7 +1054,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
-def _fmt_ratio(report) -> str:  # noqa: ANN001
+def _fmt_ratio(report: ComparisonReport) -> str:
     if not report.total_a_us or not report.total_b_us:
         return "-"
     return f"{report.total_b_us / report.total_a_us:.3f}"

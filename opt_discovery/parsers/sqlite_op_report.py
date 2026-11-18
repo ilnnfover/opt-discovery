@@ -30,7 +30,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ..schemas.metrics import Metric, Provenance
 from ..schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskType
@@ -174,7 +174,7 @@ def find_op_counter_db(paths: Path | Sequence[Path]) -> Path:
     raise ParserError(f"未找到 op_counter.db：{candidates}")
 
 
-def _to_float(value: object) -> float | None:
+def _to_float(value: Any) -> float | None:
     if value is None:
         return None
     try:

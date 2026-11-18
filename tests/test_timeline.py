@@ -14,8 +14,7 @@ from opt_discovery.analyzer.timeline import (
     summarize,
 )
 from opt_discovery.analyzer.window import Window
-from opt_discovery.schemas.evidence import ConfidenceLevel
-from opt_discovery.schemas.evidence import DiagnosisCandidate
+from opt_discovery.schemas.evidence import ConfidenceLevel, DiagnosisCandidate
 
 NS = 1000  # us -> ns
 

@@ -112,10 +112,13 @@ extra_metrics:
     unit: "%"
     agg: mean
   - name: communication_time_us
-    # 通信任务的设备时长就是通信时间；仅对 COMMUNICATION 行采集
+    # 通信任务的设备时长就是通信时间；仅对 COMMUNICATION 行采集。
+    # 单位陷阱：COMMUNICATION 行的 Task Duration 实际是 ns（见已知数据约束 8），
+    # 与 total_time_us 使用同一常量做**一次**换算；不要在消费者侧再次缩放。
     columns: ["Task Duration(us)"]
     unit: us
     agg: sum
+    scale: 0.001
     when:
       task_type: [communication]
   # -- 设备能力校准所需（2026-11-16 新增，33 列导出实测核对） ------------
