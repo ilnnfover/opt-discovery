@@ -52,6 +52,22 @@ def test_check_ranks_reports_inconsistency(tmp_path: Path, capsys) -> None:
     assert "一致（可合并/可代表）" not in out
 
 
+def test_check_ranks_strict_returns_nonzero_for_inconsistent_ranks(
+    tmp_path: Path, capsys
+) -> None:
+    """--strict：rank 不一致必须非零退出（默认模式保持 0 兼容既有脚本）。"""
+    export = _two_ranks(tmp_path / "export", rank1_scale=4.0)
+
+    code = main(
+        ["check-ranks", "--export", str(export), "--workload", str(WORKLOAD_YAML), "--strict"]
+    )
+    out = capsys.readouterr()
+
+    assert code == 3
+    assert "不一致（不可合并）" in out.out
+    assert "[strict]" in out.err
+
+
 def test_missing_rank_is_not_silently_merged(tmp_path: Path, capsys) -> None:
     """只有一个 rank 可用时必须非零退出并说明缺什么。"""
     export = _two_ranks(tmp_path / "export", rank1_scale=1.0)

@@ -1,0 +1,196 @@
+# AE-03 实施报告：运行契约与质量闸门
+
+- 任务：AE-03（强化 CLI / Pipeline 运行契约）
+- 日期：2026-11-18
+- 基线：`main` @ `e7d8aae`（AE-00~AE-02 合并后）
+- 本轮范围：R05/R10 质量闸门 + strict CLI + `run_manifest.json`
+- 非目标：AE-04（统一数据标准化边界，未实施）
+
+## 1. 目标与验收对照
+
+| 任务书要求 | 本轮实现 | 验证 |
+|---|---|---|
+| 保留普通模式，新增 strict 或等价验证入口 | `analyze`/`compare`/`check-ranks` 增加 `--strict`，默认行为不变 | `test_run_contract.py`、`test_r05` 双模式断言 |
+| 状态 `success/partial/incomparable/failed` 与退出码 | 内部 `status` + 退出码 0/1/3/4（缺输入入口 2） | 6 类端到端 CLI 测试 |
+| 不因可选 source-map 缺失宣告核心失败 | `source_map` 阶段 `required=false`，失败仅记录 | `test_optional_source_map_failure_keeps_success` |
+| 质量 degraded 不得无条件等同 success/failed | 阻断型（blocking）与提示型（degraded）分离 | `test_degraded_flag_only_warns_...` |
+| 比较必须依据 gate，不可比不得输出速度差 | `compare_tables` 先过质量闸门，`deltas=[]` | `test_quality_gate.py` 4 用例 |
+| `run_manifest.json`（独立 run_id/阶段/质量/产物/输入/工具） | `experiment/run_manifest.py` | `test_normal_run_is_success_and_manifest_is_verifiable` |
+| 防旧输出残留冒充本次输出 | 独立 run_id + 相对路径 + sha256 + `check-manifest` | `test_reused_output_dir_does_not_masquerade_old_artifacts` |
+| R05/R10 strict xfail 转正式断言 | `test_known_gaps.py` 删除，新增 `test_quality_gate.py` | 全量测试无 xfail |
+
+## 2. 质量闸门（R05/R10）
+
+### 2.1 契约
+
+新增 `opt_discovery/schemas/quality.py`：
+
+```python
+QualityFlag(code, message, severity="blocking"|"degraded", source, details)
+```
+
+标记随 `ParseMeta.extra["quality_flags"]` 落盘（JSON 兼容，旧表无该字段视为“未验证”）：
+
+| code | severity | 触发条件 |
+|---|---|---|
+| `rank_merge_inconsistent` | blocking | 两 rank 同口径 calls/total 超出 0.90–1.10 / 0.80–1.25，或跨口径单次耗时中位数超出 0.70–1.40 |
+| `rank_merge_unverified` | blocking | 声明多个 rank 但可解析不足 2 个（或评估异常） |
+| `rank_duration_inconsistent` | blocking | timeline 判定「任务数接近但累计时长差数倍」（长 kernel 截断） |
+| `rank_scope_mismatch` | degraded | 两 rank 口径不同（窗口 vs 全量），仅可比较单次耗时 |
+| `sqlite_fallback` / `window_degraded` | degraded | 既有能力边界（本轮只登记，不新增消费） |
+
+### 2.2 评估与传播
+
+`opt_discovery/analyzer/rank_quality.py`：
+
+- `assess_rank_tables`：与历史 `check-ranks` 完全同口径，返回 `RankMergeAssessment`
+  （ratios、中位数、逐 rank 摘要、逐算子行）；
+- `assess_bundle`：读取全部 rank（CSV 优先，缺失回退 sqlite），产出标记；
+- `rank_quality_from_timeline`：把 `rank_duration_inconsistent` 转成 blocking 标记；
+- CLI `check-ranks` 改为调用同一实现（输出文案保持兼容），新增 `--strict`（不一致 → 3）。
+
+`cmd_analyze` 在解析后立即评估并把标记挂到表上，再进入诊断/落盘；`cmd_compare` 与 `analyze`
+内部的对比都通过 `compare_tables` 读取标记：
+
+```python
+quality_flags = flags_from_meta(a.meta) + flags_from_meta(b.meta)
+blocking_flags = blocking(quality_flags)
+if blocking_flags:
+    comparable = False
+    reasons += [f"质量闸门未通过（{flag.code}）：{flag.message}", ...]
+```
+
+不可比时 `deltas=[]`，`observations` 明确写「数据质量闸门未通过，不得据此输出速度差或因果结论」；
+`to_dict()` 增加 `quality_flags`，落盘后可被下游机器读取。
+
+## 3. 运行契约
+
+### 3.1 退出码
+
+| 状态 | 含义 | strict | 普通模式 |
+|---|---|---|---|
+| `success` | 必需步骤通过、对比可比 | 0 | 0 |
+| `failed` | 缺输入/必需步骤失败且无可解析 Workload | 1 | 1 |
+| 缺输入（无 export） | 入口即阻断 | 2 | 2 |
+| `partial` | 有产物但必需步骤未完成 | 3 | 0（兼容） |
+| `incomparable` | 质量/契约未通过 | 4 | 0（兼容） |
+
+普通模式保持既有行为（≥1 张表即 0），但 manifest 记录真实状态；strict 供 CI/Agent 使用。
+
+### 3.2 `run_manifest.json`
+
+`opt_discovery/experiment/run_manifest.py`（schema 1.0）：
+
+```json
+{
+  "schema_version": "1.0",
+  "run_id": "analyze-20261118T...-ab12cd34",
+  "status": "partial",
+  "is_synthetic": false,
+  "strict": true,
+  "stages": [
+    {"name": "discover", "required": true, "status": "passed", "artifacts": []},
+    {"name": "parse", "required": true, "status": "passed", "artifacts": []},
+    {"name": "timeline", "required": true, "status": "failed",
+     "reason_code": "timeline_failed", "artifacts": [], "details": {"failed": ["wl"]}},
+    {"name": "compare", "required": false, "status": "passed", "artifacts": []}
+  ],
+  "workloads": [{"workload_id": "...", "status": "partial", "quality_flags": ["rank_merge_inconsistent"]}],
+  "quality_flags": ["rank_merge_inconsistent"],
+  "comparison_status": "incomparable",
+  "artifacts": [{"name": "hotspots.json", "path": "hotspots.json", "bytes": 123, "sha256": "..."}],
+  "inputs": {"exports_root": "<data-root>", "export_dirs": ["qwen35-prefill"], "configs": [{"name": "...", "sha256": "..."}]},
+  "tool": {"name": "opt-discovery", "version": "0.1.0", "python": "3.12.13", "git_commit": "e7d8aae"}
+}
+```
+
+要点：
+
+- `run_id` 每次运行唯一；`previous_run_id` 记录同目录上一次运行；
+- 产物只记**相对路径 + sha256**；`check-manifest` 校验存在性与哈希；
+- 输入不写绝对路径（`exports_root` 记为 `<data-root>`）；
+- 阶段状态区分 `passed/failed/skipped/not_requested`；可选步骤失败不改变总体成功。
+
+### 3.3 行为细节
+
+- `analyze` 以前在逐 Workload 异常时 `continue` 且返回 0；现在记录到 `parse_failures` /
+  `timeline_failures`，strict 返回 3，manifest 标记 `partial`；
+- 解析异常不再让整批崩溃（`parse_error` 记入 workload 与 stage）；
+- 无 `msprof_*.db` 时 `timeline` 记为 `skipped / no_db`（之前隐含“成功”）；
+- `compare` 读取输入失败不再抛栈，返回 1 + manifest `failed / load_error`；
+- `check-ranks --strict` 不一致返回 3（默认仍 0）。
+
+## 4. 测试
+
+新增/调整：
+
+| 文件 | 用例 | 覆盖 |
+|---|---|---|
+| `tests/test_run_contract.py` | 6 | 正常、缺输入、必需步骤失败（partial）、不可比（4）、可选步骤失败、旧产物/tamper/`check-manifest` |
+| `tests/regression/test_quality_gate.py` | 4 | 4x 链路 → compare 阻断；截断标记阻断；degraded 仅警告；CLI strict 4 / 普通 0 + manifest |
+| `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
+| `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
+
+全量：**222 passed, 17 skipped**（239 用例，无 xfail）。
+
+## 5. 实际改动
+
+| 文件 | 改动 |
+|---|---|
+| `opt_discovery/schemas/quality.py` | 新增：`QualityFlag`、severity、`attach/flags_from_meta/blocking/degraded`、稳定 code |
+| `opt_discovery/analyzer/rank_quality.py` | 新增：rank 评估（与历史 CLI 同口径）、bundle 评估、timeline 标记转换 |
+| `opt_discovery/analyzer/compare.py` | 增加 `quality_flags` 字段与序列化；`compare_tables` 先过质量闸门；不可比说明区分契约/质量 |
+| `opt_discovery/cli.py` | `check-ranks` 复用评估 + `--strict`；`analyze` 接入质量标记、`--strict`/`--run-id`/`--manifest`、阶段状态、manifest；`compare` 接入 `--strict` 与 manifest、输入错误可判定；新增 `check-manifest` |
+| `opt_discovery/experiment/run_manifest.py` | 新增：状态/阶段契约、run_id、sha256 产物、工具/输入指纹、写盘与校验 |
+| `tests/regression/test_quality_gate.py` | 新增：4 条正式断言（取代 xfail） |
+| `tests/regression/test_known_gaps.py` | 删除 |
+| `tests/test_run_contract.py` | 新增：6 条 CLI 契约用例 |
+| `docs/engineering/regression-matrix.md` | R05/R10 → enforced；AE-03 说明 |
+| `docs/engineering/baseline-audit.md` | D6/D7 关闭；INV-05 调整；§10 关闭项 |
+| `README.md` | strict 退出码、manifest、质量闸门说明 |
+
+## 6. 验证记录
+
+环境：Python 3.12.13（主）；3.11.6 复验；pytest 9.2.0（3.10/3.11 环境）与 8.3.2（系统）。
+
+| 检查 | 退出码 | 结果 |
+|---|---|---|
+| `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
+| `python -m pytest` | 0 | 222 passed, 17 skipped（239 用例） |
+| `python -m pytest tests/regression` | 0 | 61 passed |
+| 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
+| `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
+| 3.11 全量 | 0 | 222 passed, 17 skipped |
+
+未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
+合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
+单独保护。
+
+## 7. 兼容性与行为变化
+
+1. **默认行为不变**：`analyze`/`compare`/`check-ranks` 不加 `--strict` 时退出码与之前一致；
+   `analyze` 仍写原有产物路径，新增 `run_manifest.json`。
+2. `compare` 报告中新增 `quality_flags` 字段（只增不改）；`deltas` 在阻断时为空数组。
+3. `analyze` 对解析异常的处理从「直接抛栈中断整批」改为「记录失败并继续」；
+   strict 返回 3，普通模式返回 0（与之前“跳过继续”的语义一致，但可审计）。
+4. `ParseMeta.extra["quality_flags"]` 为新增字段；旧 JSON 无该字段时按“未验证”处理，不阻断。
+5. `check-manifest` 为新增子命令；不改变既有命令。
+
+## 8. 未完成 / 剩余风险
+
+| 项 | 说明 | 归属 |
+|---|---|---|
+| `compare --strict` 不强制要求 quality_flags 存在 | 避免破坏手工 JSON 工作流；绕过 `analyze` 的构造仍可“未验证” | AE-07（证据流转契约） |
+| `analyze` 内部对比未应用 `check-runs` 的采集契约 gate | 仅用 `comparable_with` + 质量标记；契约 gate 仍是独立命令 | AE-07 |
+| 质量标记只覆盖 rank 合并与时长截断 | `sqlite_fallback`/`window_degraded` 仍是 degraded，不阻断 | 视需求 |
+| `check-ranks` 未写 manifest | 任务是“比较入口”，rank 校验属于诊断工具 | AE-03 之后按需 |
+| 真实导出完整 analyze 未跑 | 成本/体积；以合成契约测试 + 真实解析测试分工 | AE-06 |
+| AE-04 未实施 | 本轮范围外 | AE-04 |
+
+## 9. 提交
+
+| 项 | 值 |
+|---|---|
+| 分支 | `feat/ae-03-run-contract`（基于 `main` @ `e7d8aae`） |
+| 提交 | 见 `git log -1`（独立提交，不混入 AE-00~AE-02 历史） |
+| 远程 | 未 push（待确认） |

@@ -26,6 +26,12 @@ from .analyzer.compare import ComparisonReport, compare_tables
 from .analyzer.contract import compare_contracts, load_table_json
 from .analyzer.graph_coverage import summarize_coverage
 from .analyzer.hotspot import hotspot_matrix, matrix_to_text, operator_hotspots
+from .analyzer.rank_quality import (
+    assess_bundle,
+    assess_rank_tables,
+    load_rank_tables,
+    rank_quality_from_timeline,
+)
 from .analyzer.timeline import annotate_diagnosis as annotate_with_timeline
 from .analyzer.timeline import summarize as summarize_timeline
 from .analyzer.window import Window, select_rounds_window
@@ -39,6 +45,39 @@ from .discovery.generator import opportunities_from_diagnosis
 from .experiment.analyzer import compare_benchmarks, load_run
 from .experiment.calibration import DEFAULT_MIN_SAMPLES, calibrate
 from .experiment.feedback import apply_feedback, load_comparison
+from .experiment.run_manifest import (
+    COMPARISON_INCOMPARABLE,
+    COMPARISON_NOT_REQUESTED,
+    COMPARISON_SUCCESS,
+    STAGE_FAILED,
+    STAGE_NOT_REQUESTED,
+    STAGE_PASSED,
+    STAGE_SKIPPED,
+    STATUS_EXIT,
+    STATUS_FAILED,
+    STATUS_INCOMPARABLE,
+    STATUS_PARTIAL,
+    STATUS_SUCCESS,
+    RunManifest,
+    StageRecord,
+    WorkloadRecord,
+    collect_artifacts,
+    fingerprint_configs,
+    new_run_id,
+    read_manifest,
+    tool_info,
+    verify_manifest,
+    write_manifest,
+)
+from .experiment.run_manifest import (
+    EXIT_FAILED as MANIFEST_EXIT_FAILED,
+)
+from .experiment.run_manifest import (
+    EXIT_INVALID as MANIFEST_EXIT_INVALID,
+)
+from .experiment.run_manifest import (
+    EXIT_SUCCESS as MANIFEST_EXIT_SUCCESS,
+)
 from .experiment.runner import run_benchmark
 from .experiment.validation import validate_thresholds
 from .parsers.csv_mapping import CsvMapping, MappingCsvParser
@@ -48,6 +87,8 @@ from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
+from .schemas.quality import attach as attach_quality
+from .schemas.quality import blocking as blocking_quality
 from .schemas.workload import WorkloadSpec
 from .source_analysis.mapping import (
     DEFAULT_REPOS,
@@ -737,24 +778,11 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
 
     parser = MappingCsvParser(CsvMapping.load(args.summary_mapping))
     sqlite_parser = SqliteOpReportParser()
-    tables: dict[int, OperatorTable] = {}
-    sources: dict[int, str] = {}
-    scopes: dict[int, str] = {}
-    for rank in bundle.ranks:
-        if rank.op_summary_files:
-            tables[rank.rank] = parser.parse(
-                rank.op_summary_files, bundle.workload, window=window
-            )
-            sources[rank.rank] = "op_summary(窗口)"
-            scopes[rank.rank] = "window"
-        else:
-            target = rank.op_report_db or rank.directory
-            try:
-                tables[rank.rank] = sqlite_parser.parse(target, bundle.workload)
-                sources[rank.rank] = "sqlite op_report(全量)"
-                scopes[rank.rank] = "full"
-            except Exception as exc:  # noqa: BLE001
-                print(f"  rank{rank.rank}: 无法解析 ({exc})")
+    tables, sources, scopes, problems = load_rank_tables(
+        bundle, parser, sqlite_parser, window
+    )
+    for problem in problems:
+        print(f"  {problem}")
 
     if len(tables) < 2:
         print(
@@ -763,74 +791,72 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
         )
         return 2
 
-    ranks = sorted(tables)
-    base, peer = tables[ranks[0]], tables[ranks[1]]
-    total_base = base.total_operator_time_us() or 0.0
-    total_peer = peer.total_operator_time_us() or 0.0
-    calls_base = sum(r.calls for r in base.records)
-    calls_peer = sum(r.calls for r in peer.records)
-    same_scope = scopes[ranks[0]] == scopes[ranks[1]]
-
-    print(f"[check-ranks] {bundle.workload_id}  ranks={ranks}")
-    for rank_index in ranks:
+    assessment = assess_rank_tables(tables, sources, scopes)
+    ranks = assessment.ranks
+    print(f"[check-ranks] {bundle.workload_id}  ranks={list(ranks)}")
+    for digest in assessment.digests:
         print(
-            f"  rank{rank_index}: {sources[rank_index]:22s} scope={scopes[rank_index]:7s} "
-            f"records={len(tables[rank_index].records):3d} "
-            f"calls={sum(r.calls for r in tables[rank_index].records):9d}"
+            f"  rank{digest.rank}: {digest.source:22s} scope={digest.scope:7s} "
+            f"records={digest.records:3d} calls={digest.calls:9d}"
         )
-
-    base_map = {r.operator: r for r in base.records}
-    rows = []
-    for record in peer.records:
-        reference = base_map.get(record.operator)
-        if reference is None or not reference.total_time_us or not record.total_time_us:
-            continue
-        share_base = reference.total_time_us.value / total_base if total_base else 0.0
-        share_peer = record.total_time_us.value / total_peer if total_peer else 0.0
-        avg_base = reference.total_time_us.value / reference.calls if reference.calls else 0.0
-        avg_peer = record.total_time_us.value / record.calls if record.calls else 0.0
-        rows.append(
-            (
-                record.operator,
-                share_base,
-                share_peer,
-                avg_base,
-                avg_peer,
-                (avg_peer / avg_base) if avg_base else None,
-            )
-        )
-    rows.sort(key=lambda item: -item[1])
 
     print()
-    if same_scope:
-        calls_ratio = calls_peer / calls_base if calls_base else 0.0
-        total_ratio = total_peer / total_base if total_base else 0.0
-        print(f"  口径相同（{scopes[ranks[0]]}）：calls_ratio={calls_ratio:.3f} total_ratio={total_ratio:.3f}")
-        consistent = 0.9 <= calls_ratio <= 1.1 and 0.8 <= total_ratio <= 1.25
+    if assessment.same_scope:
+        calls_ratio = assessment.calls_ratio or 0.0
+        total_ratio = assessment.total_ratio or 0.0
+        print(
+            f"  口径相同（{scopes[ranks[0]]}）："
+            f"calls_ratio={calls_ratio:.3f} total_ratio={total_ratio:.3f}"
+        )
     else:
         print(
             f"  口径不同（{scopes[ranks[0]]} vs {scopes[ranks[1]]}）："
             "calls/total 不可直接比较，只看单次耗时与占比结构"
         )
-        ratios = [item[5] for item in rows[:8] if item[5] is not None]
-        median = sorted(ratios)[len(ratios) // 2] if ratios else None
-        consistent = bool(median is not None and 0.7 <= median <= 1.4)
-        if median is not None:
-            print(f"  前 8 大算子的单次耗时比中位数：{median:.3f}")
+        if assessment.median_avg_ratio is not None:
+            print(f"  前 8 大算子的单次耗时比中位数：{assessment.median_avg_ratio:.3f}")
 
-    print(f"  判定: {'一致（可合并/可代表）' if consistent else '不一致（不可合并）'}")
-    if not consistent:
+    verdict = "一致（可合并/可代表）" if assessment.consistent else "不一致（不可合并）"
+    print(f"  判定: {verdict}")
+    if not assessment.consistent:
         print("  依据：单次耗时整体偏离 1.0 -> 两 rank 采集状态不同（profiling 开销/设备状态）")
+        for reason in assessment.reasons:
+            print(f"    - {reason}")
         print("  建议：用相同配置复采一个小窗口，或先用 Serving 指标交叉验证")
+    else:
+        for reason in assessment.reasons:
+            print(f"    - {reason}")
 
     print()
-    print(f"  {'operator':<26}{'share_base':>11}{'share_peer':>11}{'avg_base(us)':>14}{'avg_peer(us)':>13}{'avg_ratio':>10}")
-    for operator, share_base, share_peer, avg_base, avg_peer, ratio in rows[:8]:
+    print(
+        f"  {'operator':<26}{'share_base':>11}{'share_peer':>11}"
+        f"{'avg_base(us)':>14}{'avg_peer(us)':>13}{'avg_ratio':>10}"
+    )
+    for row in assessment.rows[:8]:
+        ratio = "-" if row.avg_ratio is None else f"{row.avg_ratio:10.3f}"
         print(
-            f"  {operator:<26}{share_base * 100:10.2f}%{share_peer * 100:10.2f}%"
-            f"{avg_base:14.1f}{avg_peer:13.1f}{('-' if ratio is None else f'{ratio:10.3f}')}"
+            f"  {row.operator:<26}{row.share_base * 100:10.2f}%{row.share_peer * 100:10.2f}%"
+            f"{row.avg_base:14.1f}{row.avg_peer:13.1f}{ratio}"
         )
+    if getattr(args, "strict", False) and not assessment.consistent:
+        print("  [strict] rank 不一致 -> 退出码 3", file=sys.stderr)
+        return 3
     return 0
+
+
+# ---------------------------------------------------------------------------
+# check-manifest（产物清单校验）
+# ---------------------------------------------------------------------------
+def cmd_check_manifest(args: argparse.Namespace) -> int:
+    problems = verify_manifest(args.path)
+    print(f"[check-manifest] {args.path}")
+    if not problems:
+        print("  OK: 清单内产物均存在且哈希一致")
+        return 0
+    for item in problems:
+        print(f"  ! {item}")
+    print("  结论：产物与清单不一致（旧产物/被修改/缺失），不能视为本次运行输出")
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -857,12 +883,72 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # compare
 # ---------------------------------------------------------------------------
 def cmd_compare(args: argparse.Namespace) -> int:
-    a = OperatorTable.read_json(args.a)
-    b = OperatorTable.read_json(args.b)
-    report = compare_tables(a, b, top=args.top)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    strict = bool(getattr(args, "strict", False))
+    run_id = getattr(args, "run_id", None) or new_run_id("compare")
+    manifest_path = Path(getattr(args, "manifest", None) or (out_dir / "run_manifest.json"))
+    previous_run_id: str | None = None
+    if manifest_path.is_file():
+        try:
+            previous_run_id = read_manifest(manifest_path).get("run_id")
+        except (OSError, ValueError):
+            previous_run_id = None
+
+    artifacts: dict[str, Path] = {}
+    inputs = {"a": Path(args.a).name, "b": Path(args.b).name}
+
+    def _finish(
+        status: str,
+        *,
+        stages: list,
+        report: ComparisonReport | None = None,
+        synthetic: bool = False,
+    ) -> int:
+        if report is None:
+            comparison_status = COMPARISON_NOT_REQUESTED
+            quality_codes: tuple[str, ...] = ()
+        else:
+            comparison_status = (
+                COMPARISON_SUCCESS if report.comparable else COMPARISON_INCOMPARABLE
+            )
+            quality_codes = tuple(sorted({flag.code for flag in report.quality_flags}))
+        manifest = RunManifest(
+            run_id=run_id,
+            status=status,
+            strict=strict,
+            is_synthetic=synthetic,
+            stages=tuple(stages),
+            quality_flags=quality_codes,
+            comparison_status=comparison_status,
+            artifacts=collect_artifacts(artifacts, out_dir),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        target = write_manifest(manifest_path, manifest)
+        print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
+        if strict:
+            return STATUS_EXIT[status]
+        return 0
+
+    try:
+        a = OperatorTable.read_json(args.a)
+        b = OperatorTable.read_json(args.b)
+    except Exception as exc:  # noqa: BLE001 - 输入错误要可判定，不能抛栈
+        print(f"[compare] 读取输入失败: {exc}", file=sys.stderr)
+        _finish(
+            STATUS_FAILED,
+            stages=[
+                StageRecord("load", True, STAGE_FAILED, "load_error", details={"error": str(exc)}),
+                StageRecord("compare", True, STAGE_NOT_REQUESTED),
+            ],
+        )
+        return MANIFEST_EXIT_FAILED
+
+    report = compare_tables(a, b, top=args.top)
     target = report.write_json(out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json")
+    artifacts[f"compare_{a.workload_id}_vs_{b.workload_id}.json"] = target
     print(f"[compare] {report.a_id} -> {report.b_id}  comparable={report.comparable}")
     for reason in report.reasons:
         print(f"  ! {reason}")
@@ -870,7 +956,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print(f"  ~ {warning}")
     for note in report.observations:
         print(f"  - {note}")
-    header = f"{'operator':<26}{'share_a':>10}{'share_b':>10}{'Δshare':>10}{'calls_ratio':>13}{'avg_ratio':>11}"
+    header = (
+        f"{'operator':<26}{'share_a':>10}{'share_b':>10}{'Δshare':>10}"
+        f"{'calls_ratio':>13}{'avg_ratio':>11}"
+    )
     print(header)
     for delta in report.deltas[: args.top]:
         def fmt(value: float | None, scale: float = 1.0) -> str:
@@ -882,13 +971,144 @@ def cmd_compare(args: argparse.Namespace) -> int:
             f"{fmt(delta.calls_ratio):>13}{fmt(delta.avg_ratio):>11}"
         )
     print(f"-> {target}")
-    return 0
+
+    status = STATUS_SUCCESS if report.comparable else STATUS_INCOMPARABLE
+    stages = [
+        StageRecord("load", True, STAGE_PASSED),
+        StageRecord(
+            "compare",
+            True,
+            STAGE_PASSED if report.comparable else STAGE_FAILED,
+            None if report.comparable else "incomparable",
+            artifacts=(target.name,),
+        ),
+    ]
+    return _finish(
+        status,
+        stages=stages,
+        report=report,
+        synthetic=a.meta.is_synthetic or b.meta.is_synthetic,
+    )
 
 
 # ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
 def cmd_analyze(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    strict = bool(getattr(args, "strict", False))
+    run_id = getattr(args, "run_id", None) or new_run_id("analyze")
+    manifest_path = Path(getattr(args, "manifest", None) or (out / "run_manifest.json"))
+    previous_run_id: str | None = None
+    if manifest_path.is_file():
+        try:
+            previous_run_id = read_manifest(manifest_path).get("run_id")
+        except (OSError, ValueError):
+            previous_run_id = None
+
+    artifacts: dict[str, Path] = {}
+    workload_records: list[WorkloadRecord] = []
+    quality_codes: set[str] = set()
+    parse_failures: list[str] = []
+    timeline_failures: list[str] = []
+    timeline_runs = 0
+    is_synthetic = False
+    comparison_status = COMPARISON_NOT_REQUESTED
+    source_map_failed = False
+
+    inputs = {
+        "exports_root": "<data-root>",
+        "export_dirs": [],
+        "workloads_dir": Path(args.workloads_dir).name,
+        "configs": fingerprint_configs(
+            [Path(args.summary_mapping), Path(args.rules)]
+            + ([Path(args.thresholds)] if getattr(args, "thresholds", None) else [])
+        ),
+    }
+
+    def _finish(status: str, *, has_tables: bool, discover_ok: bool = True) -> int:
+        stages = [
+            StageRecord(
+                "discover",
+                True,
+                STAGE_PASSED if discover_ok else STAGE_FAILED,
+                None if discover_ok else "no_export",
+                details={"exports": len(inputs["export_dirs"])},
+            ),
+            StageRecord(
+                "parse",
+                True,
+                STAGE_FAILED if parse_failures else STAGE_PASSED,
+                "workload_parse_failed" if parse_failures else None,
+                details={"failed": list(parse_failures)},
+            ),
+            StageRecord(
+                "timeline",
+                not bool(getattr(args, "skip_timeline", False)),
+                (
+                    STAGE_FAILED
+                    if timeline_failures
+                    else (
+                        STAGE_NOT_REQUESTED
+                        if getattr(args, "skip_timeline", False)
+                        else (STAGE_PASSED if timeline_runs else STAGE_SKIPPED)
+                    )
+                ),
+                (
+                    "timeline_failed"
+                    if timeline_failures
+                    else (None if timeline_runs or getattr(args, "skip_timeline", False) else "no_db")
+                ),
+                details={"failed": list(timeline_failures), "runs": timeline_runs},
+            ),
+            StageRecord("diagnosis", True, STAGE_PASSED if has_tables else STAGE_FAILED),
+            StageRecord("opportunities", True, STAGE_PASSED if has_tables else STAGE_FAILED),
+            StageRecord(
+                "source_map",
+                False,
+                (
+                    STAGE_NOT_REQUESTED
+                    if not getattr(args, "source_map", False)
+                    else (STAGE_FAILED if source_map_failed else STAGE_PASSED)
+                ),
+                "source_map_failed" if source_map_failed else None,
+            ),
+            StageRecord(
+                "compare",
+                False,
+                (
+                    STAGE_NOT_REQUESTED
+                    if comparison_status == COMPARISON_NOT_REQUESTED
+                    else (
+                        STAGE_FAILED
+                        if comparison_status == COMPARISON_INCOMPARABLE
+                        else STAGE_PASSED
+                    )
+                ),
+                "incomparable" if comparison_status == COMPARISON_INCOMPARABLE else None,
+            ),
+        ]
+        manifest = RunManifest(
+            run_id=run_id,
+            status=status,
+            strict=strict,
+            is_synthetic=is_synthetic,
+            stages=tuple(stages),
+            workloads=tuple(workload_records),
+            quality_flags=tuple(sorted(quality_codes)),
+            comparison_status=comparison_status,
+            artifacts=collect_artifacts(artifacts, out),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        target = write_manifest(manifest_path, manifest)
+        print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
+        if strict:
+            return STATUS_EXIT[status]
+        return MANIFEST_EXIT_SUCCESS if has_tables else MANIFEST_EXIT_FAILED
+
     bundles = discover_all(args.workloads_dir, args.exports_root)
     if not bundles:
         print(
@@ -896,7 +1116,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             f"{args.exports_root} 下的目录",
             file=sys.stderr,
         )
-        return 2
+        _finish(STATUS_FAILED, has_tables=False, discover_ok=False)
+        return MANIFEST_EXIT_INVALID
+
+    inputs["export_dirs"] = sorted(bundle.export_dir.name for bundle in bundles)
 
     rounds = _parse_rounds(args.rounds)
     mapping = CsvMapping.load(args.summary_mapping)
@@ -904,26 +1127,64 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     ruleset = load_ruleset(args.rules, args.thresholds)
     device_profile = _load_device_profile(ruleset, getattr(args, "device_profile", None))
     engine = DiagnosisEngine(ruleset, device_profile=device_profile)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
 
     tables: dict[str, OperatorTable] = {}
     all_opportunities: dict[str, list] = {}
-    print(f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds}，rank={args.rank}")
+    print(
+        f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds}，rank={args.rank}，"
+        f"strict={strict}，run_id={run_id}"
+    )
     for bundle in bundles:
         workload_id = bundle.workload_id
         if bundle.run_log is None:
             print(f"  - {workload_id}: 无 workload.log，跳过（无法按轮次切窗）")
+            workload_records.append(
+                WorkloadRecord(workload_id, "skipped", reason_code="no_run_log")
+            )
             continue
         try:
             window = select_rounds_window(bundle.run_log, rounds)
             rank = bundle.rank(args.rank)
         except Exception as exc:  # noqa: BLE001 - 逐 Workload 报告，不中断整批
             print(f"  - {workload_id}: 跳过 ({exc})")
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id, "failed", reason_code="window_or_rank", details={"error": str(exc)}
+                )
+            )
             continue
 
-        table = parser.parse(rank.op_summary_files, bundle.workload, window=window)
+        try:
+            table = parser.parse(rank.op_summary_files, bundle.workload, window=window)
+        except Exception as exc:  # noqa: BLE001 - 解析失败要记录，不能静默跳过
+            print(f"  - {workload_id}: 解析失败 ({exc})", file=sys.stderr)
+            parse_failures.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id, "failed", reason_code="parse_error", details={"error": str(exc)}
+                )
+            )
+            continue
         tables[workload_id] = table
+
+        # R05：rank 合并质量必须先于诊断/对比完成，并随表落盘供 compare 消费。
+        # 这里会读取全部 rank（CSV 缺失时回退 sqlite），因此能发现「异常 rank」。
+        quality_flags: list = []
+        try:
+            assessment, rank_flags, _ = assess_bundle(
+                bundle, parser, SqliteOpReportParser(), window
+            )
+            if assessment is not None:
+                table.meta.extra["rank_quality"] = assessment.to_dict()
+            attach_quality(table.meta, rank_flags)
+            quality_flags.extend(rank_flags)
+        except Exception as exc:  # noqa: BLE001 - 评估失败要显式阻断，不能静默放过
+            from .analyzer.rank_quality import unverified_flags
+
+            fallback = unverified_flags(f"评估异常：{exc}")
+            attach_quality(table.meta, fallback)
+            quality_flags.extend(fallback)
+
         report = engine.diagnose_table(table)
 
         # TP>1 时 busy/idle 必须合并所有 rank 的库：单读一个 rank 会得出相反结论
@@ -944,6 +1205,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001
                 print(f"    ! comm 失败: {exc}")
 
+        workload_timeline_failed = False
         if not args.skip_timeline:
             if db_files:
                 try:
@@ -953,6 +1215,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     )
                     report.notes = report.notes + tuple(annotate_with_timeline(report, timeline))
                     timeline.write_json(out / workload_id / "timeline.json")
+                    # R10：时长截断是阻断型质量问题，不能只写在 notes 里。
+                    timeline_runs += 1
+                    timeline_flags = rank_quality_from_timeline(timeline)
+                    if timeline_flags:
+                        attach_quality(table.meta, timeline_flags)
+                        quality_flags.extend(timeline_flags)
                     print(
                         f"    timeline: idle={timeline.device_idle_ratio * 100:.1f}% "
                         f"acl_cover={timeline.acl_coverage_of_analyzed_idle * 100:.1f}% "
@@ -960,6 +1228,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     )
                 except Exception as exc:  # noqa: BLE001 - 单 workload 失败不影响整批
                     print(f"    ! timeline 失败: {exc}")
+                    workload_timeline_failed = True
+                    timeline_failures.append(workload_id)
 
         # comm_volume / window 质量等都挂在 meta.extra 上，必须在写盘前完成
         table.write_json(out / workload_id / "operator_table.json")
@@ -977,6 +1247,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
         quality = table.meta.extra.get("window_quality") or {}
         total = table.total_operator_time_us() or 0.0
+        blocked = [flag.code for flag in blocking_quality(quality_flags)]
+        if blocked:
+            print(f"    ! quality: {', '.join(blocked)}（比较结论将被拒绝）")
         print(
             f"\n  [{workload_id}] {bundle.workload.execution.label}  "
             f"rows={table.meta.row_count} kept={table.meta.row_count - table.meta.extra.get('rows_outside_window', 0)}"
@@ -999,34 +1272,73 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         for reason in quality.get("reasons") or ():
             print(f"    ! window: {reason}")
 
+        for name in (
+            "operator_table.json",
+            "diagnosis.json",
+            "opportunities.json",
+            "graph_coverage.json",
+            "timeline.json",
+            "comm.json",
+        ):
+            candidate = out / workload_id / name
+            if candidate.is_file():
+                artifacts[f"{workload_id}/{name}"] = candidate
+        codes = tuple(sorted({flag.code for flag in quality_flags}))
+        quality_codes.update(codes)
+        is_synthetic = is_synthetic or table.meta.is_synthetic
+        workload_records.append(
+            WorkloadRecord(
+                workload_id=workload_id,
+                status="partial" if workload_timeline_failed else "success",
+                artifacts=tuple(f"{workload_id}/{name}" for name in (
+                    "operator_table.json", "diagnosis.json", "opportunities.json"
+                )),
+                quality_flags=codes,
+                details={
+                    "rows": table.meta.row_count,
+                    "records": len(table.records),
+                    "timeline_failed": workload_timeline_failed,
+                },
+            )
+        )
+
     if not tables:
         print("没有成功解析的 Workload", file=sys.stderr)
-        return 1
+        _finish(STATUS_FAILED, has_tables=False)
+        return MANIFEST_EXIT_FAILED
 
     if args.source_map:
-        operators = {record.operator for table in tables.values() for record in table.records}
-        repos = [item for item in args.repos.split(",") if item] or list(DEFAULT_REPOS)
-        payload = build_source_map(
-            operators,
-            repos,
-            include_cpp=not args.no_source_cpp,
-            binding_path=args.binding,
-            use_bindings=not args.no_bindings,
-        )
-        write_json_file(out / "source_map.json", payload)
-        attached_total = 0
-        for workload_id, generated in all_opportunities.items():
-            attached = attach_to_opportunities(generated, payload)
-            attached_total += attached
-            if attached:
-                write_opportunities(generated, out / workload_id / "opportunities.json")
-        print(f"\n[source-map] {summarize_sources(payload)}")
-        print(f"  回填 source_refs 的机会数：{attached_total}")
+        try:
+            operators = {
+                record.operator for table in tables.values() for record in table.records
+            }
+            repos = [item for item in args.repos.split(",") if item] or list(DEFAULT_REPOS)
+            payload = build_source_map(
+                operators,
+                repos,
+                include_cpp=not args.no_source_cpp,
+                binding_path=args.binding,
+                use_bindings=not args.no_bindings,
+            )
+            write_json_file(out / "source_map.json", payload)
+            artifacts["source_map.json"] = out / "source_map.json"
+            attached_total = 0
+            for workload_id, generated in all_opportunities.items():
+                attached = attach_to_opportunities(generated, payload)
+                attached_total += attached
+                if attached:
+                    write_opportunities(generated, out / workload_id / "opportunities.json")
+            print(f"\n[source-map] {summarize_sources(payload)}")
+            print(f"  回填 source_refs 的机会数：{attached_total}")
+        except Exception as exc:  # noqa: BLE001 - source-map 是可选步骤，不能因此宣告核心失败
+            source_map_failed = True
+            print(f"  ! source-map 失败（可选步骤）: {exc}", file=sys.stderr)
 
     matrix = hotspot_matrix(tables, top=args.top)
     (out / "hotspots.json").write_text(
         json.dumps(matrix, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    artifacts["hotspots.json"] = out / "hotspots.json"
     print("\n[hotspot matrix] 算子累计时间占比")
     print(matrix_to_text(matrix, top=args.top))
 
@@ -1038,20 +1350,42 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             continue
         comparison = compare_tables(table_a, table_b, top=args.top)
         target = comparison.write_json(out / f"compare_{key_a}_vs_{key_b}.json")
+        artifacts[f"compare_{key_a}_vs_{key_b}.json"] = target
+        if not comparison.comparable:
+            comparison_status = COMPARISON_INCOMPARABLE
+        elif comparison_status == COMPARISON_NOT_REQUESTED:
+            comparison_status = COMPARISON_SUCCESS
         print(
             f"  - {key_a} -> {key_b}: comparable={comparison.comparable} "
             f"total_ratio={_fmt_ratio(comparison)} "
             f"Δtop={comparison.deltas[0].operator if comparison.deltas else '-'}"
         )
+        for reason in comparison.reasons:
+            print(f"      ! {reason}")
         for warning in comparison.warnings:
             print(f"      ~ {warning}")
         for note in comparison.observations[:3]:
             print(f"      - {note}")
         print(f"      -> {target}")
     workload_csv, operator_csv = write_summaries(out)
+    artifacts[workload_csv.name] = workload_csv
+    artifacts[operator_csv.name] = operator_csv
     print(f"\n[summary] {workload_csv.name} / {operator_csv.name}")
+
+    if parse_failures:
+        status = STATUS_PARTIAL
+    elif timeline_failures:
+        status = STATUS_PARTIAL
+    elif any(item.status == "failed" for item in workload_records):
+        status = STATUS_PARTIAL
+    elif comparison_status == COMPARISON_INCOMPARABLE:
+        status = STATUS_INCOMPARABLE
+    else:
+        status = STATUS_SUCCESS
+
+    exit_code = _finish(status, has_tables=True)
     print(f"完成。产物目录: {out.resolve()}")
-    return 0
+    return exit_code
 
 
 def _fmt_ratio(report: ComparisonReport) -> str:
@@ -1200,6 +1534,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ranks.add_argument("--workload", required=True)
     p_ranks.add_argument("--summary-mapping", default=str(SUMMARY_MAPPING))
     p_ranks.add_argument("--rounds", default="1-4")
+    p_ranks.add_argument(
+        "--strict", action="store_true", help="rank 不一致时以退出码 3 结束（默认仍为 0）"
+    )
     p_ranks.set_defaults(func=cmd_check_ranks)
 
     p_cc = sub.add_parser("check-collection", help="审计统一补采是否满足参数契约")
@@ -1289,6 +1626,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--out", default=None)
     p_report.set_defaults(func=cmd_report)
 
+    p_manifest = sub.add_parser("check-manifest", help="校验 run_manifest.json 的产物哈希")
+    p_manifest.add_argument("--path", required=True)
+    p_manifest.set_defaults(func=cmd_check_manifest)
+
     p_summary = sub.add_parser("summary", help="导出 workload_summary.csv / operator_summary.csv")
     p_summary.add_argument("--dir", default="out/steady")
     p_summary.set_defaults(func=cmd_summary)
@@ -1298,6 +1639,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_compare.add_argument("--b", required=True, help="对照 operator_table.json")
     p_compare.add_argument("--top", type=int, default=15)
     p_compare.add_argument("--out-dir", default="out/compare")
+    p_compare.add_argument("--run-id", default=None, help="运行标识（默认自动生成）")
+    p_compare.add_argument(
+        "--manifest", default=None, help="run_manifest.json 路径（默认 <out-dir>/run_manifest.json）"
+    )
+    p_compare.add_argument(
+        "--strict",
+        action="store_true",
+        help="不可比或质量闸门未通过时以退出码 4 结束（默认仍为 0）",
+    )
     p_compare.set_defaults(func=cmd_compare)
 
     p_analyze = sub.add_parser("analyze", help="对全部 Workload 端到端分析（稳态窗口）")
@@ -1311,6 +1661,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--rank", type=int, default=0)
     p_analyze.add_argument("--top", type=int, default=12)
     p_analyze.add_argument("--out", default="out/steady")
+    p_analyze.add_argument("--run-id", default=None, help="运行标识（默认自动生成）")
+    p_analyze.add_argument(
+        "--manifest",
+        default=None,
+        help="run_manifest.json 路径（默认 <out>/run_manifest.json）",
+    )
+    p_analyze.add_argument(
+        "--strict",
+        action="store_true",
+        help="按运行状态返回退出码：partial=3 / incomparable=4 / failed=1（默认 0）",
+    )
     p_analyze.add_argument("--skip-timeline", action="store_true", help="跳过 TASK/CANN_API 空洞归因")
     p_analyze.add_argument("--source-map", action="store_true", help="索引源码并回填 source_refs")
     p_analyze.add_argument("--repos", default=",".join(DEFAULT_REPOS))

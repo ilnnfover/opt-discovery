@@ -73,8 +73,8 @@ cli.py                       22 个子命令（编排层）
 | D3 | `communication_time_us` 未做 ns→µs 换算（`total_time_us` 已换算） | COMMUNICATION 行 `110462688` → 额外指标变成 1.1e8 µs | 该指标下游（`communication_over_device` 等）被放大 1000x | 在列映射中声明 `scale: 0.001`，解析器按源契约只缩放一次；新增 R08 回归 |
 | D4 | `__all__` 声明不存在的符号（`DEFAULT_MAX_UNDERFEED`、`BaseParser`） | `from opt_discovery.analyzer.window import *` | 用户按导出名导入即失败 | 修正 `__all__`（`DEFAULT_MIN_BUSY_RATIO`、删除 `BaseParser`） |
 | D5 | 真实数据测试断言写死旧口径（69 行 / 771 calls / >30000 行 / 必须有 `mac_time_us` / 固定 2 分片 / rank1 必缺 CSV） | 对统一补采导出运行真实用例 | 4 失败 + 9 被空 PROF 会话连带 skip，真实覆盖被静默丢弃 | 改为「与磁盘/源列独立核对」+ 33/46 列契约 + 空会话识别；见 `regression-matrix.md` |
-| D6 | `cli.cmd_analyze` 吞掉逐 Workload 异常后仍 `return 0` | 缺 `workload.log` / 解析失败 | 「退出 0 + 部分产物」被误判为成功 | **未修**（AE-03 范围：strict 运行契约与 manifest） |
-| D7 | `rank_duration_inconsistent` 只写进 timeline notes，`compare` 不消费 | 构造两 rank 时长差 4x | 质量异常仍可进入跨模式对比 | **未修**（AE-03/AE-07 范围），已用 R10 锁定「不得解释为负载不均」 |
+| D6 | `cli.cmd_analyze` 吞掉逐 Workload 异常后仍 `return 0` | 缺 `workload.log` / 解析失败 | 「退出 0 + 部分产物」被误判为成功 | **AE-03 已修**：`--strict` 按状态返回 0/1/3/4，并写 `run_manifest.json`（普通模式保持兼容） |
+| D7 | `rank_duration_inconsistent` 只写进 timeline notes，`compare` 不消费 | 构造两 rank 时长差 4x | 质量异常仍可进入跨模式对比 | **AE-03 已修**：质量标记随表落盘，`compare` 阻断并输出原因 |
 | D8 | 样本门槛两套：`calibrate(min_samples=3)` 与设备档案路径硬编码 `DEFAULT_MIN_SAMPLES=12` | `calibrate(..., device_profile=...)`，4 样本 | README 写「分位数标定至少 12 个样本」，与函数默认值不一致 | **未统一**（策略变更需单独评审）；回归已锁定设备档案路径的 12 门槛 |
 | D9 | `load_host_intervals` 用 `fetchall()` 物化窗口内全部 Host 事件 | decode 单窗口 357 万条 | 内存峰值高于「流式」表述 | **未修**（AE-06 性能基线），见 INV-12 |
 | D10 | `OperatorRecord.__post_init__` 会静默把非 `us` 时间指标归一 | 构造 `Metric(2, "ms")` 的 record | 单位换算出现第二个边界，审计困难 | **未修**（AE-04 统一标准化边界） |
@@ -93,7 +93,7 @@ cli.py                       22 个子命令（编排层）
 | INV-02 来源不可伪造/提升 | partially_enforced | `Provenance` 枚举 + `weakest_provenance`；`diagnosis.engine` 证据封顶；`diagnosis.thresholds.Provenance` | `test_schemas.py::test_weakest_provenance`、`test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed` | 局部行为已测；`Opportunity.from_dict`、报告/`generator` 输出、外部 JSON 导入未逐一验证「来源不可提升」；阈值 overlay 只校验 provenance 字符串，未校验与 basis 的一致性 |
 | INV-03 单位只在边界换算 | **partially_enforced** | `csv_mapping.COMMUNICATION_DURATION_SCALE` + `ExtraMetricSpec.scale`；`timeline` 复用同常量。残留 D10 | `test_r08`（含漏声明 scale 的反例）、`test_schemas.py::test_time_unit_conversion` | `OperatorRecord.__post_init__` 仍会静默归一非 `us` 指标（D10）；换算入口未收敛为单一函数 |
 | INV-04 图/记录数≠守恒量 | enforced（关键路径） | `comm.summarize_comm` 按 `globalTaskId` 去重字节；`compare` 的图收缩告警 | `test_comm.py::test_dedup_by_task`、`test_analyzer.py::test_compare_uses_comm_bytes_instead_of_call_count`、`test_r07` | 报告层文字未全量扫描（仅 compare 输出）；跨 Workload 汇总不消费图收缩标记 |
-| INV-05 质量差/不可比不得出结论 | **partially_enforced** | `analyzer.contract.compare_contracts`（`incomparable`）、`compare_tables`（`comparable=False` 不产 deltas）、window `degraded`。缺口 D6/D7 | `test_p0.py::test_contract_fails_on_phase_mismatch`、`test_r10` | `cli.cmd_analyze` 逐 Workload 吞异常仍返回 0（D6）；`rank_duration_inconsistent` 未被 `compare` 消费（D7） |
+| INV-05 质量差/不可比不得出结论 | enforced（关键路径） | `analyzer.contract.compare_contracts`、`compare_tables` 质量闸门、`--strict` 退出码、`run_manifest` 状态；D6/D7 已关闭 | `test_p0.py::test_contract_fails_on_phase_mismatch`、`test_quality_gate.py`、`test_run_contract.py` | 人工构造的 `OperatorTable`（绕过 `analyze`）不带 quality_flags 时属于“未验证”，`compare --strict` 目前不强制要求标记存在 |
 | INV-06 区间裁剪 + 并集 | enforced（关键路径） | `analyzer.window.IntervalUnion`、`timeline._merge`、Host 事件二分归因取并集、overlap 裁剪 | `test_timeline.py::test_gap_attribution_uses_union_not_sum`、`test_r12` | 仅 timeline/analyzer 路径有测试；其他自建区间统计（脚本、报告）未统一走 `IntervalUnion` |
 | INV-07 不得用采集误差升级证据 | **partially_enforced** | 规则≤probable、`feedback` 的 ±5% 判定；无统计显著性检验 | `test_diagnosis.py::test_assumed_threshold_is_hypothesis_only`、`test_feedback.py` | ±5% 是固定策略而非测量误差模型；无置信区间/重复测量，小样本噪声未建模 |
 | INV-08 规则最高 probable | partially_enforced | `diagnosis.engine` 置信度/等级封顶；`confirmed` 需 kernel+端到端 | `test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed`、`test_opportunity.py` | 封顶在 `DiagnosisEngine` 报告层验证；`discovery.generator` 到 `Opportunity`、`experiment.feedback` 提升路径未逐一验证同一上限；`Opportunity.from_dict` 不校验 level |
@@ -140,13 +140,11 @@ cli.py                       22 个子命令（编排层）
 
 | 项 | 原因 | 解除条件 |
 |---|---|---|
-| AE-03 strict 运行契约 | 不在本轮范围（D6/D7） | 按任务书实现 `--strict` + `run_manifest.json` |
 | AE-04 统一 Reader / D10 | 不在本轮范围 | 收敛 `csv_mapping` 与 `OperatorRecord` 的单位边界 |
 | AE-05 架构/领域 Lint | `make check` 尚未包含依赖规则 | 实现检查器后接入 `make check` |
 | AE-06 属性测试/真实趋势回归 | 不在本轮范围 | Hypothesis + golden snapshot + 性能基线 |
 | NPU 重新采集 | 未授权，且无必要 | 仅在需要复现截断/新硬件时申请 |
 | CSV 缺失 rank 的真实回填场景 | 统一补采后两 rank 均有 CSV，真实用例显式 `pytest.skip` | 保留 CPU 回归；若复现历史导出则重新启用真实用例 |
-| R05/R10 下游质量闸门 | `compare` 未消费 `rank_mergeable` / `rank_duration_inconsistent`；已用 strict xfail 用例登记（`tests/regression/test_known_gaps.py`） | AE-03 实现闸门后，XPASS 会强制更新测试与矩阵 |
 | 阈值门槛统一（D8） | 涉及策略语义，需单独评审 | 决定以 12 为默认或改 README，并迁移 |
 | INV-01 JSON 导入路径把缺失计数补 0 | `OperatorRecord.from_dict` / `ParseMeta.from_dict` 的默认值 | AE-03/AE-04：改为缺失即报错或保留 None |
 | INV-02/INV-08 全路径保证未验证 | 仅诊断报告层有测试；`Opportunity.from_dict`、`generator`、`feedback` 未逐一核查 | AE-07 统一证据升级 API 时补全路径测试 |
@@ -160,3 +158,14 @@ cli.py                       22 个子命令（编排层）
 3. **AE-05**：依赖/领域 Lint，并接入 `make check`。
 4. **AE-06**：Hypothesis 属性测试 + 真实数据趋势回归 + 有界内存基线（解决 D9/INV-12）。
 5. **AE-07**：统一证据升级 API（解决 D7 的下游限制）。
+
+## 10. AE-03 关闭项（2026-11-18）
+
+| 原缺口 | 关闭方式 | 验证 |
+|---|---|---|
+| D6 `analyze` 失败仍返回 0 | `analyze/compare/check-ranks` 新增 `--strict`；`run_manifest.json` 记录阶段与总体状态；普通模式保持兼容 | `tests/test_run_contract.py`（6 场景） |
+| D7 质量标记未进 `compare` | `schemas/quality` + `analyzer/rank_quality`；阻断型标记随 `ParseMeta.extra` 落盘；`compare_tables` 先过闸门再算差异 | `tests/regression/test_quality_gate.py`（4 用例，含 4x 链路与 CLI strict） |
+| R05/R10 strict xfail | 改为正式断言；R05 另覆盖 `check-ranks --strict` 退出 3 | `docs/engineering/regression-matrix.md` |
+| 旧产物复用 | 独立 `run_id` + 产物相对路径 + sha256；`check-manifest` 校验 | `test_reused_output_dir_does_not_masquerade_old_artifacts` |
+
+剩余（新登记）：人工构造表绕过 `analyze` 时质量标记可缺失；`compare --strict` 目前不强制要求标记存在（避免破坏既有 JSON 工作流）。

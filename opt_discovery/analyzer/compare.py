@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..schemas.operator import OperatorTable
+from ..schemas.quality import QualityFlag, blocking, degraded, flags_from_meta
 from ..schemas.workload import WorkloadSpec
 from .contract import GRAPH_ONLY_PARAMS
 
@@ -68,6 +69,8 @@ class ComparisonReport:
     total_b_us: float | None = None
     deltas: list[OperatorDelta] = field(default_factory=list)
     observations: tuple[str, ...] = ()
+    #: 两侧表携带的质量标记（blocking 时 comparable 必为 False）
+    quality_flags: tuple[QualityFlag, ...] = ()
     generated_at: str = ""
 
     def __post_init__(self) -> None:
@@ -92,6 +95,7 @@ class ComparisonReport:
                 else None
             ),
             "observations": list(self.observations),
+            "quality_flags": [flag.to_dict() for flag in self.quality_flags],
             "deltas": [d.to_dict() for d in self.deltas],
             "generated_at": self.generated_at,
         }
@@ -165,7 +169,19 @@ def compare_tables(
 ) -> ComparisonReport:
     """Compare ``b`` against ``a`` (``delta_share = share_b - share_a``)."""
     comparable, reasons = a.workload.comparable_with(b.workload)
+    reasons = list(reasons)
     warnings: list[str] = []
+
+    # 质量闸门：rank 不可合并 / 时长截断等阻断型标记必须先于任何差异计算。
+    quality_flags = flags_from_meta(a.meta) + flags_from_meta(b.meta)
+    blocking_flags = blocking(quality_flags)
+    if blocking_flags:
+        comparable = False
+        reasons.extend(
+            f"质量闸门未通过（{flag.code}）：{flag.message}" for flag in blocking_flags
+        )
+    for flag in degraded(quality_flags):
+        warnings.append(f"质量提示（{flag.code}）：{flag.message}")
 
     if a.workload.execution.phase is not b.workload.execution.phase:
         warnings.append(
@@ -235,13 +251,20 @@ def compare_tables(
         comparable=comparable,
         reasons=tuple(reasons),
         warnings=tuple(warnings),
+        quality_flags=quality_flags,
         same_window=same_window,
         window=window_a if same_window else None,
         total_a_us=a.total_operator_time_us(),
         total_b_us=b.total_operator_time_us(),
     )
     if not comparable:
-        report.observations = ("不可比：先统一采集条件再对比，否则差异无法归因",)
+        if blocking_flags:
+            report.observations = (
+                "不可比：数据质量闸门未通过（" + ", ".join(f.code for f in blocking_flags) + "），"
+                "不得据此输出速度差或因果结论",
+            )
+        else:
+            report.observations = ("不可比：先统一采集条件再对比，否则差异无法归因",)
         return report
 
     left, right = _summarize(a), _summarize(b)
