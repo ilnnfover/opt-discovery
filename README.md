@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                218 个用例（203 个 CPU 用例 + 15 个真实数据集成用例，缺数据自动 skip）
+tests/                219 个用例（203 个 CPU 用例 + 16 个真实数据集成用例，缺数据自动 skip）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -417,7 +417,7 @@ make verify-real  # 真实数据回归；缺数据打印 BLOCKED 且退出码 2�
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 203 passed, 15 skipped（缺真实导出时）
+python -m pytest -q                      # 203 passed, 16 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检

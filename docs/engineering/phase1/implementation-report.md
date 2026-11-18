@@ -118,21 +118,21 @@
 | 检查 | 实际命令 | 退出码 | 状态 | 产物/日志 |
 |---|---|---|---|---|
 | 统一静态入口 | `make check` | 0 | PASS | ruff 0 违规；mypy 48 文件 0 错；validate 通过（11 规则/16 阈值/4 Workload） |
-| 测试 + demo | `make verify` | 0 | PASS | 203 passed, 15 skipped；demo 产物 `out/demo-check`（gitignore） |
+| 测试 + demo | `make verify` | 0 | PASS | 203 passed, 16 skipped；demo 产物 `out/demo-check`（gitignore） |
 | 真实回归（无数据） | `make verify-real` | 2 | BLOCKED | 打印 BLOCKED 与解除条件，未显示 PASS |
-| 真实回归（有数据） | `OPT_DISCOVERY_DATA_ROOT=<授权根> make verify-real` | 0 | PASS | 15 passed, 0 skipped |
-| 全量测试 | `python -m pytest` | 0 | PASS | 203 passed, 15 skipped（共 218 用例） |
+| 真实回归（有数据） | `OPT_DISCOVERY_DATA_ROOT=<授权根> make verify-real` | 0 | PASS | 15 passed, 0 skipped（当时 15 个用例；新增通信单位用例后为 16，见 §9） |
+| 全量测试 | `python -m pytest` | 0 | PASS | 203 passed, 16 skipped（共 219 用例；3.11/3.12 均通过） |
 | Ruff | `python -m ruff check .` | 0 | PASS | 无豁免规则（未全局 ignore） |
 | 类型检查 | `python -m mypy` | 0 | PASS | 48 source files，no issues |
 | 导入冒烟 | `python -c "import opt_discovery.parsers, ..."` | 0 | PASS | 证明 D1 已修 |
-| 单跑真实文件 | `pytest tests/test_real_data.py`（无数据） | 0 | SKIPPED | 15 skipped；修复前是 ImportError |
+| 单跑真实文件 | `pytest tests/test_real_data.py`（无数据） | 0 | SKIPPED | 当时 15 个用例全部 skip；修复前是 ImportError |
 | 负向：lint | 临时注入 F841/I001 → `ruff check .` | 1 | FAIL（预期） | 探针文件已删除 |
 | 负向：类型 | 临时注入 `-> int: return str` → `mypy` | 1 | FAIL（预期） | 探针文件已删除 |
 | 负向：配置 | `cli validate --rules /tmp/bad_rules.yaml` | 1 | FAIL（预期） | `'rules' must be a non-empty list` |
 | 负向：测试 | 临时失败用例 → `pytest` | 1 | FAIL（预期） | `assert 1 == 2` |
 | 安装入口 | `pip install -e ".[dev]"` + `make check` + `opt-discovery --help` | 0 | PASS | 生成 `*.egg-info`（已 gitignore） |
 
-真实回归用例数：15 passed / 0 skipped（`tests/test_real_data.py`）；CPU 回归 48 个用例。
+真实回归用例数：16 passed / 0 skipped（`tests/test_real_data.py`）；CPU 回归 48 个用例。
 
 ## 5. 行为差异与风险
 
@@ -191,12 +191,25 @@
 
 | 检查 | 退出码 | 结果 |
 |---|---|---|
-| `python -m pytest` | 0 | 203 passed, 15 skipped |
+| `python -m pytest`（3.12） | 0 | 203 passed, 16 skipped |
 | `python -m ruff check .` | 0 | All checks passed |
 | `python -m mypy` | 0 | 48 source files, no issues |
 | `python scripts/verify_real.py` | 2 | BLOCKED（无数据根） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 断言 BLOCKED 成功 |
-| `OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` | 0 | 15 passed, 0 skipped |
+| `OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` | 0 | 16 passed, 0 skipped |
 
-仍未完成（审查已列的验收前提，不在本轮代码修复范围）：R01–R12 的独立逐项核查与独立变异、
-Python 3.10 与全新 CPU 环境验证、真实 Profiling 数据可用时的解析语义复核。
+### 9.1 第二轮：独立逐项核查、变异与跨版本验证
+
+针对审查「R01–R12 未独立核查/变异」与「通信单位缺少真实数据回归」，补充执行并记录于
+`docs/engineering/phase1/independent-verification.md`：
+
+| 项 | 结果 |
+|---|---|
+| R01–R12 逐项变异（隔离副本） | 13 次注入 + 1 次真实数据注入，全部被捕获（退出码 1），无「注入错误但测试通过」 |
+| 真实数据通信单位 | 新增 `test_communication_time_matches_record_total`；删除映射 `scale` 后该用例失败，证明真实导出也能捕获 1000x 偏差 |
+| 第二解释器 | Python 3.11.6 + pytest 9.2.0：203 passed, 16 skipped |
+| 跨版本缺陷 | 3.11 暴露 `sum(shares) == 1.0` 精确断言（3.12 补偿求和掩盖）；已改为 `approx(1.0, abs=1e-12)` |
+| CI 矩阵 | 扩展为 3.10 / 3.11 / 3.12（3.10 本机不可得，仅 CI 覆盖） |
+
+仍未完成：Python 3.10 实际运行（本机不可得，`install_binary` 两次失败）、全新 CPU 环境安装验证、
+R05/R10 的下游质量闸门（AE-03/AE-07）。

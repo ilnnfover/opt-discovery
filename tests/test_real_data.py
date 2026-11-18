@@ -158,6 +158,29 @@ def test_communication_only_exists_in_op_summary(statistic_tables, summary_table
     assert all(r.extra.get("communication_time_us") is not None for r in comm)
 
 
+def test_communication_time_matches_record_total(summary_tables):
+    """通信行的 ``communication_time_us`` 必须与 ``total_time_us`` 同口径。
+
+    两者都来自 ``Task Duration``（COMMUNICATION 行是 ns），必须只做一次换算。
+    历史缺陷（D3）：``total_time_us`` 换算、额外指标没换算 -> 相差 1000 倍。
+    这里用真实导出锁定，避免合成 fixture 掩盖真实列名的差异。
+    """
+    seen = 0
+    for _, table in summary_tables:
+        for record in table.records:
+            if record.task_type is not TaskType.COMMUNICATION:
+                continue
+            metric = record.metric("communication_time_us")
+            assert metric is not None, record.operator
+            assert metric.unit == "us"
+            assert record.total_time_us is not None
+            assert metric.value == pytest.approx(record.total_time_us.value, rel=1e-9), (
+                record.operator
+            )
+            seen += 1
+    assert seen > 0, "op_summary 中应存在 COMMUNICATION 行"
+
+
 def test_time_share_matches_profiler_ratio_column(statistic_tables):
     """time_share 是派生事实，必须与 Profiler 自算的 Ratio(%) 对齐。"""
     rank, table = statistic_tables[0]

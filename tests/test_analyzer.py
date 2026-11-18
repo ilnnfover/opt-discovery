@@ -51,8 +51,10 @@ def test_hotspots_rank_and_share():
     )
     hotspots = operator_hotspots(table)
     assert [h.operator for h in hotspots] == ["hcom_allReduce_", "Add", "MatMul"]
-    assert hotspots[0].share == 0.6
-    assert sum(h.share for h in hotspots) == 1.0
+    assert hotspots[0].share == pytest.approx(0.6)
+    # 不要用精确相等：CPython 3.12 起 sum() 对浮点使用补偿求和，3.10/3.11 会得到
+    # 0.9999999999999999；该断言必须跨解释器稳定（AE-01 确定性要求）。
+    assert sum(h.share for h in hotspots) == pytest.approx(1.0, abs=1e-12)
     assert hotspots[0].avg_us == 1500.0
 
 

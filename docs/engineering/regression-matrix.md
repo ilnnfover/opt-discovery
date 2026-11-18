@@ -68,7 +68,8 @@
 ## 4. 真实数据回归（独立执行）
 
 - 入口：`make verify-real`（`scripts/verify_real.py`），要求 `OPT_DISCOVERY_DATA_ROOT` 指向四组统一补采。
-- 本轮实测：15 passed / 0 skipped / 0 failed（退出码 0）。
+- 本轮实测：16 passed / 0 skipped / 0 failed（退出码 0）；通信单位另由真实用例
+  `test_communication_time_matches_record_total` 锁定（删 `scale` 即失败，见 `phase1/independent-verification.md`）。
 - 缺数据：打印 `BLOCKED`，退出码 2，不显示 PASS；有用例 skip：退出码 3。
 - 真实回归只验证口径与契约（不逐字比对时间值）：
   `test_communication_only_exists_in_op_summary`、`test_no_rows_are_silently_dropped`、

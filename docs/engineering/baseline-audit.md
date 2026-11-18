@@ -10,7 +10,7 @@
 | 基线 commit | `1785df806af30075caea409a8b64949904edfb92`（Initial commit, 2026-11-17） |
 | 分支 | `main` |
 | 起始工作树 | 无已跟踪文件改动；仅 `docs/tasks/`（任务书）为未跟踪文件；`out/`、`export_only_prof_dir/` 已在 `.gitignore` |
-| Python | 3.12.13（`/usr/local/python3.12.13/bin/python`） |
+| Python | 3.12.13（主）；3.11.6 作为第二解释器复验（pytest 9.2.0）。3.10 本机不可得，仅 CI 矩阵覆盖 |
 | 运行时依赖 | PyYAML 6.0.3 |
 | 测试依赖 | pytest 8.3.2 |
 | 本轮新增检查工具 | ruff 0.17.5、mypy 2.4.1（写入 `[project.optional-dependencies].dev`） |
