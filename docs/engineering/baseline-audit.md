@@ -14,7 +14,7 @@
 | 运行时依赖 | PyYAML 6.0.3 |
 | 测试依赖 | pytest 8.3.2 |
 | 本轮新增检查工具 | ruff 0.17.5、mypy 2.4.1（写入 `[project.optional-dependencies].dev`） |
-| 包结构 | 48 个 `opt_discovery/**/*.py`；19 个功能测试文件 + 14 个新增回归测试文件（37 个用例） |
+| 包结构 | 48 个 `opt_discovery/**/*.py`；19 个功能测试文件 + 回归目录 16 个文件 / 48 个用例（14 个测试文件 + `_helpers.py`、`_claims.py`） |
 
 `requires-python = ">=3.10"`，但 README 推荐 3.12。本机只有 3.12，3.10 仅通过
 `ruff target-version=py310` / `mypy python_version=3.10` 与 CI 矩阵声明，**未在本机实际运行**
@@ -81,22 +81,29 @@ cli.py                       22 个子命令（编排层）
 
 ## 5. 不变量覆盖矩阵（改动后）
 
-| ID | 状态 | 强制机制（文件:符号） | 证据（测试节点） |
-|---|---|---|---|
-| INV-01 缺失≠0 | enforced | `schemas.metrics.Metric`（无占位默认）、`OperatorTable.total_operator_time_us` 返回 `None`、`csv_mapping._to_float` 空值表、`missing_extra_metrics` | `test_schemas.py::test_operator_table_total_time_returns_none_without_data`、`test_r02`、`test_r09` |
-| INV-02 来源不可伪造/提升 | enforced | `Provenance` 枚举 + `weakest_provenance`；`diagnosis.engine` 证据封顶；`diagnosis.thresholds.Provenance` | `test_schemas.py::test_weakest_provenance`、`test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed` |
-| INV-03 单位只在边界换算 | **partially_enforced** | `csv_mapping.COMMUNICATION_DURATION_SCALE` + `ExtraMetricSpec.scale`；`timeline` 复用同常量。残留 D10 | `test_r08`（含漏声明 scale 的反例）、`test_schemas.py::test_time_unit_conversion` |
-| INV-04 图/记录数≠守恒量 | enforced | `comm.summarize_comm` 按 `globalTaskId` 去重字节；`compare` 的图收缩告警 | `test_comm.py::test_dedup_by_task`、`test_analyzer.py::test_compare_uses_comm_bytes_instead_of_call_count`、`test_r07` |
-| INV-05 质量差/不可比不得出结论 | **partially_enforced** | `analyzer.contract.compare_contracts`（`incomparable`）、`compare_tables`（`comparable=False` 不产 deltas）、window `degraded`。缺口 D6/D7 | `test_p0.py::test_contract_fails_on_phase_mismatch`、`test_r10` |
-| INV-06 区间裁剪 + 并集 | enforced | `analyzer.window.IntervalUnion`、`timeline._merge`、Host 事件二分归因取并集、overlap 裁剪 | `test_timeline.py::test_gap_attribution_uses_union_not_sum`、`test_r12` |
-| INV-07 不得用采集误差升级证据 | **partially_enforced** | 规则≤probable、`feedback` 的 ±5% 判定；无统计显著性检验 | `test_diagnosis.py::test_assumed_threshold_is_hypothesis_only`、`test_feedback.py` |
-| INV-08 规则最高 probable | enforced | `diagnosis.engine` 置信度/等级封顶；`confirmed` 需 kernel+端到端 | `test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed`、`test_opportunity.py` |
-| INV-09 工作负载级 A/B 不归因算子 | enforced | `experiment.feedback.apply_feedback` 的 scope 分支 | `test_feedback.py::test_workload_level_result_does_not_attribute_to_operator` |
-| INV-10 合成数据不得冒充实测 | **partially_enforced** | `ParseMeta.is_synthetic` → `DiagnosisReport.is_synthetic`；`compare` 警告一侧合成。`feedback`/`generator` 未校验 | `test_pipeline.py::test_cli_demo_writes_outputs` |
-| INV-11 缺失/回退/不充分可机读 | **partially_enforced** | `ParseMeta.warnings` + `missing_columns` + 新增 `missing_extra_metrics`；TASK 回退 note；阈值 `provenance/basis` | `test_csv_parser.py::test_unmapped_columns_are_reported`、`test_r09`、`test_supplementary_gates` |
-| INV-12 有界内存/流式 | **partially_enforced** | `MappingCsvParser` 逐行；但 op intervals 排序需保存列表，Host 事件 `fetchall`（D9） | 无性能基线（AE-06） |
+标签口径（重要）：
 
-“partially_enforced” 全部在 §8 列出收敛任务，不视为已保护。
+- `enforced`：**关键路径**有直接回归测试，且测试能捕获历史错误；不等于形式化的全路径证明。
+- `partially_enforced`：核心路径有测试，但存在已知未覆盖/未独立验证的构造、反序列化或消费边界。
+- 未标注的“全局保证”一律不作为后续任务的依赖前提；需要全路径结论时必须补测试或做形式化审查。
+
+| ID | 状态 | 强制机制（文件:符号） | 证据（测试节点） | 已知未覆盖边界 |
+|---|---|---|---|---|
+| INV-01 缺失≠0 | partially_enforced | `schemas.metrics.Metric`（无占位默认）、`OperatorTable.total_operator_time_us` 返回 `None`、`csv_mapping._to_float` 空值表、`missing_extra_metrics` | `test_schemas.py::test_operator_table_total_time_returns_none_without_data`、`test_r02`、`test_r09` | `OperatorRecord.from_dict` 对缺失 `calls` 取 0、`ParseMeta.from_dict` 对缺失计数取 0（JSON 导入路径会把「缺失」变成 0） |
+| INV-02 来源不可伪造/提升 | partially_enforced | `Provenance` 枚举 + `weakest_provenance`；`diagnosis.engine` 证据封顶；`diagnosis.thresholds.Provenance` | `test_schemas.py::test_weakest_provenance`、`test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed` | 局部行为已测；`Opportunity.from_dict`、报告/`generator` 输出、外部 JSON 导入未逐一验证「来源不可提升」；阈值 overlay 只校验 provenance 字符串，未校验与 basis 的一致性 |
+| INV-03 单位只在边界换算 | **partially_enforced** | `csv_mapping.COMMUNICATION_DURATION_SCALE` + `ExtraMetricSpec.scale`；`timeline` 复用同常量。残留 D10 | `test_r08`（含漏声明 scale 的反例）、`test_schemas.py::test_time_unit_conversion` | `OperatorRecord.__post_init__` 仍会静默归一非 `us` 指标（D10）；换算入口未收敛为单一函数 |
+| INV-04 图/记录数≠守恒量 | enforced（关键路径） | `comm.summarize_comm` 按 `globalTaskId` 去重字节；`compare` 的图收缩告警 | `test_comm.py::test_dedup_by_task`、`test_analyzer.py::test_compare_uses_comm_bytes_instead_of_call_count`、`test_r07` | 报告层文字未全量扫描（仅 compare 输出）；跨 Workload 汇总不消费图收缩标记 |
+| INV-05 质量差/不可比不得出结论 | **partially_enforced** | `analyzer.contract.compare_contracts`（`incomparable`）、`compare_tables`（`comparable=False` 不产 deltas）、window `degraded`。缺口 D6/D7 | `test_p0.py::test_contract_fails_on_phase_mismatch`、`test_r10` | `cli.cmd_analyze` 逐 Workload 吞异常仍返回 0（D6）；`rank_duration_inconsistent` 未被 `compare` 消费（D7） |
+| INV-06 区间裁剪 + 并集 | enforced（关键路径） | `analyzer.window.IntervalUnion`、`timeline._merge`、Host 事件二分归因取并集、overlap 裁剪 | `test_timeline.py::test_gap_attribution_uses_union_not_sum`、`test_r12` | 仅 timeline/analyzer 路径有测试；其他自建区间统计（脚本、报告）未统一走 `IntervalUnion` |
+| INV-07 不得用采集误差升级证据 | **partially_enforced** | 规则≤probable、`feedback` 的 ±5% 判定；无统计显著性检验 | `test_diagnosis.py::test_assumed_threshold_is_hypothesis_only`、`test_feedback.py` | ±5% 是固定策略而非测量误差模型；无置信区间/重复测量，小样本噪声未建模 |
+| INV-08 规则最高 probable | partially_enforced | `diagnosis.engine` 置信度/等级封顶；`confirmed` 需 kernel+端到端 | `test_diagnosis.py::test_measured_thresholds_raise_to_probable_but_not_confirmed`、`test_opportunity.py` | 封顶在 `DiagnosisEngine` 报告层验证；`discovery.generator` 到 `Opportunity`、`experiment.feedback` 提升路径未逐一验证同一上限；`Opportunity.from_dict` 不校验 level |
+| INV-09 工作负载级 A/B 不归因算子 | enforced（关键路径） | `experiment.feedback.apply_feedback` 的 scope 分支 | `test_feedback.py::test_workload_level_result_does_not_attribute_to_operator`、`test_operator_scoped_improvement_upgrades_to_probable` | 仅 `apply_feedback` 一个入口；外部手工构造 Opportunity 的路径不受约束 |
+| INV-10 合成数据不得冒充实测 | **partially_enforced** | `ParseMeta.is_synthetic` → `DiagnosisReport.is_synthetic`；`compare` 警告一侧合成。`feedback`/`generator` 未校验 | `test_pipeline.py::test_cli_demo_writes_outputs` | `feedback`/`generator` 不检查 `is_synthetic`；合成产出的 Opportunity 可进入反馈回路 |
+| INV-11 缺失/回退/不充分可机读 | **partially_enforced** | `ParseMeta.warnings` + `missing_columns` + 新增 `missing_extra_metrics`；TASK 回退 note；阈值 `provenance/basis` | `test_csv_parser.py::test_unmapped_columns_are_reported`、`test_r09`、`test_supplementary_gates` | TASK 回退、窗口退化等仍只有自由文本 note，未全部结构化；部分脚本输出不写 warnings |
+| INV-12 有界内存/流式 | **partially_enforced** | `MappingCsvParser` 逐行；但 op intervals 排序需保存列表，Host 事件 `fetchall`（D9） | 无性能基线（AE-06） | Host 事件 `fetchall`（D9）；区间排序需全量列表；无峰值内存/耗时测量 |
+
+“partially_enforced” 全部在 §8 列出收敛任务，不视为已保护。`enforced` 也仅表示关键路径
+有测试，**不能**据此声明全路径保证；需要全路径结论时应补测试或评审。
 
 ## 6. README 12 类约束的基线覆盖（改动前 → 改动后）
 
@@ -110,7 +117,7 @@ cli.py                       22 个子命令（编排层）
 | R04 占比>1 | 直接（诊断层） | enforced | 事实层不 clamp + 单流水 2.6 |
 | R05 rank 回填/不可合并 | 回填仅真实数据；「不可合并」零测试 | partially | CLI 闸门三种状态 + sqlite 能力缺失标记 |
 | R06 MSTX | 缺表 | enforced | 仅枚举表、开启但空两种状态 |
-| R07 算子收缩 | 间接 | partially | presence-only + 无收益字段 + 线索措辞 |
+| R07 算子收缩 | 间接 | enforced（收益类结论） | presence-only + 全字段/文本递归扫描 + 注入反例被拒绝；仍不禁止「未执行」类描述性文字（见 §8） |
 | R08 ns 单位 | 时间线有；`communication_time_us` **有缺陷** | enforced | 精确刻度 + 只缩放一次 + 漏配置反例 |
 | R09 33/46 列 | 未知列有；缺列无标记、FLOPs 无断言 | enforced | `missing_extra_metrics` + flop 单位 + 双格式 |
 | R10 时长截断 | 间接（TASK 构造） | partially | op_summary 两 rank + 不得解释为不均；下游比较限制待 AE-03 |
@@ -141,6 +148,10 @@ cli.py                       22 个子命令（编排层）
 | NPU 重新采集 | 未授权，且无必要 | 仅在需要复现截断/新硬件时申请 |
 | CSV 缺失 rank 的真实回填场景 | 统一补采后两 rank 均有 CSV | 保留 CPU 回归；若复现历史导出则重新启用真实用例 |
 | 阈值门槛统一（D8） | 涉及策略语义，需单独评审 | 决定以 12 为默认或改 README，并迁移 |
+| INV-01 JSON 导入路径把缺失计数补 0 | `OperatorRecord.from_dict` / `ParseMeta.from_dict` 的默认值 | AE-03/AE-04：改为缺失即报错或保留 None |
+| INV-02/INV-08 全路径保证未验证 | 仅诊断报告层有测试；`Opportunity.from_dict`、`generator`、`feedback` 未逐一核查 | AE-07 统一证据升级 API 时补全路径测试 |
+| INV-09 外部手工构造 Opportunity | 只有 `apply_feedback` 入口受约束 | AE-07 |
+| R07「算子未执行」类文字未禁止 | 目前只禁「收益/消除/节省」结论；描述性 presence 说明允许 | 保持现状（该说法本身是事实），如需更强约束在报告层加词表 |
 
 ## 9. 后续任务顺序（建议）
 

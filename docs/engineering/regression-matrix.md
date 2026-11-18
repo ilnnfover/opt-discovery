@@ -1,7 +1,7 @@
 # AE-02 历史问题回归矩阵
 
 > 错误目录来源：`README.md` 「已知数据约束」1–12。
-> 组织方式：`tests/regression/`（37 个用例：R01–R12 共 31 个 + 补充闸门/脚手架契约 6 个）。
+> 组织方式：`tests/regression/`（48 个用例：R01–R12 共 32 个 + 补充闸门/脚手架契约 16 个）。
 > CPU-only、无私有数据依赖。
 > 所有 fixture 在测试运行时生成（`tests/regression/_helpers.py`），脱敏且小于 10 行/文件。
 > 期望值来自独立算术（磁盘行数、Count 列求和、ns→µs、`total/calls`），不复用被测聚合逻辑。
@@ -16,7 +16,7 @@
 | **R04** | 流水时间占比 >1 被 clamp 到 1 | `diagnosis/facts.build_facts`（不夹取）；`diagnosis/engine`（>1 追加说明） | record `total=100`，`aicore=150`、`vec=20`；另一例 `mte2=260` | `compute_pipe_time_fraction=1.5`、`mte2_time_fraction=2.6`，≠1.0 | 任意 clamp 会让等式与 `!=1.0` 失败 | INV-06/07 | enforced |
 | **R05** | rank1 无 CSV / 回填口径不同 / 两 rank 不可合并 | `cli.cmd_check_ranks`、`SqliteOpReportParser`、`collectors._build` 的 note | 两 rank op_summary（时长 1x vs 4x）；rank1 仅 `device_1/sqlite/op_counter.db` | 4x → `不一致（不可合并）`；缺 rank → 退出 2；sqlite → `口径不同/不可直接比较`；回填表带 `sqlite_fallback/no_pipe_metrics/no_timestamps` | 静默合并/把缺失 rank 当单 rank 成功 | INV-04/05 | partially（闸门在 CLI，未进 Schema） |
 | **R06** | 只有 `ENUM_MSTX_EVENT_TYPE` 枚举表，被当成已采集 | `collectors/mstx.load_mstx`（只认 `MsprofTx`） | ①仅枚举表；②有 `MsprofTx` 但空 | ①`available=False` + 「没有开启 MSTX/无法进一步归因」；②`available=True` + 「未实际打点」 | 把枚举表当数据 → 状态断言失败 | INV-05/11 | enforced |
-| **R07** | Graph 下算子集合收缩（71→44）被当成「算子未执行/已删除」 | `analyzer/compare.compare_tables`（`presence=only_a`、模式差异告警）、`to_dict` 无收益字段 | eager 有 `FusedBias`，graph 无 | `presence=only_a`、`share_b=None`、告警含「捕获/融合」「线索」；输出无 `saving*/eliminated*` | 新增任何「消除收益」字段 → 关键字断言失败 | INV-04/07 | partially（不计算收益，但没有自动封禁未来字段的 Schema） |
+| **R07** | Graph 下算子集合收缩（71→44）被当成「算子未执行/已删除」 | `analyzer/compare.compare_tables`（`presence=only_a`、模式差异告警）；`tests/regression/_claims.py` 递归扫描键名与文本 | eager 有 `FusedBias`，graph 无 | `presence=only_a`、`share_b=None`、告警含「捕获/融合」「线索」；序列化前后均无 `saving/eliminat/收益/节省/消除/提速` | 向 observations / deltas 嵌套字段 / window 深层键注入「预计收益 8%」「saved_us」→ `assert_no_claims` 必须抛错 | INV-04/07 | enforced（收益类结论） |
 | **R08** | `COMMUNICATION` 的 Task Duration 是 ns，被当 µs 或重复缩放 | `csv_mapping.COMMUNICATION_DURATION_SCALE` + `ExtraMetricSpec.scale`；`timeline.load_op_intervals` 复用 | 一行 `hcom_allReduce` `110462688` + 一行 `MatMul` 同值 | comm = 110462.688 µs（≠1.1e8、≠110.46）；kernel 不缩放；`communication_time_us` 只在通信行且同值 | 删除 mapping 的 `scale` → 回到 1.1e8（用例失败） | INV-03 | enforced（本轮修复 D3） |
 | **R09** | 33/46 列导出差异、FLOPs 单位、未知列 | `csv_mapping._report_column_issues`（新增 `missing_extra_metrics`）、`configs/parsers/ascend_op_summary.yaml` | 33 列风格表头（含 `Block Num/aic_cube_fops/Mystery Col`）；46 列风格表头 | 缺 `mac/mte/cube_utilization` 有标记且指标为 None；`flops` 单位 `flop`、值不缩放；`block_num` 取 mean；未知列进 `unmapped_columns` | 缺列被静默吞掉 → `missing_extra_metric` 断言失败 | INV-01/11 | enforced |
 | **R10** | decode-eager rank1 长 kernel 时长截断 → 误判「卡在等/负载不均」 | `analyzer/timeline.summarize`（`rank_duration_inconsistent`）、notes 约束 | 两 rank 各 4 个任务（1000 µs vs 34 µs） | flag=True；notes 含「累计时长相差数倍/不可比」；**不**出现「TP 两卡明显不对称」；一致时 flag=False | 走不对称解释或改 flag 判定 → 断言失败 | INV-05 | partially（下游 compare 尚不消费该 flag，见审计 D7） |
@@ -44,7 +44,7 @@
 | R04 | `1.5 != 1.0` | `compute_pipe_time_fraction` |
 | R05 | `'不一致（不可合并）' not in out` / `code == 0`（应为 2） | CLI stdout/stderr |
 | R06 | `trace.available is False` 失败（枚举表被当成数据） | `MstxTrace.available` |
-| R07 | `presence == 'only_a'` / `'saving' not in keys` | `ComparisonReport.deltas/to_dict` |
+| R07 | `find_claims(payload) == []` 失败（文本/嵌套键命中）；注入探针时 `DID NOT RAISE AssertionError` | `_claims.find_claims` 返回的 JSON 路径 |
 | R08 | `110462688.0 != 110462.688`（漏缩放） | `Metric.value` 与 `interval` 时长 |
 | R09 | `{'mac_time_us', ...} <= missing` 失败（缺列未标记） | `meta.extra['missing_extra_metrics']` |
 | R10 | `rank_duration_inconsistent is False` / 出现「TP 两卡明显不对称」 | `TimelineSummary` 与 notes |
@@ -61,6 +61,9 @@
 | R08：删除 `ascend_op_summary.yaml` 的 `scale: 0.001` | `pytest tests/regression/test_r08_communication_unit.py -q` | 1 | `test_communication_time_metric_is_only_on_communication_rows` |
 | R11：利用率分母换成 `total_time_us` | `pytest tests/regression/test_r11_utilization_denominator.py -q` | 1 | `test_utilization_uses_aicore_time_not_task_duration` |
 | R12：`_gaps_from_merged` 的 cursor 从 0 起算 | `pytest tests/regression/test_r12_window_origin.py -q` | 1 | `test_epoch_origin_does_not_create_a_pseudo_gap` 等 2 个 |
+| verify-real 分类回退为「skip 优先」 | `pytest tests/regression/test_verify_real_contract.py -q` | 1 | `test_failure_with_skips_is_failure_not_skipped` |
+| `gate_exit` 改为任意退出码都通过 | `pytest tests/regression/test_verify_real_contract.py -q` | 1 | `test_expect_blocked_gate_accepts_only_two[5-1]`、`test_expect_blocked_rejects_false_pass`、`..._rejects_skip` |
+| `_claims` 只扫顶层键、不递归 | `pytest tests/regression/test_r07_graph_operator_shrink.py -q` | 1 | `test_claims_guard_rejects_injected_conclusions` |
 
 ## 4. 真实数据回归（独立执行）
 
@@ -76,7 +79,7 @@
 | 缺口 | 现状 | 归属 |
 |---|---|---|
 | R05 「不可合并」只存在于 CLI 文案 | 无 Schema 级 `rank_mergeable` 字段；下游 `analyze` 不消费 | AE-03（运行契约） |
-| R07 没有对「收益字段」的 Schema 级封禁 | 仅测试锁定当前输出不含收益字段 | AE-07 |
+| R07 无 Schema 级封禁 | 由 `_claims` 全字段扫描 + 注入反例锁定；生产代码仍可能新增字段（测试会拦住） | AE-07（若需要运行时校验） |
 | R10 质量异常不阻断 `compare` | flag 已产出，`compare_tables` 未读取 | AE-03/AE-07 |
 | INV-12 有界内存无基线 | 未做峰值内存/耗时测量 | AE-06 |
 | 真实 CSV 缺失 rank 的回填场景 | 统一补采后不可复现，CPU 回归替代 | AE-06（若重采） |

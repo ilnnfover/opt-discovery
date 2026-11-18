@@ -43,5 +43,6 @@ jobs:
       - name: Synthetic pipeline self-test
         run: python -m opt_discovery.cli demo --out out/demo-ci
       - name: Real regression must fail closed without data
-        # 公开 runner 没有私有导出：必须得到 BLOCKED(2) 而不是 0（PASS）
-        run: python scripts/verify_real.py || [ $? -eq 2 ]
+        # 公开 runner 没有私有导出：断言退出码恰为 BLOCKED(2)。
+        # 不用 `cmd || [ $? -eq 2 ]`：命令返回 0 时该写法会直接通过，漏掉假 PASS。
+        run: python scripts/verify_real.py --expect-blocked

@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from _claims import assert_no_claims, find_claims
 from _helpers import make_workload
 from opt_discovery.analyzer.compare import compare_tables
 from opt_discovery.schemas.metrics import Metric, Provenance
@@ -63,11 +66,30 @@ def test_warning_states_capture_fusion_not_deletion(comparison) -> None:
     assert "线索" in warnings
 
 
-def test_no_eliminated_savings_are_claimed(comparison) -> None:
-    """负向：输出里不允许出现「消除/节省」型收益字段或结论。"""
+def test_no_savings_claims_in_any_field_or_text(comparison) -> None:
+    """用户可见输出（含嵌套字段、键名与文本）不得出现「消除/节省」型结论。"""
     payload = comparison.to_dict()
-    keys = " ".join(payload).lower()
-    for forbidden in ("saving", "eliminat", "eliminated_us", "estimated_gain", "预计收益"):
-        assert forbidden not in keys
-    for delta in payload["deltas"]:
-        assert not {"saved_us", "eliminated_us", "estimated_gain"} & set(delta)
+
+    assert find_claims(payload) == []
+    # 实际写盘/传给用户的 JSON 形态同样干净
+    assert find_claims(json.loads(json.dumps(payload, ensure_ascii=False))) == []
+    assert_no_claims(payload)
+
+
+def test_claims_guard_rejects_injected_conclusions(comparison) -> None:
+    """反例：把结论注入到不同位置（文本/嵌套字段/深层键名）都必须被拒绝。"""
+    base = json.loads(json.dumps(comparison.to_dict(), ensure_ascii=False))
+
+    text_claim = json.loads(json.dumps(base, ensure_ascii=False))
+    text_claim["observations"].append("FusedBias 被融合，预计收益 8%")
+
+    nested_claim = json.loads(json.dumps(base, ensure_ascii=False))
+    nested_claim["deltas"][0]["saved_us"] = 120.0
+
+    deep_claim = json.loads(json.dumps(base, ensure_ascii=False))
+    deep_claim["window"] = {"note": {"estimated_gain_pct": 8.0}}
+
+    for corrupted in (text_claim, nested_claim, deep_claim):
+        assert find_claims(corrupted), corrupted
+        with pytest.raises(AssertionError):
+            assert_no_claims(corrupted)

@@ -42,7 +42,7 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.ruff.lint.isort]
 # tests/regression 的共享构造器与包内代码同属本仓库 first-party
-known-first-party = ["opt_discovery", "_helpers"]
+known-first-party = ["opt_discovery", "_helpers", "_claims"]
 
 [tool.mypy]
 # 选 mypy 而不是 pyright：纯 Python 实现，随 dev extra 一起安装即可在本地与 CI 得到

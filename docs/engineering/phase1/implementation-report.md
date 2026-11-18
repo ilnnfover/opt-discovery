@@ -33,7 +33,7 @@
 
 | 文件/符号 | 修改内容 | 修改原因 |
 |---|---|---|
-| `phase1/implementation-report.md` | 本报告 | 交付物 |
+| `docs/engineering/phase1/implementation-report.md` | 本报告（按审查目录结构调整后位置） | 交付物 |
 | `docs/engineering/baseline-audit.md` | 基线、调用链、10 个真实缺陷、INV-01~12 / R01~R12 覆盖矩阵、阻塞清单 | AE-00 交付物 |
 | `docs/engineering/regression-matrix.md` | R01~R12 → 实现 / fixture / 独立预期 / 反例 / 失败信息 / 不变量 | AE-02 交付物 |
 | `pyproject.toml` | dev 依赖增 ruff/mypy；`[tool.ruff]`（E4/E7/E9/F/I/B、py310、排除 `scripts/harness`）；`[tool.mypy]`（python_version=3.10、files=opt_discovery） | AE-01 统一配置；选 mypy 而非 pyright 的原因写在配置注释 |
@@ -79,13 +79,13 @@
 | R04 占比 >1 | `test_r04_pipe_fraction.py`（2） | 1.5 / 2.6，不 clamp | PASS |
 | R05 rank 回填/不可合并 | `test_r05_rank_merge.py`（4） | 4x→`不一致（不可合并）`；缺 rank→退出 2；sqlite→`口径不同` | PASS |
 | R06 MSTX | `test_r06_mstx_enum_only.py`（2） | 仅枚举表=False；开启但空=True 且措辞不同 | PASS |
-| R07 图收缩 | `test_r07_graph_operator_shrink.py`（3） | `presence=only_a`、`share_b=None`；无 saving/eliminated 字段 | PASS |
+| R07 图收缩 | `test_r07_graph_operator_shrink.py`（4） | `presence=only_a`、`share_b=None`；全字段/文本递归扫描无 saving/收益类结论；注入反例被拒绝 | PASS |
 | R08 ns 单位 | `test_r08_communication_unit.py`（4） | 110462688 ns = 110462.688 µs；kernel 不缩放；漏配置→1000x 被捕获 | PASS |
 | R09 33/46 列 | `test_r09_export_columns.py`（3） | 缺列有 `missing_extra_metrics`；`flops` 单位 `flop`；未知列入审计 | PASS |
 | R10 时长截断 | `test_r10_truncated_duration.py`（2） | flag=True；不出现「TP 两卡明显不对称」 | PASS |
 | R11 利用率分母 | `test_r11_utilization_denominator.py`（2） | 0.1797（aicore 分母）<1；Task Duration 分母=1.54 | PASS |
 | R12 epoch 伪 gap | `test_r12_window_origin.py`（2） | `gap_max=50µs`、`idle=300µs`，与 epoch 偏移无关 | PASS |
-| 补充闸门 | `test_supplementary_gates.py`（2）、`test_verify_real_contract.py`（4） | 12 样本门槛；缺 sha 判失败；skip≠PASS；缺数据=BLOCKED | PASS |
+| 补充闸门 | `test_supplementary_gates.py`（2）、`test_verify_real_contract.py`（14） | 12 样本门槛；缺 sha 判失败；skip≠PASS；失败+跳过=FAIL；`--expect-blocked` 只接受 2 | PASS |
 
 ### 3.3 故障注入（隔离 `/tmp` 副本，主树未引入错误）
 
@@ -118,10 +118,10 @@
 | 检查 | 实际命令 | 退出码 | 状态 | 产物/日志 |
 |---|---|---|---|---|
 | 统一静态入口 | `make check` | 0 | PASS | ruff 0 违规；mypy 48 文件 0 错；validate 通过（11 规则/16 阈值/4 Workload） |
-| 测试 + demo | `make verify` | 0 | PASS | 192 passed, 15 skipped；demo 产物 `out/demo-check`（gitignore） |
+| 测试 + demo | `make verify` | 0 | PASS | 203 passed, 15 skipped；demo 产物 `out/demo-check`（gitignore） |
 | 真实回归（无数据） | `make verify-real` | 2 | BLOCKED | 打印 BLOCKED 与解除条件，未显示 PASS |
 | 真实回归（有数据） | `OPT_DISCOVERY_DATA_ROOT=<授权根> make verify-real` | 0 | PASS | 15 passed, 0 skipped |
-| 全量测试 | `python -m pytest` | 0 | PASS | 192 passed, 15 skipped（共 207 用例） |
+| 全量测试 | `python -m pytest` | 0 | PASS | 203 passed, 15 skipped（共 218 用例） |
 | Ruff | `python -m ruff check .` | 0 | PASS | 无豁免规则（未全局 ignore） |
 | 类型检查 | `python -m mypy` | 0 | PASS | 48 source files，no issues |
 | 导入冒烟 | `python -c "import opt_discovery.parsers, ..."` | 0 | PASS | 证明 D1 已修 |
@@ -132,7 +132,7 @@
 | 负向：测试 | 临时失败用例 → `pytest` | 1 | FAIL（预期） | `assert 1 == 2` |
 | 安装入口 | `pip install -e ".[dev]"` + `make check` + `opt-discovery --help` | 0 | PASS | 生成 `*.egg-info`（已 gitignore） |
 
-真实回归用例数：15 passed / 0 skipped（`tests/test_real_data.py`）；CPU 回归 37 个用例。
+真实回归用例数：15 passed / 0 skipped（`tests/test_real_data.py`）；CPU 回归 48 个用例。
 
 ## 5. 行为差异与风险
 
@@ -160,7 +160,7 @@
 
 - AE-00：完成。基线、调用链、10 个真实缺陷、INV/R 覆盖矩阵与阻塞清单已归档。
 - AE-01：完成。ruff + mypy + Makefile + CI（3.10/3.12）+ `verify-real` 三态闸门；负向验证全部非零退出。
-- AE-02：完成 R01–R12（31 用例）+ 6 个补充/契约用例；R05/R07/R10 明确标 partially，未假装通过。
+- AE-02：完成 R01–R12（32 用例）+ 16 个补充/契约用例（合计 48）；R05/R10 标 partially，R07 经复查补强后为 enforced（收益类结论）。
 - 未完成：AE-03~AE-08（见 §6）。
 - 建议下一步：**AE-03**（strict 运行契约 + `run_manifest.json`），先消除「退出 0 被当成成功」与「质量异常不阻断对比」。
 
@@ -169,6 +169,34 @@
 | 项 | 值 |
 |---|---|
 | 分支 | `feat/ae-00-01-02-agent-ready`（基于 `main` 的基线 commit `1785df8`） |
-| 提交内容 | 本轮代码、配置、测试、`docs/engineering/`、`phase1/implementation-report.md` |
+| 提交内容 | 本轮代码、配置、测试、`docs/engineering/`（含 `phase1/` 报告与审查材料） |
 | 未纳入提交 | `docs/tasks/`（任务书本身，保持未跟踪）；`out/`、`*.egg-info/`、缓存（gitignore） |
 | 远程 | 未推送（本轮未授权 push） |
+
+## 9. 独立审查问题修复（2026-11-18）
+
+审查来源：`docs/engineering/phase1/review-report.md`（结论 FAIL，4 项问题）。逐项处置：
+
+| 审查项 | 问题 | 修复 | 负向/回归证据 |
+|---|---|---|---|
+| P1 | `ci.yml` 的 `command \|\| [ $? -eq 2 ]` 在命令返回 0 时仍通过 | 新增 `verify_real.py --expect-blocked`：脚本内部断言实际退出码恰为 2，0/1/3/其他一律 `GATE FAILED`；CI 改为直接调用该模式 | `test_verify_real_contract.py` 参数化 5 种退出码；`monkeypatch _run -> 0` 与 `-> 3` 均判失败 |
+| P1 | `classify` 先判 skip，失败+跳过被归为 SKIPPED | 改为「非零退出码 → FAIL」优先，再判 skip；docstring 固化顺序 | `test_failure_with_skips_is_failure_not_skipped`（1+skipped → 1）；`2 + errors + skipped → 2` |
+| P2 | R07 负向断言只查顶层键与 3 个 delta 字段 | 新增 `tests/regression/_claims.py`：递归扫描键名与字符串（saving/saved_us/eliminat/estimated_gain/gain_us/benefit、收益/节省/消除/提速）；R07 对实际输出（序列化前后）断言为空，并注入 3 类错误结论验证被拒绝 | `test_no_savings_claims_in_any_field_or_text`、`test_claims_guard_rejects_injected_conclusions`（文本/嵌套字段/深层键） |
+| P2 | 审计中 INV-02/INV-08 标为 enforced，证据只覆盖局部 | 矩阵增加「已知未覆盖边界」列与标签口径说明；INV-01/02/03/05/07/08/10/11/12 重新定级为 `partially_enforced`，`enforced` 收窄为「关键路径」并逐条写明未覆盖边界；R07 状态同步更新 | `docs/engineering/baseline-audit.md` §5 / §8 |
+
+同时修正报告位置：审查将报告置于 `docs/engineering/phase1/`，本报告已按该结构更新路径引用，
+并删除旧的 `phase1/implementation-report.md` 跟踪项。
+
+修复后的验证（本地，Python 3.12）：
+
+| 检查 | 退出码 | 结果 |
+|---|---|---|
+| `python -m pytest` | 0 | 203 passed, 15 skipped |
+| `python -m ruff check .` | 0 | All checks passed |
+| `python -m mypy` | 0 | 48 source files, no issues |
+| `python scripts/verify_real.py` | 2 | BLOCKED（无数据根） |
+| `python scripts/verify_real.py --expect-blocked` | 0 | 断言 BLOCKED 成功 |
+| `OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` | 0 | 15 passed, 0 skipped |
+
+仍未完成（审查已列的验收前提，不在本轮代码修复范围）：R01–R12 的独立逐项核查与独立变异、
+Python 3.10 与全新 CPU 环境验证、真实 Profiling 数据可用时的解析语义复核。

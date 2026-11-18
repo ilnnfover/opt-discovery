@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                207 个用例（192 个 CPU 用例 + 15 个真实数据集成用例，缺数据自动 skip）
+tests/                218 个用例（203 个 CPU 用例 + 15 个真实数据集成用例，缺数据自动 skip）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -417,7 +417,7 @@ make verify-real  # 真实数据回归；缺数据打印 BLOCKED 且退出码 2�
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 192 passed, 15 skipped（缺真实导出时）
+python -m pytest -q                      # 203 passed, 15 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
@@ -425,7 +425,8 @@ python -m opt_discovery.cli demo         # 合成数据跑通全链路（不代�
 ```
 
 `verify-real` 需要设置 `OPT_DISCOVERY_DATA_ROOT` 指向四组统一补采的根目录；目录不全会
-直接 `BLOCKED`。真实用例有用例被 skip 时退出码为 3，避免「跳过 = 通过」。
+直接 `BLOCKED`。真实用例有用例被 skip 时退出码为 3，避免「跳过 = 通过」；失败+跳过并存时
+按 FAIL 处理。CI 用 `--expect-blocked` 断言「缺数据时必须返回 2」，返回 0/3/其他都判失败。
 回归矩阵（历史问题 → 测试节点 → 独立预期）见 `docs/engineering/regression-matrix.md`。
 
 加一个 Workload：在 `configs/workloads/<model>/` 放 YAML，填 `labels.export_dir`，
