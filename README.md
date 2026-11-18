@@ -412,6 +412,11 @@ python -m pip install -e ".[dev]"
 make check        # ruff + mypy + CLI validate（无需 NPU / 真实数据）
 make verify       # 普通测试 + 回归 + synthetic demo
 make verify-real  # 真实数据回归；缺数据打印 BLOCKED 且退出码 2（不是 PASS）
+
+# 干净环境验证：复制工作树 + 新建 venv + 从零安装 + 全部检查
+make clean-env-check PYTHON=python3        # 默认解释器
+make clean-env-check PYTHON=python3.10     # 最低支持版本
+# 本机没有 3.10 时：python -m pip install uv && uv python install 3.10
 ```
 
 底层命令仍可单独执行：

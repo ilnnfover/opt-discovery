@@ -27,8 +27,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.10 = requires-python 的最低支持版本；3.11 = 本地已验证的第二版本；
-        # 3.12 = 主要运行版本。3.10 在本机不可得，只能由 CI 覆盖。
+        # 3.10 = requires-python 的最低支持版本（本地已用 uv 独立构建复验）；
+        # 3.11 = 本地第二版本；3.12 = 主要运行版本。
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -37,12 +37,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dev dependencies
         run: python -m pip install -e ".[dev]"
-      - name: Unit / contract / regression tests
-        run: python -m pytest -q
-      - name: Config validation
-        run: python -m opt_discovery.cli validate
-      - name: Synthetic pipeline self-test
-        run: python -m opt_discovery.cli demo --out out/demo-ci
+      # 与本地共用 Makefile 入口，避免命令漂移
+      - name: Check (ruff + mypy + validate)
+        run: make check PYTHON=python
+      - name: Verify (tests + synthetic demo)
+        run: make verify PYTHON=python DEMO_OUT=out/demo-ci
       - name: Real regression must fail closed without data
         # 公开 runner 没有私有导出：断言退出码恰为 BLOCKED(2)。
         # 不用 `cmd || [ $? -eq 2 ]`：命令返回 0 时该写法会直接通过，漏掉假 PASS。

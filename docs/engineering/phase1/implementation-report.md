@@ -208,8 +208,9 @@
 | R01–R12 逐项变异（隔离副本） | 13 次注入 + 1 次真实数据注入，全部被捕获（退出码 1），无「注入错误但测试通过」 |
 | 真实数据通信单位 | 新增 `test_communication_time_matches_record_total`；删除映射 `scale` 后该用例失败，证明真实导出也能捕获 1000x 偏差 |
 | 第二解释器 | Python 3.11.6 + pytest 9.2.0：203 passed, 16 skipped |
+| Python 3.10 实际执行 | `uv python install 3.10` → 3.10.22 干净 venv：`make check`/`make verify` 通过（203 passed, 16 skipped），真实回归 16 passed, 0 skipped |
+| 全新 CPU 环境安装 | `scripts/check_clean_env.sh`（`make clean-env-check`）：3.10.22 与 3.12.13 均从零 `pip install --no-cache-dir -e ".[dev]"` 后全绿 |
 | 跨版本缺陷 | 3.11 暴露 `sum(shares) == 1.0` 精确断言（3.12 补偿求和掩盖）；已改为 `approx(1.0, abs=1e-12)` |
 | CI 矩阵 | 扩展为 3.10 / 3.11 / 3.12（3.10 本机不可得，仅 CI 覆盖） |
 
-仍未完成：Python 3.10 实际运行（本机不可得，`install_binary` 两次失败）、全新 CPU 环境安装验证、
-R05/R10 的下游质量闸门（AE-03/AE-07）。
+仍未完成：真正空白 OS/容器上的验证（当前用干净 venv + 工作树副本模拟）、R05/R10 的下游质量闸门（AE-03/AE-07）。

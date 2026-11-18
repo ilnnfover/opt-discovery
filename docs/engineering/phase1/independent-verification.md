@@ -11,7 +11,11 @@
 |---|---|---|
 | Python 3.12.13 | PyYAML 6.0.3、pytest 8.3.2、ruff 0.17.5、mypy 2.4.1 | 203 passed, 16 skipped |
 | Python 3.11.6（`/usr/bin/python3.11` + venv） | PyYAML 6.0.3、pytest 9.2.0 | 203 passed, 16 skipped |
-| Python 3.10 | — | **BLOCKED**：本机无 3.10；`install_binary` 两次失败（安装器报 3.14.3 校验失败），未改动系统包 |
+| Python 3.10.22（uv 独立构建 + 干净 venv） | PyYAML 6.0.3、pytest 9.2.0、ruff 0.17.5、mypy 2.4.1 | 203 passed, 16 skipped；真实回归 16 passed, 0 skipped |
+
+3.10 的获取方式：`install_binary` 工具两次失败（安装器报 3.14.3 校验失败），改用 `pip install uv` +
+`uv python install 3.10`（独立构建，自带 sqlite3/ssl/zlib），再建 venv。该解释器**不是**系统包，
+不影响系统 Python；详见 §6。
 
 3.11 是本地能拿到的最低主版本，用于验证「不依赖 3.12 特性」；3.10 仍只能由 CI 矩阵声明。
 
@@ -59,11 +63,36 @@ FAILED tests/test_analyzer.py::test_hotspots_rank_and_share - assert 0.999999999
 修复：改为 `pytest.approx(1.0, abs=1e-12)`（`hotspots[0].share` 同样改为 approx），并保留注释说明原因。
 修复后 3.11 / 3.12 均 203 passed, 16 skipped。该缺陷说明「最低支持版本验证」不能由单一解释器替代。
 
-## 5. 仍未完成 / 限制
+## 5. 全新 CPU 环境安装验证（AE-01）
+
+脚本：`scripts/check_clean_env.sh`（Makefile 入口 `make clean-env-check PYTHON=python3.10`）。步骤：
+
+1. 把工作树复制到临时目录，排除 `.git`、`out/`、`export_only_prof_dir/`、`__pycache__`、各类缓存与 `*.egg-info`；
+2. 用指定解释器建 **干净 venv**（不继承系统 site-packages）；
+3. `pip install --no-cache-dir -e ".[dev]"`（强制真实解析/下载，不复用本站缓存）；
+4. 依次执行 `make check`（ruff+mypy+validate）、`make verify`（pytest+demo）、`opt-discovery --help`；
+5. `verify-real`：有 `OPT_DISCOVERY_DATA_ROOT` 时要求全通过，否则用 `--expect-blocked` 断言 BLOCKED(2)。
+
+实测：
+
+| 解释器 | 安装结果 | make check | make verify | verify-real | 退出码 |
+|---|---|---|---|---|---|
+| 3.10.22 | PyYAML 6.0.3 / pytest 9.2.0 / ruff 0.17.5 / mypy 2.4.1 | 0 | 203 passed, 16 skipped | BLOCKED(2) 断言通过 | 0 |
+| 3.10.22 + 真实数据 | 同上 | 0 | 203 passed, 16 skipped | 16 passed, 0 skipped | 0 |
+| 3.12.13 | 同上（pytest 9.2.0） | 0 | 203 passed, 16 skipped | BLOCKED(2) 断言通过 | 0 |
+
+顺带发现并修复：`make test` 原本写 `pytest -q`，与 pyproject 的 `addopts = "-q"` 叠加成双 `-q`，
+会吞掉 `N passed / N skipped` 摘要（与 verify-real 的 skip 检测同类风险）。已去掉 Makefile 里的 `-q`。
+CI 也改为直接调用 `make check` / `make verify`，避免本地与 CI 命令漂移。
+
+覆盖边界：干净 venv 只能隔离 Python 依赖，不能验证操作系统/内核/驱动差异（项目为 CPU-only 分析，
+不依赖 CANN/NPU）；真正的空白机器验证仍建议在容器或新主机上跑同一脚本。
+
+## 6. 仍未完成 / 限制
 
 | 项 | 现状 |
 |---|---|
-| Python 3.10 实际运行 | 本机不可得；CI 矩阵已声明 3.10/3.11/3.12 |
+| 全新机器/容器隔离 | 已用「干净 venv + 工作树副本 + `--no-cache-dir`」模拟；未在真正空白 OS 或容器中验证 |
 | R05 下游闸门 | 只有 CLI 文案与退出码；`analyze` 不消费 rank 合并结论（AE-03） |
 | R10 下游闸门 | `rank_duration_inconsistent` 未被 `compare` 消费（AE-03/AE-07） |
 | 真实数据趋势回归 | 现有真实用例验证的是口径/契约，不比对历史数值趋势（AE-06） |
