@@ -81,3 +81,19 @@
 本轮相对于基线存在通信时间缩放、缺列告警和 `ParseMeta.extra` 类型等行为变化；本次未发现足够证据认定其他 API 契约全面兼容。真实数据和 NPU 未用于本次复审，不能独立确认通信单位真实结果或性能结论。现存 D6/D7、单位双边界、证据来源及内存缺口已在审计中登记，不把 synthetic 结果解释为真实性能。
 
 必须修复 P1-1、P1-2，并补齐或明确阻塞 AE-02 中的 R05/R10、R06/R12 相关要求；P2-1 应一并修复并回归验证。**允许开展 AE-03～AE-04 的修复工作，但不应把 AE-00～AE-02 标为全部通过或以此合并其下游，直到上述验收缺口及真实数据状态得到明确处理。**
+
+## 2026-11-19 修复后复核与后续工作判断
+
+复核 HEAD `ef79fc54bc26fa1b8fb6c487c4612f6a1a620e2e`。此前真实回归摘要误判问题已改为解析 JUnit 结构化结果，并对缺失结果失败关闭；无 CSV 回填样本现在明确 skip；内部使用独立状态区分缺数据与 pytest 失败。R06 与 R12 增加了相应边界用例。上述修复及契约测试已审阅。
+
+本次执行：
+
+| 检查 | 结果 |
+|---|---|
+| `PYTHONDONTWRITEBYTECODE=1 make check PYTHON=python3` | PASS：Ruff、mypy、配置验证通过 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify PYTHON=python3 DEMO_OUT=/tmp/opt-review3-demo` | PASS / SKIPPED / XFAIL：211 passed、17 skipped、2 xfailed；synthetic demo 通过 |
+| `python3 scripts/verify_real.py --expect-blocked` | PASS：未设置数据根时识别 BLOCKED；此结果不表示真实回归通过 |
+| `python3 -m pytest tests/regression/test_verify_real_contract.py tests/regression/test_known_gaps.py -ra -o addopts='' -p no:cacheprovider` | 20 passed、2 xfailed |
+| 真实 Profiling 数据与 NPU | BLOCKED / NOT RUN：本次未使用真实数据或 NPU |
+
+**判断：可以开展 AE-03，并可准备 AE-04；AE-02 尚不能标记为完整通过。** 两个 strict xfail 对应 R05、R10：比较路径尚未消费 rank 不可合并及截断标记。应在 AE-03 实现质量闸门、验证实际输入到比较的传播链，并将预期失败改为正式通过的测试。下游变更合并前应完成这些验证；真实数据回归须单独报告，不能将跳过计为通过。
