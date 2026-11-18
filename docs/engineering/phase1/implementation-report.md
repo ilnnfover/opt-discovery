@@ -118,10 +118,10 @@
 | 检查 | 实际命令 | 退出码 | 状态 | 产物/日志 |
 |---|---|---|---|---|
 | 统一静态入口 | `make check` | 0 | PASS | ruff 0 违规；mypy 48 文件 0 错；validate 通过（11 规则/16 阈值/4 Workload） |
-| 测试 + demo | `make verify` | 0 | PASS | 203 passed, 16 skipped；demo 产物 `out/demo-check`（gitignore） |
+| 测试 + demo | `make verify` | 0 | PASS | 211 passed, 17 skipped, 2 xfailed；demo 产物 `out/demo-check`（gitignore） |
 | 真实回归（无数据） | `make verify-real` | 2 | BLOCKED | 打印 BLOCKED 与解除条件，未显示 PASS |
-| 真实回归（有数据） | `OPT_DISCOVERY_DATA_ROOT=<授权根> make verify-real` | 0 | PASS | 15 passed, 0 skipped（当时 15 个用例；新增通信单位用例后为 16，见 §9） |
-| 全量测试 | `python -m pytest` | 0 | PASS | 203 passed, 16 skipped（共 219 用例；3.11/3.12 均通过） |
+| 真实回归（有数据） | `OPT_DISCOVERY_DATA_ROOT=<授权根> make verify-real` | 3 | SKIPPED | 当时 15 passed；第三轮因「无 CSV 回填」场景显式 skip → 16 passed, 1 skipped（见 §9.2） |
+| 全量测试 | `python -m pytest` | 0 | PASS | 211 passed, 17 skipped, 2 xfailed（共 230 用例；3.10/3.11/3.12 均通过） |
 | Ruff | `python -m ruff check .` | 0 | PASS | 无豁免规则（未全局 ignore） |
 | 类型检查 | `python -m mypy` | 0 | PASS | 48 source files，no issues |
 | 导入冒烟 | `python -c "import opt_discovery.parsers, ..."` | 0 | PASS | 证明 D1 已修 |
@@ -191,12 +191,12 @@
 
 | 检查 | 退出码 | 结果 |
 |---|---|---|
-| `python -m pytest`（3.12） | 0 | 203 passed, 16 skipped |
+| `python -m pytest`（3.12） | 0 | 211 passed, 17 skipped, 2 xfailed |
 | `python -m ruff check .` | 0 | All checks passed |
 | `python -m mypy` | 0 | 48 source files, no issues |
 | `python scripts/verify_real.py` | 2 | BLOCKED（无数据根） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 断言 BLOCKED 成功 |
-| `OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` | 0 | 16 passed, 0 skipped |
+| `OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` | 3 | SKIPPED（16 passed, 1 skipped；不可复现场景显式 skip） |
 
 ### 9.1 第二轮：独立逐项核查、变异与跨版本验证
 
@@ -207,10 +207,25 @@
 |---|---|
 | R01–R12 逐项变异（隔离副本） | 13 次注入 + 1 次真实数据注入，全部被捕获（退出码 1），无「注入错误但测试通过」 |
 | 真实数据通信单位 | 新增 `test_communication_time_matches_record_total`；删除映射 `scale` 后该用例失败，证明真实导出也能捕获 1000x 偏差 |
-| 第二解释器 | Python 3.11.6 + pytest 9.2.0：203 passed, 16 skipped |
-| Python 3.10 实际执行 | `uv python install 3.10` → 3.10.22 干净 venv：`make check`/`make verify` 通过（203 passed, 16 skipped），真实回归 16 passed, 0 skipped |
+| 第二解释器 | Python 3.11.6 + pytest 9.2.0：211 passed, 17 skipped, 2 xfailed |
+| Python 3.10 实际执行 | `uv python install 3.10` → 3.10.22 干净 venv：`make check`/`make verify` 通过（211 passed, 17 skipped, 2 xfailed），真实回归 16 passed, 1 skipped（SKIPPED） |
 | 全新 CPU 环境安装 | `scripts/check_clean_env.sh`（`make clean-env-check`）：3.10.22 与 3.12.13 均从零 `pip install --no-cache-dir -e ".[dev]"` 后全绿 |
 | 跨版本缺陷 | 3.11 暴露 `sum(shares) == 1.0` 精确断言（3.12 补偿求和掩盖）；已改为 `approx(1.0, abs=1e-12)` |
 | CI 矩阵 | 扩展为 3.10 / 3.11 / 3.12（3.10 本机不可得，仅 CI 覆盖） |
 
 仍未完成：真正空白 OS/容器上的验证（当前用干净 venv + 工作树副本模拟）、R05/R10 的下游质量闸门（AE-03/AE-07）。
+
+### 9.2 第三轮（最终复审）问题修复
+
+| 复审项 | 修复 | 证据 |
+|---|---|---|
+| P1-1 文本摘要解析导致全跳过=PASS | `verify_real` 改为解析 `--junitxml` 结构化计数；清除 `PYTEST_ADDOPTS`；`tests=0`/`executed=0`/junit 缺失或坏格式一律 fail-closed | `test_all_skipped_with_extra_quiet_is_not_pass`（真实执行 + `PYTEST_ADDOPTS=-q` + 16 全 skip → SKIPPED）、`test_classify` 全跳过/空集合参数化 |
+| P1-2 无回填样本静默计为通过 | 回填用例无候选时显式 `pytest.skip`；把「有 CSV 的 rank 必须带 sqlite」拆为独立用例并无条件断言（非空列表） | 真实回归如实变为 SKIPPED（16 passed, 1 skipped）；`test_sqlite_available_for_exported_ranks` |
+| P1-3 R05/R10 下游未受限 | 不在 AE-02 内实现（属 AE-03），新增 strict xfail 用例描述应有行为；矩阵/审计维持 partially 并登记 | `tests/regression/test_known_gaps.py`（2 条，当前 xfail；实现闸门后 XPASS 会强制更新） |
+| P2-1 BLOCKED 与退出码 2 撞码 | 判定改为内部 `Outcome` 枚举；`gate_exit` 只认 `Outcome.BLOCKED`，退出码仅用于边界映射 | `test_pytest_interrupt_code_two_is_not_blocked`、`test_gate_accepts_only_blocked_outcome` |
+| P2-2 R06/R12 边界未覆盖 | R06 增「缺同步指标不得当实测 0 / host_silent 不猜测」；R12 增「显式窗口 vs 回退窗口」对照 | `test_missing_sync_metric_is_not_reported_as_measured_zero`、`test_explicit_and_fallback_window_have_distinct_semantics` |
+| P3 报告自相矛盾 | 统一为「3.10/3.11 均已实际运行」，删除“只能由 CI 声明” | `phase1/independent-verification.md` §1 |
+
+修复后本地验证（3.12.13）：`make check` 0；`pytest` 211 passed / 17 skipped / 2 xfailed；
+`verify_real.py --expect-blocked` 0；有数据时 `verify_real.py` → SKIPPED(3)（16 passed, 1 skipped）。
+3.10.22 干净 venv 与 3.11.6 同样通过（见 `phase1/independent-verification.md`）。

@@ -1,74 +1,83 @@
-# AE-00～AE-02 独立验收报告
+# AE-00～AE-02 最终独立复审
 
-日期：2026-11-18。结论：**FAIL**。已发现检查结果分类缺陷；此外本次独立审查尚未完成全部测试逐项代码核查与变异验证，不能据此宣称完整验收。
+日期：2026-11-18。**结论：FAIL**。上轮提出的主要问题已有修复，但真实数据验证入口仍可把跳过的测试报告为 PASS，且一项真实数据回填测试在没有适用样本时以通过计数。AE-01 与真实回归的完成状态因此不能验收。R05、R10 的下游质量闸门仍是已登记的功能缺口。
 
-基线 `1785df806af30075caea409a8b64949904edfb92`，本轮 HEAD `98d67ab`，分支 `feat/ae-00-01-02-agent-ready`，完整范围为两者的 diff。审查开始时 `phase1/implementation-report.md` 已被工作区删除，从 HEAD 读取；`docs/tasks/` 和 `docs/engineering/phase1/` 已未跟踪。任务书未提交，以工作区版本为准。未恢复或修改这些原有改动。
+审查范围为基线 `1785df806af30075caea409a8b64949904edfb92` 至 HEAD `7d1d445`，分支 `feat/ae-00-01-02-agent-ready`；上次审查之后的提交为 `309fcaf`、`095f335`、`7d1d445`。开始时仅 `docs/tasks/` 未跟踪；任务书从该工作区读取。未修改代码、测试或配置；本报告是唯一有意修改的受版本管理文件。
 
-## 任务验收
+## 任务验收矩阵
 
-| 任务 | 状态 | 证据与限制 |
+| 任务 | 状态 | 证据与范围 |
 |---|---|---|
-| AE-00 | NOT RUN（完整验收） | 阅读了基线审计和实施报告；基线与提交边界吻合。12 个不变量未逐个独立复现，不能认证 enforced 标签。审计第 87 行的 INV-02 由枚举和局部封顶推断全局不可伪造，证据不足，建议列为部分验证并核查所有构造及消费边界。第 93 行 INV-08 的全路径保证同样需独立验证。其他标签尚未完成核验。 |
-| AE-01 | FAIL | CPU 测试、静态检查、配置与 demo 可运行；CI 和真实回归分类存在下述缺陷。Python 3.10 和 GitHub Actions 未实际运行。 |
-| AE-02 | NOT RUN（完整验收） | 全量测试执行通过（15 项跳过）；已阅读矩阵及 R05/R07/R10 测试，尚未逐项检查所有实现，也未独立执行变异。不能将实施报告中的变异记录作为本次实测。 |
+| AE-00 | PASS WITH CONDITIONS | 审计记录基线、调用链和 INV-01～12。上次指出的 INV-02、INV-08 已改为部分强制；INV-01 的 JSON 默认零及其他已知缺口已有登记。`baseline-audit.md:95-100` 的 INV-04/06/09 限定为关键路径，并明确未覆盖范围；不应理解为全局保证。真实数据和报告中历史执行结果本次无法独立复现。 |
+| AE-01 | FAIL | `make check`、`make verify` 在本机 CPU 通过；缺数据退出 2、CI 缺数据路径正常。但输出解析与退出码混用导致虚假 PASS 或错误分类，见问题 P1。3.10、3.11 的运行与干净环境安装是其他 agent 的记录，本次未复验；GitHub Actions 未运行。 |
+| AE-02 | FAIL（完整验收） | 逐项检查了新增测试的生产入口及主要断言，三项独立变异被捕获。R05/R10 未保护下游使用，R06/R12 覆盖不完整；真实回填场景未执行却被计入通过。其余测试为对应示例提供实质性保护，不等于全面证明所有变体。 |
 
-## R01～R12 有效性矩阵
+## R01～R12 测试有效性
 
-下表 NOT RUN 指本次独立有效性审核或变异验证未完成，不表示 pytest 未执行。除 R05/R07/R10 外，以下覆盖描述为矩阵声明，未独立认定有效。
+状态表示验收覆盖，而非简单 pytest 运行状态；测试均位于 `tests/regression/`。
 
-| ID | 目标及证据 | 独立判定 |
+| ID | 结论 | 代码及断言证据 / 局限 |
 |---|---|---|
-| R01 | 自然排序与分片聚合，`tests/regression/test_r01_slice_order.py` | NOT RUN：未独立变异 |
-| R02 | 缺 HCCL，`test_r02_statistic_missing_hccl.py` | NOT RUN：未独立核验断言 |
-| R03 | Core Type 加权聚合，`test_r03_core_type_rollup.py` | NOT RUN：未独立核验断言 |
-| R04 | 大于 1 的流水占比，`test_r04_pipe_fraction.py` | NOT RUN：未独立核验断言 |
-| R05 | `test_r05_rank_merge.py:43` 调用真实 CLI，检查不一致及缺 rank；第 76 行检查 sqlite 回填 | 部分有效：检查 CLI 文案和退出，但不证明下游分析拒绝合并；不一致场景本身仍返回 0。 |
-| R06 | MSTX 枚举表，`test_r06_mstx_enum_only.py` | NOT RUN：未独立核验断言 |
-| R07 | `test_r07_graph_operator_shrink.py:39` 调用 compare；检查 presence 和告警 | 部分有效：禁止收益断言仅检查部分键，未检查嵌套文本和其他字段，见问题清单。 |
-| R08 | 通信单位，`test_r08_communication_unit.py` | NOT RUN：未独立变异；真实数据语义未验证 |
-| R09 | 导出列差异，`test_r09_export_columns.py` | NOT RUN：未独立核验断言 |
-| R10 | `test_r10_truncated_duration.py:33` 调用真实 timeline，检查标记和措辞 | 部分有效：未验证 compare 消费质量标记，不能阻止下游错误结论。 |
-| R11 | 利用率分母，`test_r11_utilization_denominator.py` | NOT RUN：未独立变异 |
-| R12 | epoch 空洞，`test_r12_window_origin.py` | NOT RUN：未独立变异 |
+| R01 | PASS | `test_r01_slice_order.py:34,56` 调用 discovery 与 parser，检查 1/2/10 自然序、独立总数和分片等价；本次字典序变异失败。 |
+| R02 | PASS | `test_r02_statistic_missing_hccl.py:46` 检查记录及指标缺失、总量与热点口径说明；使用真实 parser。 |
+| R03 | PASS | `test_r03_core_type_rollup.py:52,58` 核查 core type 保留、771 calls、加权平均及反例。 |
+| R04 | PASS | `test_r04_pipe_fraction.py:30` 调用 `build_facts` 并断言 1.5 和 2.6；引擎中对大于 1 的说明未由这两个新测试直接验证。 |
+| R05 | FAIL（部分覆盖） | `test_r05_rank_merge.py:42,71,97` 实际调用 CLI、collector 和 SQLite parser；检查缺 rank、不可合并文案及来源能力。不可合并时 CLI 仍返回 0，测试未证明分析下游拒绝合并；真实无 CSV 回填场景见 P1-2。 |
+| R06 | FAIL（部分覆盖） | `test_r06_mstx_enum_only.py:43` 验证枚举表不代表采集及空表区别；未验证任务书要求的缺同步指标和 host_silent 不猜测原因。 |
+| R07 | PASS WITH CONDITIONS | `test_r07_graph_operator_shrink.py:48,69` 实测 compare 的 presence、缺失和警告，递归检查键及中文文本；反例只覆盖词表，不能保证所有同义表达或其他输出路径。上轮顶层检查问题已改善。 |
+| R08 | PASS WITH CONDITIONS | `test_r08_communication_unit.py:36,52,59` 调用 parser 和 timeline，独立断言 110462688 ns → 110462.688 µs、非通信不缩放；本次移除映射 scale 的变异被捕获。真实数据本次 BLOCKED。 |
+| R09 | PASS | `test_r09_export_columns.py:63,93,114` 检查缺列标记、未知列、flop 单位和宽表数值，调用真实 parser。 |
+| R10 | FAIL（部分覆盖） | `test_r10_truncated_duration.py:31` 调用 timeline 并检查 flag、说明和无不均文案；compare 不消费 flag，未达到任务书要求的相关对比受限。 |
+| R11 | PASS | `test_r11_utilization_denominator.py:38,56` 调用 `build_facts`，用独立算术核对活跃时间分母，缺分母不产指标。 |
+| R12 | PASS WITH CONDITIONS | `test_r12_window_origin.py:18` 使用显式窗口比较两个 epoch、检查空洞与 idle；本次 cursor=0 变异使两项失败。该文件未独立验证任务书所要求的显式窗口与回退窗口区别。 |
 
-测试文件的完整路径均位于 `tests/regression/`。报告列出的 R01/R08/R11/R12 故障注入为实施者声明，未由本次审查复现。
+## 上轮问题复核
 
-## 实际验证
+- 原 CI 的 `cmd || ...` 已改为 `--expect-blocked`；正常缺数据路径成功，0/1/3 等有契约测试，但新的退出码碰撞见 P2-1。
+- 失败加跳过现在先分类为 FAIL（`scripts/verify_real.py:56`），有直接测试；跳过检测仍受输出格式影响，见 P1-1。
+- R07 增加递归扫描及嵌套反例；扫描是有限词表。
+- 审计将 INV-02/08 改为部分强制，列出未验证路径。
 
-| 命令 | 状态 | 结果 |
+## 本次实际执行
+
+| 命令或检查 | 状态 | 结果 |
 |---|---|---|
-| `git status --short --branch`; `git log --oneline -8`; `git diff --stat 1785df8 98d67ab` | PASS | 确认提交范围和原有工作区状态 |
-| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider` | PASS / SKIPPED | 退出 0；192 项通过、15 项跳过，后者为真实数据测试 |
-| `python3 -m ruff check . --no-cache` | PASS | 退出 0 |
-| `python3 -m mypy --cache-dir /tmp/opt-review-mypy` | PASS | 48 个文件无问题 |
-| `PYTHONDONTWRITEBYTECODE=1 python3 -m opt_discovery.cli validate` | PASS | 配置通过 |
-| `PYTHONDONTWRITEBYTECODE=1 python3 -m opt_discovery.cli demo --out /tmp/opt-review-demo` | PASS | 退出 0，四组 synthetic 输出 |
-| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py` | BLOCKED | 未设置数据根，退出 2 |
-| 真实 Profiling 数据、NPU、Python 3.10、GitHub Actions | NOT RUN | 无可用数据或环境；没有重新采集 |
-| 本次隔离变异 | NOT RUN | 尚未执行，实施者记录不能替代独立复现 |
-
-`make check`、`make verify` 未直接运行；上表执行了其对应底层命令并将缓存和 demo 写至 `/tmp`。未核实全新环境安装。
+| `git status --short --branch`, `git log --oneline -8`, `git diff --stat 1785df8 HEAD` | PASS | 确认范围和工作区 |
+| `PYTHONDONTWRITEBYTECODE=1 make check PYTHON=python3` | PASS | Ruff、mypy 48 文件和 validate 退出 0 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify PYTHON=python3 DEMO_OUT=/tmp/opt-review2-demo` | PASS / SKIPPED | 203 passed、16 skipped；demo 成功，退出 0 |
+| `python3 scripts/verify_real.py --expect-blocked` | PASS | 未设置数据根时正确识别 BLOCKED(2)，闸门退出 0 |
+| `python3 -m pytest tests/test_real_data.py -q -p no:cacheprovider`，随后将真实输出送入 `classify` | FAIL（预期负向验证） | 16 项全部 skip，pytest 退出 0，双重 `-q` 输出无摘要；`classify` 返回 `(0, 'PASS ... ? passed，0 skipped')`。这是实际复现而非实施报告引用。 |
+| 隔离 `/tmp` 副本变异 R01/R08/R12，再分别运行对应 pytest 文件 | PASS（预期捕获） | 字典序、删除 scale、cursor=0 均退出 1，分别被对应测试捕获；主树未变异。 |
+| 真实数据 / NPU / 3.10 / 3.11 / GitHub Actions | BLOCKED 或 NOT RUN | 本次无真实数据根；未使用 NPU；未独立运行其他解释器和托管 CI。其他 agent 的 14 次变异及真实数据、干净环境报告是历史声明，非本次实测。 |
 
 ## 问题清单
 
-### P1：CI 未严格断言缺数据返回 BLOCKED
+### P1-1：真实回归可把所有跳过报告为 PASS
 
-`.github/workflows/ci.yml:47` 的 `command || [ $? -eq 2 ]` 在命令返回 0 时直接成功，因此即使真实数据检查错误返回 PASS，CI 仍通过，与第 46 行的要求相反。应捕获退出码后明确断言恰为 2，并对 0、3、其他错误做负向验证。
+`scripts/verify_real.py:58-66,90-98` 从 pytest 的人类可读摘要中解析 skipped；额外 `-q`（例如用户环境 `PYTEST_ADDOPTS=-q`）会隐藏摘要，所有测试跳过时 pytest 仍退出 0，而代码返回 `PASS (? passed, 0 skipped)`。本次用实际全跳过输出直接复现。影响：缺失真实证据可能被作为完成验收。建议使用 pytest 结构化结果/插件或专门的 session hook 计数，强制至少一个测试执行且计数可解析，失败关闭；增加额外 quiet、无摘要和全跳过端到端负向用例。
 
-### P1：失败与跳过并存时被标记为 SKIPPED
+### P1-2：无真实回填样本的测试静默计为通过
 
-`scripts/verify_real.py:47` 在检查 pytest 非零退出前优先匹配 skipped；同时发生失败和跳过时报告 SKIPPED、返回 3，隐藏失败分类。应先处理非零失败，再分类跳过，并增加失败加跳过的契约测试。现有代码仍返回非零，但自动化调用者无法准确区分失败与缺失。
+`tests/test_real_data.py:414-442` 的文档承诺无历史样本时显式 skip，但实际仅检查有 CSV 的目录是否有 SQLite 就 return，pytest 将其计为 passed，且循环无匹配项时可空通过。`docs/engineering/phase1/independent-verification.md:50` 的 16 passed 不能证明真实缺 CSV 回填已执行。影响：真实回归覆盖和通过数误导。建议无候选时明确 `pytest.skip` 并让 verify-real 报 SKIPPED；将有 CSV 的 SQLite 前提拆为独立测试并断言非空，保留 CPU 回填回归。
 
-### P2：图收缩负向断言覆盖不完整
+### P1-3：历史质量异常尚未在消费端受限
 
-`tests/regression/test_r07_graph_operator_shrink.py:68` 只搜索顶层键，之后仅排除 delta 的三个精确键；收益结论可出现在 observations、warnings、嵌套字段或其他名称而不触发失败。应针对实际用户可见输出构造错误结论的反例并验证被拒绝，覆盖结构化字段及文本。
+`tests/regression/test_r05_rank_merge.py:42-52` 仅验证 CLI 文案且接受 0；`tests/regression/test_r10_truncated_duration.py:31-44` 仅验证 timeline 标记与文案。`docs/engineering/baseline-audit.md:96` 已承认 compare 未消费截断 flag。影响：异常 rank 仍可能进入不受限制的分析或对比，不能满足任务书 AE-02 中 R05/R10 的完整预期。建议添加覆盖实际分析/对比消费链的反例，并在 AE-03 实现可靠闸门；在此之前矩阵维持部分覆盖，不能标为完整通过。
 
-### P2：不变量全局强制状态证据不足
+### P2-1：BLOCKED 与 pytest 失败共用退出码 2
 
-`docs/engineering/baseline-audit.md:87` 将 INV-02 标为 enforced，但所列枚举、来源合并和诊断封顶只证明局部行为，不能证明所有来源不可伪造或提升。影响后续任务依赖判断；应标明局部覆盖并检查构造、反序列化和消费路径。同理第 93 行 INV-08 应补充全路径证据。
+`scripts/verify_real.py:56-57,77-79,98-100` 透传 pytest 退出码 2（如中断或收集错误），而 `gate_exit` 将任意 2 认作缺数据并返回 0。本次直接验证 `classify(2, ...)` 报 FAIL 后 `gate_exit(2, expect_blocked=True)` 却报 OK。公开 CI 默认无数据时不触发，但当数据目录存在并发生该错误时可能误报缺数据保护通过。建议内部传递带状态的结果，而非只比较共用的整数，并加入此端到端反例。
 
-## 修复与后续判断
+### P2-2：R06/R12 必需边界尚无直接覆盖
 
-必须修复两个检查结果分类问题并补充负向测试；补强 R07 并修订审计中过度确定的状态。必须完成 R01～R12 独立逐项核查及关键变异、在受支持 Python 版本和干净 CPU 环境验证；真实数据可用时验证解析语义变更。当前真实数据不可用，通信单位修复的真实回归不能由 synthetic 代替。R05/R10 的质量闸门缺口已在实施材料中列为后续工作。
+`tests/regression/test_r06_mstx_enum_only.py:43` 未检查同步指标缺失和 host_silent 原因限制；`tests/regression/test_r12_window_origin.py:18-30` 两例均用同一种显式窗口，未对照回退窗口语义。影响：矩阵的 enforced 表述比任务书要求更宽。建议增加实际消费路径的反例及两种窗口来源的比较；在完成前将对应矩阵标为部分覆盖。
 
-**暂不允许以 AE-02 已通过为依据合并 AE-03～AE-04。** 可准备后续工作，但应先修复本报告阻断问题并完成独立验收；涉及真实语义的变更在真实回归前保持待验证。
+### P3：验证报告存在自相矛盾
+
+`docs/engineering/phase1/independent-verification.md:14,20` 一处声明已运行 3.10，另一处称 3.10 只能由 CI 声明。影响：读者无法确定证据状态；建议核对日志后统一表述。
+
+## 兼容性、限制与后续判断
+
+本轮相对于基线存在通信时间缩放、缺列告警和 `ParseMeta.extra` 类型等行为变化；本次未发现足够证据认定其他 API 契约全面兼容。真实数据和 NPU 未用于本次复审，不能独立确认通信单位真实结果或性能结论。现存 D6/D7、单位双边界、证据来源及内存缺口已在审计中登记，不把 synthetic 结果解释为真实性能。
+
+必须修复 P1-1、P1-2，并补齐或明确阻塞 AE-02 中的 R05/R10、R06/R12 相关要求；P2-1 应一并修复并回归验证。**允许开展 AE-03～AE-04 的修复工作，但不应把 AE-00～AE-02 标为全部通过或以此合并其下游，直到上述验收缺口及真实数据状态得到明确处理。**

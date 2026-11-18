@@ -411,6 +411,28 @@ def test_sqlite_fallback_equals_exported_op_statistic():
         assert sql_map[key][1] == pytest.approx(csv_map[key][1], rel=1e-6), key
 
 
+def test_sqlite_available_for_exported_ranks():
+    """有 CSV 的 rank 必须同时带 sqlite，否则 CSV 缺失时回填路径不可用。
+
+    与「缺 CSV 回填」分开：本用例在任何导出布局下都有意义，且用非空断言
+    避免「循环没有匹配项也算通过」。
+    """
+    decode_root = _DATA_ROOT / "qwen35-decode"
+    if not decode_root.is_dir():
+        pytest.skip("qwen35-decode 导出不存在")
+    exported = [
+        prof
+        for prof in sorted(decode_root.glob("PROF_*"))
+        if prof.is_dir()
+        and list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+    ]
+    assert exported, "应有至少一个带 op_statistic CSV 的 rank"
+    for prof in exported:
+        assert list(prof.glob("device_*/sqlite/op_counter.db")), (
+            f"{prof}: 有 CSV 但无 sqlite，回填路径不可用"
+        )
+
+
 def test_sqlite_fallback_fills_rank1_without_csv():
     """缺 CSV 的 rank 必须能用 device_*/sqlite 回填出同一口径的表。
 
@@ -429,17 +451,11 @@ def test_sqlite_fallback_fills_rank1_without_csv():
         and list(prof.glob("device_*/sqlite/op_counter.db"))
     ]
     if not candidates:
-        # 本次导出所有 rank 都有 CSV：历史场景不适用。这不等于「已验证回填可用」，
-        # 因此改为断言回填路径的前提——有 CSV 的 rank 也必须带 sqlite。
-        # 无 CSV 的完整回填场景由 CPU 回归 tests/regression/test_r05_rank_merge.py 覆盖。
-        for prof in sorted(decode_root.glob("PROF_*")):
-            csvs = list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
-            if not csvs:
-                continue
-            assert list(prof.glob("device_*/sqlite/op_counter.db")), (
-                f"{prof}: 有 CSV 但无 sqlite，回填路径不可用"
-            )
-        return
+        # 本次导出所有 rank 都有 CSV：该场景不可复现。必须显式 skip 并让 verify-real
+        # 报 SKIPPED，而不是静默 return 被 pytest 计为 passed。
+        # 回填能力本身由 CPU 回归 tests/regression/test_r05_rank_merge.py 覆盖；
+        # 「有 CSV 的 rank 是否带 sqlite」由上一个用例断言。
+        pytest.skip("本次导出所有 rank 都有 CSV：无 CSV 回填场景不可复现（见 CPU 回归 R05）")
     rank1 = candidates[-1]
 
     workload = WorkloadSpec.from_yaml(WORKLOAD)

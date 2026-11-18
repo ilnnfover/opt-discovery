@@ -76,8 +76,17 @@ echo "[clean-env] opt-discovery --help OK"
 
 log "verify-real"
 if [ -n "${OPT_DISCOVERY_DATA_ROOT:-}" ]; then
-  # 有真实数据：要求全部执行且通过（0 skipped）
+  # 有真实数据：PASS(0) 或 SKIPPED(3) 都说明入口工作正常；SKIPPED 表示有用例
+  # 不可复现，按契约不计为通过（不能在这里把它当成 PASS）。FAILED(1)/BLOCKED(2) 直接失败。
+  set +e
   "$VENV_PY" scripts/verify_real.py
+  real_rc=$?
+  set -e
+  case "$real_rc" in
+    0) log "真实回归: PASS（全部用例执行通过）" ;;
+    3) log "真实回归: SKIPPED（有未执行用例，不计为通过；见上方输出）" ;;
+    *) echo "[clean-env] 真实回归失败（退出码 $real_rc）"; exit "$real_rc" ;;
+  esac
 else
   # 无真实数据：必须是 BLOCKED(2)，不能是 PASS
   "$VENV_PY" scripts/verify_real.py --expect-blocked

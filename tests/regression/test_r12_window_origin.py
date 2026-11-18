@@ -49,3 +49,24 @@ def test_gap_semantics_are_independent_of_the_epoch_offset(tmp_path: Path) -> No
     assert far_epoch.gap_max_us == near_zero.gap_max_us == 50.0
     assert far_epoch.gap_count == near_zero.gap_count == 1
     assert far_epoch.device_idle_us == near_zero.device_idle_us
+
+
+def test_explicit_and_fallback_window_have_distinct_semantics(tmp_path: Path) -> None:
+    """显式窗口统计整段窗口；回退窗口（无窗口）只统计首个到末个任务之间。
+
+    任务 100–200 / 250–350 µs：
+    * 显式窗口 0–500：span=500、idle=300（含首尾未覆盖区间）；
+    * 回退窗口：span=busy+gaps=250、idle=50；真实空洞仍是 50 µs，两种口径都不得出现伪 gap。
+    """
+    prof = make_rank_export(tmp_path / "fallback", 0)
+    db = make_timeline_db(prof / "msprof_0.db", tasks=[(100.0, 200.0), (250.0, 350.0)])
+
+    explicit = summarize(db, Window(start_us=0.0, end_us=500.0, rounds=(1,)))
+    fallback = summarize(db, None)
+
+    assert explicit.span_us == 500.0
+    assert explicit.device_idle_us == 300.0
+    assert fallback.span_us == 250.0
+    assert fallback.device_idle_us == 50.0
+    assert explicit.gap_count == fallback.gap_count == 1
+    assert explicit.gap_max_us == fallback.gap_max_us == 50.0

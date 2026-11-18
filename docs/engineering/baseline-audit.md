@@ -145,7 +145,8 @@ cli.py                       22 个子命令（编排层）
 | AE-05 架构/领域 Lint | `make check` 尚未包含依赖规则 | 实现检查器后接入 `make check` |
 | AE-06 属性测试/真实趋势回归 | 不在本轮范围 | Hypothesis + golden snapshot + 性能基线 |
 | NPU 重新采集 | 未授权，且无必要 | 仅在需要复现截断/新硬件时申请 |
-| CSV 缺失 rank 的真实回填场景 | 统一补采后两 rank 均有 CSV | 保留 CPU 回归；若复现历史导出则重新启用真实用例 |
+| CSV 缺失 rank 的真实回填场景 | 统一补采后两 rank 均有 CSV，真实用例显式 `pytest.skip` | 保留 CPU 回归；若复现历史导出则重新启用真实用例 |
+| R05/R10 下游质量闸门 | `compare` 未消费 `rank_mergeable` / `rank_duration_inconsistent`；已用 strict xfail 用例登记（`tests/regression/test_known_gaps.py`） | AE-03 实现闸门后，XPASS 会强制更新测试与矩阵 |
 | 阈值门槛统一（D8） | 涉及策略语义，需单独评审 | 决定以 12 为默认或改 README，并迁移 |
 | INV-01 JSON 导入路径把缺失计数补 0 | `OperatorRecord.from_dict` / `ParseMeta.from_dict` 的默认值 | AE-03/AE-04：改为缺失即报错或保留 None |
 | INV-02/INV-08 全路径保证未验证 | 仅诊断报告层有测试；`Opportunity.from_dict`、`generator`、`feedback` 未逐一核查 | AE-07 统一证据升级 API 时补全路径测试 |

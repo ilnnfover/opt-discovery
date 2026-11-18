@@ -149,17 +149,39 @@ def write_rank_summary(
     return write_op_summary(output / name, rows, header)
 
 
-def make_timeline_db(path: Path, *, host: Sequence[tuple[float, float, str]] = ()) -> Path:
-    """建一个最小 msprof 库（TASK/CANN_API/STRING_IDS），时间单位 ns。"""
+def make_timeline_db(
+    path: Path,
+    *,
+    host: Sequence[tuple[float, float, str]] = (),
+    tasks: Sequence[tuple[float, float]] = (),
+    enum_mstx: bool = False,
+) -> Path:
+    """建一个最小 msprof 库（TASK/CANN_API/STRING_IDS），时间单位 ns。
+
+    ``tasks`` 写入 TASK 表（回退窗口路径使用）；``enum_mstx`` 只建
+    ``ENUM_MSTX_EVENT_TYPE`` 枚举表（模拟「没开打点但有枚举」）。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.execute("create table TASK (startNs integer, endNs integer)")
     connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
     connection.execute("create table STRING_IDS (id integer, value text)")
     connection.executemany(
+        "insert into TASK values (?, ?)",
+        [(int(start * 1000), int(end * 1000)) for start, end in tasks],
+    )
+    connection.executemany(
         "insert into CANN_API values (?, ?, ?)",
         [(name, int(start * 1000), int(end * 1000)) for start, end, name in host],
     )
+    if enum_mstx:
+        connection.execute(
+            "create table ENUM_MSTX_EVENT_TYPE (id integer, name text, value text)"
+        )
+        connection.executemany(
+            "insert into ENUM_MSTX_EVENT_TYPE values (?, ?, ?)",
+            [(0, "marker", "0"), (1, "push_pop", "1")],
+        )
     connection.commit()
     connection.close()
     return path

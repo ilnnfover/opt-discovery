@@ -9,15 +9,15 @@
 
 | 解释器 | 依赖 | 全量结果 |
 |---|---|---|
-| Python 3.12.13 | PyYAML 6.0.3、pytest 8.3.2、ruff 0.17.5、mypy 2.4.1 | 203 passed, 16 skipped |
-| Python 3.11.6（`/usr/bin/python3.11` + venv） | PyYAML 6.0.3、pytest 9.2.0 | 203 passed, 16 skipped |
-| Python 3.10.22（uv 独立构建 + 干净 venv） | PyYAML 6.0.3、pytest 9.2.0、ruff 0.17.5、mypy 2.4.1 | 203 passed, 16 skipped；真实回归 16 passed, 0 skipped |
+| Python 3.12.13 | PyYAML 6.0.3、pytest 8.3.2、ruff 0.17.5、mypy 2.4.1 | 211 passed, 17 skipped, 2 xfailed |
+| Python 3.11.6（`/usr/bin/python3.11` + venv） | PyYAML 6.0.3、pytest 9.2.0 | 211 passed, 17 skipped, 2 xfailed |
+| Python 3.10.22（uv 独立构建 + 干净 venv） | PyYAML 6.0.3、pytest 9.2.0、ruff 0.17.5、mypy 2.4.1 | 211 passed, 17 skipped, 2 xfailed；真实回归 16 passed, 1 skipped（→ SKIPPED） |
 
 3.10 的获取方式：`install_binary` 工具两次失败（安装器报 3.14.3 校验失败），改用 `pip install uv` +
 `uv python install 3.10`（独立构建，自带 sqlite3/ssl/zlib），再建 venv。该解释器**不是**系统包，
 不影响系统 Python；详见 §6。
 
-3.11 是本地能拿到的最低主版本，用于验证「不依赖 3.12 特性」；3.10 仍只能由 CI 矩阵声明。
+3.10 与 3.11 均已实际运行（3.10 通过 uv 独立构建 + 干净 venv），用于验证「不依赖 3.12 特性」；CI 矩阵 3.10/3.11/3.12 覆盖托管环境。
 
 ## 2. R01–R12 逐项核查与变异
 
@@ -40,6 +40,9 @@
 
 结论：14 次注入全部被捕获（`ALL_CAUGHT`），未出现「注入错误但测试仍通过」。
 
+R06/R12 在第三轮复审后新增的边界用例（缺同步指标、显式 vs 回退窗口）为断言级补充，
+未另做独立变异；它们验证的是「不把缺失当实测」与两种窗口口径的差异，结论见 `regression-matrix.md` §1。
+
 ## 3. 新增：真实数据上的通信单位回归
 
 `tests/test_real_data.py::test_communication_time_matches_record_total`：遍历真实 `op_summary` 导出的
@@ -47,7 +50,12 @@ COMMUNICATION 记录，断言 `communication_time_us.unit == "us"`、值与 `tot
 且至少存在一条通信记录。移除 `scale` 后该用例失败（见上表 R08-real），说明合成 fixture 之外也有真实语义保护；
 修复前该断言会得到 1000 倍偏差。
 
-真实回归现状：`OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` → `16 passed, 0 skipped`，退出 0。
+真实回归现状：`OPT_DISCOVERY_DATA_ROOT=<授权根> python scripts/verify_real.py` → **SKIPPED（16 passed, 1 skipped）**，退出 3。
+
+原因：`test_sqlite_fallback_fills_rank1_without_csv` 在「所有 rank 都有 CSV」的补采上不可复现，已按复审要求改为
+显式 `pytest.skip`（不再静默计为通过），因此入口整体不能记 PASS。回填能力由 CPU 回归
+`test_r05_rank_merge.py` 覆盖；「有 CSV 的 rank 是否带 sqlite」由新增用例
+`test_sqlite_available_for_exported_ranks` 无条件断言（非空循环）。
 
 ## 4. 跨版本发现并修复的缺陷
 
@@ -61,7 +69,7 @@ FAILED tests/test_analyzer.py::test_hotspots_rank_and_share - assert 0.999999999
 测试用**精确相等**断言「占比之和为 1」，属于版本相关的偶然通过。
 
 修复：改为 `pytest.approx(1.0, abs=1e-12)`（`hotspots[0].share` 同样改为 approx），并保留注释说明原因。
-修复后 3.11 / 3.12 均 203 passed, 16 skipped。该缺陷说明「最低支持版本验证」不能由单一解释器替代。
+修复后 3.11 / 3.12 均 211 passed, 17 skipped, 2 xfailed。该缺陷说明「最低支持版本验证」不能由单一解释器替代。
 
 ## 5. 全新 CPU 环境安装验证（AE-01）
 
@@ -71,15 +79,16 @@ FAILED tests/test_analyzer.py::test_hotspots_rank_and_share - assert 0.999999999
 2. 用指定解释器建 **干净 venv**（不继承系统 site-packages）；
 3. `pip install --no-cache-dir -e ".[dev]"`（强制真实解析/下载，不复用本站缓存）；
 4. 依次执行 `make check`（ruff+mypy+validate）、`make verify`（pytest+demo）、`opt-discovery --help`；
-5. `verify-real`：有 `OPT_DISCOVERY_DATA_ROOT` 时要求全通过，否则用 `--expect-blocked` 断言 BLOCKED(2)。
+5. `verify-real`：有 `OPT_DISCOVERY_DATA_ROOT` 时接受 PASS(0) 或 SKIPPED(3)（SKIPPED 不计为通过并打印），
+   否者用 `--expect-blocked` 断言 BLOCKED；FAILED(1)/错配一律非零。
 
 实测：
 
 | 解释器 | 安装结果 | make check | make verify | verify-real | 退出码 |
 |---|---|---|---|---|---|
-| 3.10.22 | PyYAML 6.0.3 / pytest 9.2.0 / ruff 0.17.5 / mypy 2.4.1 | 0 | 203 passed, 16 skipped | BLOCKED(2) 断言通过 | 0 |
-| 3.10.22 + 真实数据 | 同上 | 0 | 203 passed, 16 skipped | 16 passed, 0 skipped | 0 |
-| 3.12.13 | 同上（pytest 9.2.0） | 0 | 203 passed, 16 skipped | BLOCKED(2) 断言通过 | 0 |
+| 3.10.22 | PyYAML 6.0.3 / pytest 9.2.0 / ruff 0.17.5 / mypy 2.4.1 | 0 | 211 passed, 17 skipped, 2 xfailed | BLOCKED 断言通过 | 0 |
+| 3.10.22 + 真实数据 | 同上 | 0 | 211 passed, 17 skipped, 2 xfailed | SKIPPED（16 passed, 1 skipped） | 0（脚本接受 SKIPPED 并注明不计通过） |
+| 3.12.13 | 同上（pytest 9.2.0） | 0 | 211 passed, 17 skipped, 2 xfailed | BLOCKED 断言通过 | 0 |
 
 顺带发现并修复：`make test` 原本写 `pytest -q`，与 pyproject 的 `addopts = "-q"` 叠加成双 `-q`，
 会吞掉 `N passed / N skipped` 摘要（与 verify-real 的 skip 检测同类风险）。已去掉 Makefile 里的 `-q`。
@@ -93,7 +102,18 @@ CI 也改为直接调用 `make check` / `make verify`，避免本地与 CI 命�
 | 项 | 现状 |
 |---|---|
 | 全新机器/容器隔离 | 已用「干净 venv + 工作树副本 + `--no-cache-dir`」模拟；未在真正空白 OS 或容器中验证 |
-| R05 下游闸门 | 只有 CLI 文案与退出码；`analyze` 不消费 rank 合并结论（AE-03） |
-| R10 下游闸门 | `rank_duration_inconsistent` 未被 `compare` 消费（AE-03/AE-07） |
+| R05/R10 下游闸门 | 仍只有 CLI/时间线层标记；`compare` 尚未消费。已用 **strict xfail** 用例锁定预期（`tests/regression/test_known_gaps.py`），AE-03 实现后会 XPASS 并强制更新 |
+| 真实无 CSV 回填场景 | 统一补采不可复现，真实回归显式 SKIPPED；CPU 回归覆盖 |
 | 真实数据趋势回归 | 现有真实用例验证的是口径/契约，不比对历史数值趋势（AE-06） |
 | 变异为人工注入 | 未接入自动化变异测试工具（如 mutmut），仅保留本轮脚本化证据 |
+
+## 7. 第三轮复审问题修复（2026-11-18）
+
+| 复审项 | 问题 | 修复与证据 |
+|---|---|---|
+| P1-1 | 解析 pytest 文本摘要，额外 `-q` 时全跳过被误判 PASS | `verify_real` 改用 `--junitxml` 结构化计数（`parse_junit`），并清除 `PYTEST_ADDOPTS`；`tests=0`/`executed=0`/junit 缺失或不可解析均失败关闭。回归用例：`test_all_skipped_with_extra_quiet_is_not_pass`（真实执行、`PYTEST_ADDOPTS=-q`、16 个用例全 skip → SKIPPED，非 PASS）、`test_classify` 参数化全跳过/空集合 |
+| P1-2 | 无回填样本时静默计为 passed | `test_sqlite_fallback_fills_rank1_without_csv` 改为显式 `pytest.skip`；新增 `test_sqlite_available_for_exported_ranks` 无条件断言（非空列表）。真实回归因此如实变为 SKIPPED（16 passed, 1 skipped） |
+| P1-3 | R05/R10 下游未受限 | 未在 AE-02 内实现闸门（属 AE-03），新增 `tests/regression/test_known_gaps.py` 两条 strict xfail 用例描述应有行为；矩阵维持 partially，并注明可由 XPASS 追踪 |
+| P2-1 | BLOCKED 与 pytest 退出码 2 撞码 | 退出码不再参与判定：内部 `Outcome` 枚举（PASS/SKIPPED/FAILED/BLOCKED），`gate_exit` 只认 `Outcome.BLOCKED`。回归用例：`test_pytest_interrupt_code_two_is_not_blocked` |
+| P2-2 | R06 缺同步指标/host_silent 边界、R12 缺回退窗口对照 | R06 新增 `test_missing_sync_metric_is_not_reported_as_measured_zero`（`mstx_available=False`、`silent_unattributed_us>0`、无「同步等待合计」措辞）；R12 新增 `test_explicit_and_fallback_window_have_distinct_semantics`（显式 span/idle=500/300，回退=250/50，空洞同为 50µs） |
+| P3 | 报告自相矛盾（3.10 已运行 vs 只能 CI） | §1 已统一为「3.10/3.11 均已实际运行」，删除“仍只能由 CI 声明” |
