@@ -11,7 +11,7 @@ help:
 	@echo "make clean-env-check 干净 venv 从零安装并跑全部检查（PYTHON=3.10 可指定版本）"
 	@echo "make lint / typecheck / validate / demo / test  单独执行"
 
-# 架构/领域检查（AE-05）尚未实现；实现后在此接入，而不是假装已存在。
+# 架构/领域检查由 tools/arch_lint.py 执行，作为 check 的一部分。
 check: lint arch-lint typecheck validate
 
 lint:

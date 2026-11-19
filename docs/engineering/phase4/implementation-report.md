@@ -80,7 +80,7 @@
 
 ## 5. 测试
 
-`tests/test_arch_lint.py`（17 条）：
+`tests/test_arch_lint.py`（28 条）：
 
 - 当前仓库必须 0 违规；
 - 四条架构规则各一个反例，schema 相对导入合法；
@@ -99,8 +99,8 @@
 | 检查 | 结果 |
 |---|---|
 | `make check` | 0（含 arch-lint） |
-| `pytest` | **335 passed, 17 skipped**（352 用例） |
-| `make verify DEMO_OUT=/tmp/ae05-demo` | 0，335 passed / 17 skipped |
+| `pytest` | **346 passed, 17 skipped**（363 用例） |
+| `make verify DEMO_OUT=/tmp/ae05-demo` | 0，346 passed / 17 skipped |
 | 真实数据 `tests/test_real_data.py` | 16 passed, 1 skipped |
 | 临时违规探针 | arch-lint 退出 2；清理后 0 |
 | `git diff --check` | 0 |
@@ -119,3 +119,27 @@
 - OD007 只检查 YAML 阈值；设备档案 JSON 的 `peak_*` 字段不在任务书“阈值来源”范围内。
 - 未引入 import-linter；模块依赖检查为文件级 import 前缀。
 - 未跑四组真实导出的完整 `analyze`；NPU 未运行。
+
+## 9. 复审修复（2026-11-19）
+
+依据 `docs/engineering/phase4/review-report.md`：
+
+| 问题 | 修复 | 回归 |
+|---|---|---|
+| P1-1 ARCH 漏基础领域与报告跨层入口 | `core-schemas` 增加 `opt_discovery/primitives.py`；report 禁止 `opt_discovery.cli`、`opt_discovery.experiment.feedback`；相对导入也解析后检查 | primitives 导入 report、report 相对导入 cli/feedback 均失败；同语句去重 |
+| P1-2 OD003 漏 SQLite/CLI raw、误伤报告文案 | 受限制模块检查 `sqlite3` / `csv` 导入、`.connect`、`op_counter.db`/`op_report`/`msprof_`/`mindstudio_profiler_output`；CLI 追加 SQL `TASK` 检测；report 允许 `op_summary` 来源文案 | diagnosis `sqlite3.connect('op_counter.db')`、CLI `from TASK` 失败；报告来源说明通过 |
+| P1-3 OD004 漏 `evidence_level`、误报 `level` | 目标改为 `severity/verdict/evidence_level`；仅 feedback.py 的 `ConfidenceLevel.PROBABLE` 升级允许，`CONFIRMED` 拒绝 | 直接 `evidence_level=CONFIRMED` 失败；feedback PROBABLE 通过；`logger.level` 通过 |
+| P1-4 OD005 CLI 整文件豁免 | `od005_allow` 改为 `(file,line)` 精确匹配，只豁免已说明的 1387 行保护分支 | 同文件新增 handler 被拒；旧分支通过 |
+| P1-5 OD002 无法区分换算与计数 | 仅当上下文/左值含 time/duration/ns/us/ms/busy/gap 时才拦截 `*1000`/`/1000`；补充 `*0.001` 的 ns→µs 检测 | `duration_ns*0.001` 失败；`batches*1000` 通过 |
+| P2 | 空配置静默关闭 ARCH；OD001 条件补零；OD007 行号 | 空 `arch_rules` 报 `ARCH:config`；`Metric(0 if x is None else x)` 被拒；阈值报键所在行 | 新增对应测试 |
+| P3 | 重复诊断、Make 注释 | 每条 import 语句每规则去重；Make 注释更新 | `test_arch_report_cannot_import...` 断言 2 条（每条语句 1 条） |
+
+自检结果：
+
+| 检查 | 结果 |
+|---|---|
+| `make check` | 0 |
+| `pytest` | **346 passed, 17 skipped**（363 用例） |
+| `make verify DEMO_OUT=/tmp/ae05-r2-demo2` | 0，346 passed / 17 skipped |
+| 真实数据 `tests/test_real_data.py` | 16 passed, 1 skipped |
+| `git diff --check` | 0 |

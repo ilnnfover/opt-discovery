@@ -129,22 +129,28 @@ def _check_imports(
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
+        reported: set[str] = set()
         for target in _absolute_imports(node, module):
             for rule in rules:
                 roots = [str(item) for item in rule.get("roots", ())]
                 if not any(rel == item or rel.startswith(item + "/") for item in roots):
                     continue
                 forbidden = [str(item) for item in rule.get("forbid", ())]
-                if any(_matches(target, item) for item in forbidden):
-                    violations.append(
-                        Violation(
-                            f"ARCH:{rule.get('name', 'rule')}",
-                            rel,
-                            node.lineno,
-                            f"{rel} 不允许导入 {target}",
-                            "移入 CLI/适配器，或通过 schemas 的公共 API 传递数据",
-                        )
+                if not any(_matches(target, item) for item in forbidden):
+                    continue
+                rule_name = f"ARCH:{rule.get('name', 'rule')}"
+                if rule_name in reported:
+                    continue
+                reported.add(rule_name)
+                violations.append(
+                    Violation(
+                        rule_name,
+                        rel,
+                        node.lineno,
+                        f"{rel} 不允许导入 {target}",
+                        "移入 CLI/适配器，或通过 schemas 的公共 API 传递数据",
                     )
+                )
     return violations
 
 
@@ -160,17 +166,26 @@ def _check_od001(tree: ast.AST, rel: str) -> list[Violation]:
             for keyword in node.keywords:
                 if keyword.arg == "value":
                     value = keyword.value
+        suspicious = False
         if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or):
-            if any(_zero(item) for item in value.values):
-                violations.append(
-                    Violation(
-                        "OD001",
-                        rel,
-                        node.lineno,
-                        "Metric 构造把缺失值静默替换为 0",
-                        "保留 None 并用 MissingEvidence / Provenance 表达，或显式标记 default",
-                    )
+            suspicious = any(_zero(item) for item in value.values)
+        elif isinstance(value, ast.IfExp):
+            test = value.test
+            compares_none = (
+                isinstance(test, ast.Compare)
+                and any(isinstance(op, (ast.Is, ast.IsNot)) for op in test.ops)
+            )
+            suspicious = compares_none and (_zero(value.body) or _zero(value.orelse))
+        if suspicious:
+            violations.append(
+                Violation(
+                    "OD001",
+                    rel,
+                    node.lineno,
+                    "Metric 构造把缺失值静默替换为 0",
+                    "保留 None 并用 MissingEvidence / Provenance 表达，或显式标记 default",
                 )
+            )
     return violations
 
 
@@ -181,14 +196,45 @@ def _check_od002(
         return []
     parents = _parents(tree)
     violations: list[Violation] = []
+    time_words = ("us", "ms", "ns", "time", "duration", "latency", "busy", "gap")
+
+    def _name_text(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id.lower()
+        if isinstance(node, ast.Attribute):
+            return node.attr.lower()
+        return ""
+
+    def _assignment_context(node: ast.AST) -> str:
+        current = node
+        while current in parents:
+            parent = parents[current]
+            if isinstance(parent, ast.Assign):
+                target = parent.targets[0]
+                if isinstance(target, ast.Name):
+                    return target.id.lower()
+                if isinstance(target, ast.Attribute):
+                    return target.attr.lower()
+            current = parent
+        return ""
+
     for node in ast.walk(tree):
         if not isinstance(node, ast.BinOp) or not isinstance(node.op, (ast.Mult, ast.Div)):
             continue
-        operands = (node.left, node.right)
-        if not any(
-            isinstance(item, ast.Constant) and item.value in _UNIT_CONSTANTS
-            for item in operands
-        ):
+        constant = None
+        for item in (node.left, node.right):
+            if isinstance(item, ast.Constant) and isinstance(item.value, (int, float)):
+                if item.value in _UNIT_CONSTANTS or abs(float(item.value) - 0.001) < 1e-12:
+                    constant = float(item.value)
+                    break
+        if constant is None:
+            continue
+        context = _assignment_context(node)
+        left = _name_text(node.left)
+        time_like = any(word in context or word in left for word in time_words)
+        if constant == 0.001 and not time_like:
+            continue
+        if constant in _UNIT_CONSTANTS and not time_like:
             continue
         if _inside_fstring(node, parents):
             continue
@@ -205,29 +251,83 @@ def _check_od002(
 
 
 def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
-    if not (
+    restricted = (
         rel.startswith("opt_discovery/diagnosis/")
         or rel.startswith("opt_discovery/discovery/")
         or rel.startswith("opt_discovery/report/")
-    ):
+        or rel == "opt_discovery/cli.py"
+    )
+    if not restricted:
         return []
     violations: list[Violation] = []
+    dangerous_tokens = ("op_counter.db", "op_report", "msprof_", "mindstudio_profiler_output")
+    if rel.startswith("opt_discovery/diagnosis/") or rel.startswith(
+        "opt_discovery/discovery/"
+    ):
+        dangerous_tokens = dangerous_tokens + ("op_summary", "op_statistic")
     for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            targets = _absolute_imports(node, _module_name(Path(rel), Path(".")))
+            if any(item == "sqlite3" or item.startswith("sqlite3.") for item in targets):
+                violations.append(
+                    Violation(
+                        "OD003",
+                        rel,
+                        node.lineno,
+                        "下游/编排模块直接导入 sqlite3",
+                        "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+                    )
+                )
+            if rel != "opt_discovery/report/" and any(
+                item == "csv" or item.startswith("csv.") for item in targets
+            ):
+                violations.append(
+                    Violation(
+                        "OD003",
+                        rel,
+                        node.lineno,
+                        "下游模块直接导入 csv 解析原始数据",
+                        "通过 parsers/csv_mapping 或 events 的公共 Reader 读取",
+                    )
+                )
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "connect":
+                violations.append(
+                    Violation(
+                        "OD003",
+                        rel,
+                        node.lineno,
+                        "直接连接 sqlite 数据库",
+                        "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+                    )
+                )
+                continue
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         text = node.value.lower()
-        token = next((item for item in _RAW_SOURCE_TOKENS if item in text), None)
-        if token is None:
-            continue
-        violations.append(
-            Violation(
-                "OD003",
-                rel,
-                node.lineno,
-                f"下游模块直接引用原始 Profiler 数据源 {token!r}",
-                "通过 OperatorTable/FactSet 等公共数据契约读取，不在 diagnosis/report 解析原始文件",
+        if rel != "opt_discovery/cli.py" and any(
+            token in text for token in dangerous_tokens
+        ):
+            violations.append(
+                Violation(
+                    "OD003",
+                    rel,
+                    node.lineno,
+                    "受限制模块出现原始 Profiler 数据源标识",
+                    "通过 OperatorTable/FactSet 公共契约读取；来源说明请放在文档/注释",
+                )
             )
-        )
+        elif re.search(r"\b(from|into|update|join)\s+task\b", text):
+            violations.append(
+                Violation(
+                    "OD003",
+                    rel,
+                    node.lineno,
+                    "直接查询 Profiler TASK 表",
+                    "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+                )
+            )
     return violations
 
 
@@ -242,9 +342,16 @@ def _check_od004(tree: ast.AST, rel: str) -> list[Violation]:
         for target in targets:
             if isinstance(target, ast.Attribute) and target.attr in {
                 "severity",
-                "level",
                 "verdict",
+                "evidence_level",
             }:
+                if (
+                    rel == "opt_discovery/experiment/feedback.py"
+                    and target.attr == "evidence_level"
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "PROBABLE"
+                ):
+                    continue
                 violations.append(
                     Violation(
                         "OD004",
@@ -273,10 +380,8 @@ def _check_od004(tree: ast.AST, rel: str) -> list[Violation]:
 
 
 def _check_od005(
-    tree: ast.AST, rel: str, allowed: Mapping[str, str]
+    tree: ast.AST, rel: str, allowed: Mapping[tuple[str, int], str]
 ) -> list[Violation]:
-    if rel in allowed:
-        return []
     violations: list[Violation] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.ExceptHandler):
@@ -285,6 +390,8 @@ def _check_od005(
             isinstance(node.type, ast.Name) and node.type.id in {"Exception", "BaseException"}
         )
         if not broad:
+            continue
+        if (rel, node.lineno) in allowed:
             continue
         if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
             violations.append(
@@ -336,9 +443,10 @@ def _check_od007(root: Path) -> list[Violation]:
     for path in files:
         if ".bak" in path.name:
             continue
+        text = path.read_text(encoding="utf-8")
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
             violations.append(
                 Violation(
                     "OD007",
@@ -349,19 +457,29 @@ def _check_od007(root: Path) -> list[Violation]:
                 )
             )
             continue
+        lines = text.splitlines()
         for key, item in _iter_threshold_items(data):
             provenance = str(item.get("provenance", "")).strip().lower()
             has_basis = bool(str(item.get("basis") or item.get("source") or "").strip())
-            if provenance not in _THRESHOLD_PROVENANCE or not has_basis:
-                violations.append(
-                    Violation(
-                        "OD007",
-                        _relative(path, root),
-                        1,
-                        f"阈值 {key!r} 缺少登记的 provenance/basis",
-                        "补充 provenance(assumed/declared/derived/measured) 与 basis/source",
-                    )
+            if provenance in _THRESHOLD_PROVENANCE and has_basis:
+                continue
+            line = next(
+                (
+                    index
+                    for index, raw in enumerate(lines, start=1)
+                    if re.match(rf"^\s*{re.escape(str(key))}\s*:", raw)
+                ),
+                1,
+            )
+            violations.append(
+                Violation(
+                    "OD007",
+                    _relative(path, root),
+                    line,
+                    f"阈值 {key!r} 缺少登记的 provenance/basis",
+                    "补充 provenance(assumed/declared/derived/measured) 与 basis/source",
                 )
+            )
     return violations
 
 
@@ -371,12 +489,22 @@ def run_lint(root: str | Path, config_path: str | Path) -> list[Violation]:
     arch_rules = config.get("arch_rules") or []
     authorized = [str(item) for item in config.get("od002_authorized_files") or []]
     od005_allowed = {
-        str(item["file"]): str(item.get("reason", ""))
+        (str(item["file"]), int(item["line"])): str(item.get("reason", ""))
         for item in config.get("od005_allow") or []
-        if isinstance(item, Mapping) and item.get("file")
+        if isinstance(item, Mapping) and item.get("file") and item.get("line")
     }
 
     violations: list[Violation] = []
+    if not arch_rules:
+        violations.append(
+            Violation(
+                "ARCH:config",
+                str(Path(config_path)),
+                1,
+                "架构规则为空，检查会静默失效",
+                "在 configs/quality/arch_lint.yaml 中至少登记一条 arch_rules",
+            )
+        )
     for path in sorted((root_path / "opt_discovery").rglob("*.py")):
         rel = _relative(path, root_path)
         try:

@@ -6,7 +6,7 @@
 
 arch_rules:
   - name: core-schemas
-    roots: ["opt_discovery/schemas"]
+    roots: ["opt_discovery/schemas", "opt_discovery/primitives.py"]
     forbid:
       - opt_discovery.cli
       - opt_discovery.report
@@ -26,7 +26,9 @@ arch_rules:
   - name: report-read-only
     roots: ["opt_discovery/report"]
     forbid:
+      - opt_discovery.cli
       - opt_discovery.diagnosis
+      - opt_discovery.experiment.feedback
       - opt_discovery.discovery
       - opt_discovery.parsers
       - opt_discovery.collectors
@@ -55,4 +57,5 @@ od002_authorized_files:
 # best-effort path cannot mask the original error.
 od005_allow:
   - file: opt_discovery/cli.py
+    line: 1387
     reason: best-effort early input protection; original error is reported before this handler
