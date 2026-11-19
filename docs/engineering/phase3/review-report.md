@@ -196,3 +196,23 @@
 | 在 `git archive d9950de` 的临时副本中运行本次新增的四个测试 | 预期失败，4 failed、23 deselected。四个测试在 `344c2b9` 的定向套件中通过。 |
 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-344-probe.s8DriW/check.py`，并从隔离的 `d9950de` 目录运行同一探针 | 独立 CSV 和 SQLite 探针实测上轮四组均关闭。新增相对坐标回归与缺数据路径回归见上表。 |
 | `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，未配置真实数据根目录。NPU 与托管 CI 未运行。 |
+
+## AE-04 最终增量验收（2026-11-19）
+
+**结论为 PASS。`bae5726` 可以合并并进入 AE-05。** 本轮复核 `344c2b9..bae5726` 及直接受影响的代码。上轮 P1 和 P2 均关闭，复核范围内未发现新的阻断项。
+
+| 上轮问题 | 验收证据 |
+|---|---|
+| P1 · TASK 和 Host Reader 的首事件相对原点 | **已关闭。** 独立 SQLite 样例中，两个 Reader 对相隔 100 ns 的事件均返回 `[0.0, 0.1] µs`。未传原点时保持绝对坐标，显式 `origin_ns` 优先，过滤后的首事件可作为原点。原例经 Timeline 验证，有窗和无窗的 device/Host busy 分别为 0.2 和 0.3 µs。涉及 `opt_discovery/events.py:428`、`:504`。 |
+| P2 · 无窗 TASK 原点预读的缺数据行为 | **已关闭。** 不存在的路径、缺 TASK 表、TASK 表为空和非法 SQLite 文件均经 `summarize` 得到 `TimelineError`。不存在的路径保持未创建。只读查询还通过了含空格、`?`、`#` 和中文的数据库路径测试。涉及 `opt_discovery/events.py:377`。 |
+
+非阻断文档项。`opt_discovery/events.py:427`、`:467` 的文字可明确省略原点参数时使用绝对坐标、显式传入 `origin_us=None` 时使用首事件原点、传入 `origin_ns` 时以指定整数 ns 为原点。上述三种行为已实际验证。
+
+| 验证 | 结果 |
+|---|---|
+| `git diff --check 344c2b9 HEAD`、`PYTHONDONTWRITEBYTECODE=1 make check` | PASS。Ruff、mypy 和配置检查通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae04-accept-demo.cGDfQE` | PASS，318 passed、17 skipped，合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，75 passed。 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-accept-probe.G1LURf/verify.py` | PASS。独立 SQLite 样例覆盖上表两项修复。 |
+| 在 `git archive 344c2b9` 的临时副本上运行当前新增的两个回归测试 | 两个测试均如预期失败，当前提交上随定向套件通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED。复核环境未配置真实数据目录，NPU 与托管 CI 未运行。 |
