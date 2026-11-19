@@ -51,3 +51,36 @@
 | `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | 真实 Profiling 为 BLOCKED，复核环境未配置数据目录。托管 CI 与 NPU 未运行。 |
 
 合并复核以五项 P1 的原反例为门槛。直接跨层调用、raw 读取、证据写入、静默回退与明确的未经授权换算应退出非零。相邻的合法文案、计数、公共 API 调用与已授权适配器应通过。P2/P3 可后续处理。
+
+## `d2eb678` 增量复核（2026-11-19）
+
+**结论仍为 FAIL。暂缓合并和进入 AE-06。** 本轮只复核 `712610d..d2eb678` 的修复及直接受影响的判断分支。上轮五项的原始反例均得到预期结果，ARCH 与 OD005 两项已关闭。OD002、OD003 和 OD004 的修复路径仍有三项 P1。该差异在 `opt_discovery/` 和 CI 工作流下无改动。
+
+| 上轮事项 | 复核结果 | 证据 |
+|---|---|---|
+| P1-1 · ARCH 跨层依赖 | 关闭 | `primitives.py` 导入 report、report 相对导入 CLI 与反馈写入入口均被拦截。完整副本中调用 `cmd_diagnose` 的报告代码使 `make check` 退出 2。重复导入诊断已去重。 |
+| P1-2 · OD003 原始数据访问 | 部分关闭 | diagnosis 读取 SQLite 回填源和 CLI 查询 TASK 均拦截，`op_summary` 报告来源文案通过。直接读取该文件及 `.connect` 判断仍有问题，见下表。 |
+| P1-3 · OD004 证据升级 | 部分关闭 | report 直接赋 `CONFIRMED` 触发 OD004，普通 `logger.level` 通过。反馈模块内新增的无验证 `PROBABLE` 写入可绕过。 |
+| P1-4 · OD005 CLI 豁免 | 关闭 | 原 handler 获准。同一 `cli.py` 新增 `except Exception: pass` 时，`make check` 退出 2 并定位新分支。 |
+| P1-5 · OD002 单位换算 | 部分关闭 | `duration_ns * 0.001` 已拦截，`batches * 1000` 通过。交换乘法操作数后仍漏报，其他普通计数仍可误报。 |
+
+### 剩余阻断项
+
+| 级别 | 代码位置 | 实际影响及修复建议 |
+|---|---|---|
+| P1 · OD003 无法区分 raw CSV 读取和相邻合法操作 | `tools/arch_lint.py:263`、`:270`、`:294`、`:309` | 报告直接执行 `(rank / 'op_summary_1.csv').read_text()` 的完整副本 `make check` 退出 0。报告中仅说明 `op_counter.db` / `op_report` 来源，以及 diagnosis 的普通 `signal.connect(callback)`，直接运行检查器均退出 1。`csv` 导入判断还复用了已被 SQLite 判断消费的迭代器。修复应检查明确的 Profiler 路径及读取调用，限定 SQLite 名称或已知表，允许合法来源文案和 `csv.writer`。这组反例均为直接表达式。 |
+| P1 · OD004 允许反馈模块绕过验证直接升级 | `tools/arch_lint.py:348`；`opt_discovery/experiment/feedback.py:126`；`tests/test_arch_lint.py:234` | 在完整的 `feedback.py` 中增加另一函数直接执行 `opportunity.evidence_level = ConfidenceLevel.PROBABLE`，`make check` 仍退出 0。豁免只看文件和右值属性名，未限定实际验证入口。新增测试的允许样例本身也是任意函数内的无验证赋值。将豁免限制到既有验证写入点，补同文件且同等级的非法赋值反例。 |
+| P1 · OD002 仍误判普通计数并漏掉明确时间换算 | `tools/arch_lint.py:199`、`:221`、`:232` | `return items * 1000` 使完整副本 `make check` 退出 2，原因是 `items` 含 `ms`。等价的 `return 0.001 * duration_ns` 却让 `make check` 退出 0。`row['duration_ns'] / 1000` 的直接检查同样漏报。按完整词或单位后缀识别时间语义，并识别实际参与乘法的时间操作数以及明确的时长字段键。 |
+
+无 P0。两个非阻断边界可随有关规则处理。OD001 已拦截缺失值条件补零，但 `Metric(1 if state is running else 0, 'count', Provenance.DERIVED)` 也退出 1，因为判断 `is`/`is not` 时没有检查是否比较 `None`。OD007 普通键的诊断已从第 1 行修正到第 2 行，带引号的合法 YAML 键仍回落到第 1 行。对应 `tools/arch_lint.py:172`、`:466`。
+
+### 本轮实际验证
+
+| 验证 | 结果 |
+|---|---|
+| `git diff --check 712610d HEAD`、`PYTHONDONTWRITEBYTECODE=1 make check` | 退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_arch_lint.py` | 28 passed。 |
+| 在 `git archive 712610d` 的副本中仅加入当前新增规则测试，定向运行 11 个新增用例 | 11 个如预期失败，17 deselected。当前提交中的相同用例均通过。 |
+| 在 `/tmp/ae05-incremental.plDphI/checkout` 执行 `previous.py`、`previous-gate.py` 和 `incremental.py` | 在独立生产路径 fixture 和完整 Git 副本中复跑旧样例、直接运行真检查器并注入 `make check`。具体退出码见上两表。 |
+
+本轮验证限于修复差异，未重跑 `make verify`、真实数据或托管 CI。复核结论以三项 P1 所列的明确正反例为合并门槛。

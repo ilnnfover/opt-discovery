@@ -95,7 +95,8 @@ def test_od003_raw_source_in_report_is_rejected(tmp_path: Path) -> None:
     _write(
         tmp_path,
         "opt_discovery/report/x.py",
-        "PATH = 'mindstudio_profiler_output/op_summary_1.csv'\n",
+        "def f(path):\n"
+        "    return (path / 'mindstudio_profiler_output/op_summary_1.csv').read_text()\n",
     )
     assert _violations(tmp_path, "OD003")
 
@@ -226,6 +227,8 @@ def test_od004_evidence_level_and_generic_level(tmp_path: Path) -> None:
     assert len(violations) == 1
     assert violations[0].line == 2
 
+    import yaml
+
     _write(
         tmp_path,
         "opt_discovery/experiment/feedback.py",
@@ -233,9 +236,15 @@ def test_od004_evidence_level_and_generic_level(tmp_path: Path) -> None:
         "def f(opportunity):\n"
         "    opportunity.evidence_level = ConfidenceLevel.PROBABLE\n",
     )
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    config["od004_allow"] = [
+        {"file": "opt_discovery/experiment/feedback.py", "line": 3, "reason": "test"}
+    ]
+    config_path = tmp_path / "arch_lint.yaml"
+    config_path.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
     assert not [
         item
-        for item in run_lint(tmp_path, CONFIG)
+        for item in run_lint(tmp_path, config_path)
         if item.rule == "OD004"
         and item.path == "opt_discovery/experiment/feedback.py"
     ]
@@ -324,3 +333,92 @@ def test_od004_feedback_cannot_jump_to_confirmed(tmp_path: Path) -> None:
         "    opportunity.evidence_level = ConfidenceLevel.CONFIRMED\n",
     )
     assert _violations(tmp_path, "OD004")
+
+
+def test_od004_feedback_second_write_is_not_exempt(tmp_path: Path) -> None:
+    import yaml
+
+    _write(
+        tmp_path,
+        "opt_discovery/experiment/feedback.py",
+        "from opt_discovery.schemas.evidence import ConfidenceLevel\n"
+        "def verified(opportunity):\n"
+        "    opportunity.evidence_level = ConfidenceLevel.PROBABLE\n"
+        "def unverified(opportunity):\n"
+        "    opportunity.evidence_level = ConfidenceLevel.PROBABLE\n",
+    )
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    config["od004_allow"] = [
+        {"file": "opt_discovery/experiment/feedback.py", "line": 3, "reason": "verified"}
+    ]
+    config_path = tmp_path / "arch_lint.yaml"
+    config_path.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+    violations = [item for item in run_lint(tmp_path, config_path) if item.rule == "OD004"]
+    assert len(violations) == 1
+    assert violations[0].line == 5
+
+
+def test_od003_report_raw_read_is_rejected_but_prose_allowed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/report/x.py",
+        "from pathlib import Path\n"
+        "def f(rank):\n"
+        "    return (rank / 'op_summary_1.csv').read_text()\n",
+    )
+    _write(
+        tmp_path,
+        "opt_discovery/report/y.py",
+        "NOTE = '来源：op_counter.db / op_report 导出'\n",
+    )
+    violations = _violations(tmp_path, "OD003")
+    assert len(violations) == 1
+    assert violations[0].path == "opt_discovery/report/x.py"
+
+
+def test_od003_signal_connect_is_allowed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/diagnosis/x.py",
+        "def f(signal, callback):\n"
+        "    signal.connect(callback)\n",
+    )
+    assert run_lint(tmp_path, CONFIG) == []
+
+
+def test_od002_reversed_operand_and_subscript_key(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/analyzer/x.py",
+        "def f(row, duration_ns):\n"
+        "    a = 0.001 * duration_ns\n"
+        "    b = row['duration_ns'] / 1000\n"
+        "    items = 5\n"
+        "    return items * 1000\n",
+    )
+    violations = _violations(tmp_path, "OD002")
+    assert [item.line for item in violations] == [2, 3]
+
+
+def test_od001_non_none_conditional_is_allowed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/analyzer/x.py",
+        "from opt_discovery.schemas.metrics import Metric, Provenance\n"
+        "def f(state):\n"
+        "    return Metric(1 if state is running else 0, 'count', Provenance.DERIVED)\n",
+    )
+    assert run_lint(tmp_path, CONFIG) == []
+
+
+def test_od007_quoted_key_line_is_accurate(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "configs/rules/bad.yaml",
+        'thresholds:\n'
+        '  "x":\n'
+        "    value: 1.0\n"
+        "    unit: ratio\n",
+    )
+    violations = _violations(tmp_path, "OD007")
+    assert violations[0].line == 2

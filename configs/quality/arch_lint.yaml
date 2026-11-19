@@ -59,3 +59,9 @@ od005_allow:
   - file: opt_discovery/cli.py
     line: 1387
     reason: best-effort early input protection; original error is reported before this handler
+
+# OD004: the only verified feedback upgrade is the existing PROBABLE write.
+od004_allow:
+  - file: opt_discovery/experiment/feedback.py
+    line: 130
+    reason: apply_feedback 单变量验证后最多升到 probable

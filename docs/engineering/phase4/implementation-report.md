@@ -80,7 +80,7 @@
 
 ## 5. 测试
 
-`tests/test_arch_lint.py`（28 条）：
+`tests/test_arch_lint.py`（34 条）：
 
 - 当前仓库必须 0 违规；
 - 四条架构规则各一个反例，schema 相对导入合法；
@@ -99,8 +99,8 @@
 | 检查 | 结果 |
 |---|---|
 | `make check` | 0（含 arch-lint） |
-| `pytest` | **346 passed, 17 skipped**（363 用例） |
-| `make verify DEMO_OUT=/tmp/ae05-demo` | 0，346 passed / 17 skipped |
+| `pytest` | **352 passed, 17 skipped**（369 用例） |
+| `make verify DEMO_OUT=/tmp/ae05-demo` | 0，352 passed / 17 skipped |
 | 真实数据 `tests/test_real_data.py` | 16 passed, 1 skipped |
 | 临时违规探针 | arch-lint 退出 2；清理后 0 |
 | `git diff --check` | 0 |
@@ -139,7 +139,27 @@
 | 检查 | 结果 |
 |---|---|
 | `make check` | 0 |
-| `pytest` | **346 passed, 17 skipped**（363 用例） |
-| `make verify DEMO_OUT=/tmp/ae05-r2-demo2` | 0，346 passed / 17 skipped |
+| `pytest` | **352 passed, 17 skipped**（369 用例） |
+| `make verify DEMO_OUT=/tmp/ae05-r2-demo2` | 0，352 passed / 17 skipped |
 | 真实数据 `tests/test_real_data.py` | 16 passed, 1 skipped |
+| `git diff --check` | 0 |
+
+## 10. 第二轮增量复核修复（2026-11-19）
+
+| 问题 | 修复 | 回归 |
+|---|---|---|
+| P1 · OD003 无法区分 raw 文件读取与普通文案 | 改为检测受限模块的 raw **读取调用**（`open`/`read_text`/`read_bytes`/`read_csv`）及路径子树中的 Profiler 标识；`.connect` 仅当接收者是 `sqlite3` 时判定；`csv` 导入检查先物化迭代器，report 允许 `csv.writer`；来源文案不再拦截 | 报告 `op_summary` 读取被拒、`op_counter.db`/`op_report` 文案通过；diagnosis `signal.connect(callback)` 通过；CLI `TASK` 查询被拒 |
+| P1 · OD004 feedback 任意函数可写 `PROBABLE` | `od004_allow` 改为 `(file,line)` 精确匹配，仅登记 `feedback.py:130` 的既有验证升级点；同文件第二个赋值（不同行）被拒 | 合法行通过、同文件新增函数失败、普通 `logger.level` 通过 |
+| P1 · OD002 计数误报且反向/下标时间换算漏报 | 仅按完整时间 token 或 `_us/_ms/_ns` 后缀判断；同时检查左右操作数与 Subscript 字符串键；`0.001 * duration_ns`、`row['duration_ns']/1000` 被拒，`items*1000`、`batches*1000` 通过 | 新增正反例 |
+| P2 · OD001 非 None 条件误报 | `IfExp` 仅在比较项含 `Constant(None)` 时判定 | `state is running` 条件通过 |
+| P2 · OD007 引号键行号 | 行号匹配允许键两侧引号 | `"x":` 报第 2 行 |
+
+自检结果：
+
+| 检查 | 结果 |
+|---|---|
+| `make check` | 0 |
+| `pytest` | **352 passed, 17 skipped**（369 用例） |
+| `make verify DEMO_OUT=/tmp/ae05-r3-demo` | 0，352 passed / 17 skipped |
+| 真实数据 | 16 passed, 1 skipped |
 | `git diff --check` | 0 |

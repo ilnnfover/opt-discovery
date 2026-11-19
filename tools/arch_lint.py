@@ -174,6 +174,10 @@ def _check_od001(tree: ast.AST, rel: str) -> list[Violation]:
             compares_none = (
                 isinstance(test, ast.Compare)
                 and any(isinstance(op, (ast.Is, ast.IsNot)) for op in test.ops)
+                and any(
+                    isinstance(item, ast.Constant) and item.value is None
+                    for item in test.comparators
+                )
             )
             suspicious = compares_none and (_zero(value.body) or _zero(value.orelse))
         if suspicious:
@@ -195,15 +199,24 @@ def _check_od002(
     if rel in authorized:
         return []
     parents = _parents(tree)
+    time_tokens = {"us", "ms", "ns", "time", "duration", "latency", "busy", "gap"}
     violations: list[Violation] = []
-    time_words = ("us", "ms", "ns", "time", "duration", "latency", "busy", "gap")
 
-    def _name_text(node: ast.AST) -> str:
+    def _tokens(node: ast.AST) -> set[str]:
+        text = ""
         if isinstance(node, ast.Name):
-            return node.id.lower()
-        if isinstance(node, ast.Attribute):
-            return node.attr.lower()
-        return ""
+            text = node.id
+        elif isinstance(node, ast.Attribute):
+            text = node.attr
+        elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            text = str(node.slice.value)
+        return set(re.split(r"[^a-z0-9]+", text.lower())) - {""}
+
+    def _time_like(node: ast.AST) -> bool:
+        tokens = _tokens(node)
+        return bool(tokens & time_tokens) or any(
+            token.endswith(("_us", "_ms", "_ns")) for token in tokens
+        )
 
     def _assignment_context(node: ast.AST) -> str:
         current = node
@@ -224,17 +237,18 @@ def _check_od002(
         constant = None
         for item in (node.left, node.right):
             if isinstance(item, ast.Constant) and isinstance(item.value, (int, float)):
-                if item.value in _UNIT_CONSTANTS or abs(float(item.value) - 0.001) < 1e-12:
-                    constant = float(item.value)
+                value = float(item.value)
+                if value in (1000.0, 1e3) or abs(value - 0.001) < 1e-12:
+                    constant = value
                     break
         if constant is None:
             continue
-        context = _assignment_context(node)
-        left = _name_text(node.left)
-        time_like = any(word in context or word in left for word in time_words)
-        if constant == 0.001 and not time_like:
-            continue
-        if constant in _UNIT_CONSTANTS and not time_like:
+        context_tokens = set(re.split(r"[^a-z0-9]+", _assignment_context(node))) - {""}
+        time_context = bool(context_tokens & time_tokens) or any(
+            token.endswith(("_us", "_ms", "_ns")) for token in context_tokens
+        )
+        operand_time = _time_like(node.left) or _time_like(node.right)
+        if not (time_context or operand_time):
             continue
         if _inside_fstring(node, parents):
             continue
@@ -243,7 +257,7 @@ def _check_od002(
                 "OD002",
                 rel,
                 node.lineno,
-                "直接做 1000 倍单位换算",
+                "直接做 1000 倍/0.001 倍单位换算",
                 "使用 events/primitives 的 ns_from_us 或 schemas.units.to_us",
             )
         )
@@ -260,14 +274,26 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
     if not restricted:
         return []
     violations: list[Violation] = []
-    dangerous_tokens = ("op_counter.db", "op_report", "msprof_", "mindstudio_profiler_output")
-    if rel.startswith("opt_discovery/diagnosis/") or rel.startswith(
-        "opt_discovery/discovery/"
-    ):
-        dangerous_tokens = dangerous_tokens + ("op_summary", "op_statistic")
+    raw_tokens = (
+        "op_summary",
+        "op_statistic",
+        "op_counter.db",
+        "op_report",
+        "msprof_",
+        "mindstudio_profiler_output",
+    )
+
+    def _raw_in_subtree(node: ast.AST) -> bool:
+        for item in ast.walk(node):
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                text = item.value.lower()
+                if any(token in text for token in raw_tokens):
+                    return True
+        return False
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            targets = _absolute_imports(node, _module_name(Path(rel), Path(".")))
+            targets = list(_absolute_imports(node, _module_name(Path(rel), Path("."))))
             if any(item == "sqlite3" or item.startswith("sqlite3.") for item in targets):
                 violations.append(
                     Violation(
@@ -278,7 +304,7 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
                         "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
                     )
                 )
-            if rel != "opt_discovery/report/" and any(
+            if not rel.startswith("opt_discovery/report/") and any(
                 item == "csv" or item.startswith("csv.") for item in targets
             ):
                 violations.append(
@@ -291,34 +317,51 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
                     )
                 )
             continue
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr == "connect":
-                violations.append(
-                    Violation(
-                        "OD003",
-                        rel,
-                        node.lineno,
-                        "直接连接 sqlite 数据库",
-                        "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "connect":
+                receiver = func.value
+                receiver_name = ""
+                if isinstance(receiver, ast.Name):
+                    receiver_name = receiver.id
+                elif isinstance(receiver, ast.Attribute):
+                    receiver_name = receiver.attr
+                if "sqlite" in receiver_name.lower():
+                    violations.append(
+                        Violation(
+                            "OD003",
+                            rel,
+                            node.lineno,
+                            "直接连接 sqlite 数据库",
+                            "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+                        )
                     )
-                )
-                continue
+                    continue
+            reads = (
+                isinstance(func, ast.Name)
+                and func.id == "open"
+                or isinstance(func, ast.Attribute)
+                and func.attr in {"read_text", "read_bytes", "read_csv", "open"}
+            )
+            if reads:
+                subject = node.func.value if isinstance(func, ast.Attribute) else None
+                if _raw_in_subtree(node) or (
+                    subject is not None and _raw_in_subtree(subject)
+                ):
+                    violations.append(
+                        Violation(
+                            "OD003",
+                            rel,
+                            node.lineno,
+                            "受限制模块直接读取原始 Profiler 路径",
+                            "通过 parsers/csv_mapping、parsers/sqlite_op_report 或 events 的公共 Reader 读取",
+                        )
+                    )
+                    continue
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         text = node.value.lower()
-        if rel != "opt_discovery/cli.py" and any(
-            token in text for token in dangerous_tokens
-        ):
-            violations.append(
-                Violation(
-                    "OD003",
-                    rel,
-                    node.lineno,
-                    "受限制模块出现原始 Profiler 数据源标识",
-                    "通过 OperatorTable/FactSet 公共契约读取；来源说明请放在文档/注释",
-                )
-            )
-        elif re.search(r"\b(from|into|update|join)\s+task\b", text):
+        if re.search(r"\b(from|into|update|join)\s+task\b", text):
             violations.append(
                 Violation(
                     "OD003",
@@ -331,7 +374,9 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
     return violations
 
 
-def _check_od004(tree: ast.AST, rel: str) -> list[Violation]:
+def _check_od004(
+    tree: ast.AST, rel: str, allowed: Mapping[tuple[str, int], str]
+) -> list[Violation]:
     if rel == "opt_discovery/schemas/quality.py":
         return []
     violations: list[Violation] = []
@@ -345,12 +390,7 @@ def _check_od004(tree: ast.AST, rel: str) -> list[Violation]:
                 "verdict",
                 "evidence_level",
             }:
-                if (
-                    rel == "opt_discovery/experiment/feedback.py"
-                    and target.attr == "evidence_level"
-                    and isinstance(node.value, ast.Attribute)
-                    and node.value.attr == "PROBABLE"
-                ):
+                if target.attr == "evidence_level" and (rel, node.lineno) in allowed:
                     continue
                 violations.append(
                     Violation(
@@ -467,7 +507,9 @@ def _check_od007(root: Path) -> list[Violation]:
                 (
                     index
                     for index, raw in enumerate(lines, start=1)
-                    if re.match(rf"^\s*{re.escape(str(key))}\s*:", raw)
+                    if re.match(
+                        rf"^\s*[\"']?{re.escape(str(key))}[\"']?\s*:", raw
+                    )
                 ),
                 1,
             )
@@ -491,6 +533,11 @@ def run_lint(root: str | Path, config_path: str | Path) -> list[Violation]:
     od005_allowed = {
         (str(item["file"]), int(item["line"])): str(item.get("reason", ""))
         for item in config.get("od005_allow") or []
+        if isinstance(item, Mapping) and item.get("file") and item.get("line")
+    }
+    od004_allowed = {
+        (str(item["file"]), int(item["line"])): str(item.get("reason", ""))
+        for item in config.get("od004_allow") or []
         if isinstance(item, Mapping) and item.get("file") and item.get("line")
     }
 
@@ -518,7 +565,7 @@ def run_lint(root: str | Path, config_path: str | Path) -> list[Violation]:
         violations.extend(_check_od001(tree, rel))
         violations.extend(_check_od002(tree, rel, authorized))
         violations.extend(_check_od003(tree, rel))
-        violations.extend(_check_od004(tree, rel))
+        violations.extend(_check_od004(tree, rel, od004_allowed))
         violations.extend(_check_od005(tree, rel, od005_allowed))
         violations.extend(_check_od006(tree, rel))
     violations.extend(_check_od007(root_path))
