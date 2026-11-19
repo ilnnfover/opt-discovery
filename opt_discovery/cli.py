@@ -887,16 +887,42 @@ def cmd_check_manifest(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
-def cmd_report(args: argparse.Namespace) -> int:
-    root = Path(args.dir)
-    manifest = root / "run_manifest.json"
-    artifacts = artifact_allowlist(manifest) if manifest.is_file() else None
-    if manifest.is_file() and artifacts is None:
+def _downstream_manifest(
+    root: Path, args: argparse.Namespace
+) -> tuple[Path | None, set[str] | None, Path | None, int]:
+    """解析下游要使用的清单；显式指定或无效清单不得回退到目录扫描。"""
+    explicit = getattr(args, "manifest", None)
+    path = Path(explicit) if explicit else root / "run_manifest.json"
+    if explicit or path.is_file():
+        if not path.is_file():
+            print(f"  ! 清单不存在: {path}", file=sys.stderr)
+            return None, None, None, MANIFEST_EXIT_FAILED
+        artifacts = artifact_allowlist(path)
+        if artifacts is None:
+            print(f"  ! 清单无法解析: {path}", file=sys.stderr)
+            return None, None, None, MANIFEST_EXIT_FAILED
+        return path, artifacts, path.parent, 0
+    if not getattr(args, "allow_legacy", False):
         print(
-            "  ! run_manifest.json 无法解析，按目录扫描（legacy）",
+            "  ! 缺少 run_manifest.json；确需扫描旧目录请加 --allow-legacy",
             file=sys.stderr,
         )
-    target = write_markdown_report(root, args.out or None, artifacts=artifacts)
+        return None, None, None, MANIFEST_EXIT_FAILED
+    print("  ! 未找到清单，按目录扫描（legacy）", file=sys.stderr)
+    return None, None, None, 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    root = Path(args.dir)
+    manifest, artifacts, artifact_root, code = _downstream_manifest(root, args)
+    if code:
+        return code
+    target = write_markdown_report(
+        root,
+        args.out or None,
+        artifacts=artifacts,
+        artifact_root=artifact_root,
+    )
     print(f"-> {target}")
     return 0
 
@@ -906,18 +932,17 @@ def cmd_report(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def cmd_summary(args: argparse.Namespace) -> int:
     root = Path(args.dir)
-    manifest = root / "run_manifest.json"
-    artifacts = artifact_allowlist(manifest) if manifest.is_file() else None
-    include = manifest_workload_ids(manifest) if artifacts is not None else None
-    if manifest.is_file() and artifacts is None:
-        print(
-            "  ! run_manifest.json 无法解析，按目录扫描（legacy）",
-            file=sys.stderr,
-        )
+    manifest, artifacts, artifact_root, code = _downstream_manifest(root, args)
+    if code:
+        return code
+    include = manifest_workload_ids(manifest) if manifest is not None else None
     workload_path, operator_path = write_summaries(
-        root, include=include, artifacts=artifacts
+        root,
+        include=include,
+        artifacts=artifacts,
+        artifact_root=artifact_root,
     )
-    if artifacts is not None:
+    if manifest is not None:
         # 重建 CSV 后同步清单哈希，避免 check-manifest 误报
         refresh_manifest_artifacts(
             manifest,
@@ -1272,6 +1297,24 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         if _collides(path):
             raise OSError(f"输出路径与输入重合: {path.name}")
 
+    def _protect_export_inputs(workloads) -> None:
+        """导出尚未 discover 时，按 YAML 的 export_dir 保护原始采集文件。"""
+        for workload in workloads:
+            export_dir = workload.labels.get("export_dir")
+            if not export_dir:
+                continue
+            base = exports_root / export_dir
+            if not base.is_dir():
+                continue
+            for pattern in (
+                "workload.log",
+                "**/op_summary*.csv",
+                "**/op_report*.csv",
+                "**/*.db",
+            ):
+                for path in base.glob(pattern):
+                    _protect(path)
+
     def _manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
         for candidate in (manifest_path, out / "run_manifest.json"):
             if _collides(candidate, extra):
@@ -1318,6 +1361,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     except OSError as exc:
         detail = _redact_error(exc, (out, manifest_path.parent))
         print(f"[analyze] 无法创建输出目录: {detail}", file=sys.stderr)
+        try:
+            _protect_export_inputs(
+                [
+                    WorkloadSpec.from_yaml(path)
+                    for path in sorted(workloads_dir.glob("*.yaml"))
+                ]
+            )
+        except Exception:  # noqa: BLE001 - 保护尽力而为，不能掩盖原始错误
+            pass
         _output_dir_failure(detail)
         return MANIFEST_EXIT_FAILED
 
@@ -1471,6 +1523,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     ids = [workload.workload_id for workload in expected_workloads]
     duplicate_ids.extend(sorted({wid for wid in ids if ids.count(wid) > 1}))
     if duplicate_ids:
+        _protect_export_inputs(expected_workloads)
         print(
             f"[analyze] workload_id 重复: {', '.join(duplicate_ids)}（产物会互相覆盖）",
             file=sys.stderr,
@@ -1486,6 +1539,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     try:
         bundles = discover_all(workloads_dir, exports_root)
     except Exception as exc:  # noqa: BLE001 - 发现失败也要写本轮 failed 清单
+        _protect_export_inputs(expected_workloads)
         print(f"[analyze] 导出发现失败: {_error(exc)}", file=sys.stderr)
         _save(
             STATUS_FAILED,
@@ -2427,6 +2481,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="把 analyze 产物渲染成 report.md")
     p_report.add_argument("--dir", default="out/steady")
     p_report.add_argument("--out", default=None)
+    p_report.add_argument("--manifest", default=None, help="指定本轮 run_manifest.json")
+    p_report.add_argument(
+        "--allow-legacy", action="store_true", help="没有清单时允许扫描旧目录"
+    )
     p_report.set_defaults(func=cmd_report)
 
     p_manifest = sub.add_parser("check-manifest", help="校验 run_manifest.json 的产物哈希")
@@ -2435,6 +2493,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_summary = sub.add_parser("summary", help="导出 workload_summary.csv / operator_summary.csv")
     p_summary.add_argument("--dir", default="out/steady")
+    p_summary.add_argument("--manifest", default=None, help="指定本轮 run_manifest.json")
+    p_summary.add_argument(
+        "--allow-legacy", action="store_true", help="没有清单时允许扫描旧目录"
+    )
     p_summary.set_defaults(func=cmd_summary)
 
     p_compare = sub.add_parser("compare", help="对比两个已解析的 OperatorTable")

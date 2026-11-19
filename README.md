@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                289 个用例（272 个 CPU 用例 + 17 个真实数据集成用例）
+tests/                292 个用例（275 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -422,7 +422,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 272 passed, 17 skipped（缺真实导出时）
+python -m pytest -q                      # 275 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
@@ -464,6 +464,8 @@ python -m opt_discovery.cli check-manifest --path <out>/run_manifest.json
 比较入口同时应用采集契约（与 `check-runs` 同一实现，警告会进入比较报告的 `warnings`），
 轮次/阶段/硬件不一致时同样不可比。`check-runs` 只检查采集契约；质量标记闸门在 `compare`。
 同一输出目录不支持并发运行（无文件锁）；需要并行请使用独立 `--out`/`--out-dir` 与 `--manifest`。
+`summary`/`report` 默认要求 `run_manifest.json`：可用 `--manifest` 指定外置清单，
+确需扫描无清单的旧目录时必须显式加 `--allow-legacy`；损坏/缺失的清单不会被静默忽略。
 已知阻断码由 code 决定最低严重性（`severity=degraded` 也会被拒）；标记字段无法解析按
 `quality_flag_invalid` 阻断，不会静默忽略。timeline 失败/缺失会转成 blocking 标记随表落盘，
 独立 `compare` 读取后同样拒绝。

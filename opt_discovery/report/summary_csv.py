@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -60,19 +61,27 @@ def _load(path: Path) -> dict[str, Any] | None:
 
 
 def _read_artifact(
-    workload_dir: Path, name: str, allowed: set[str] | None
+    workload_dir: Path,
+    name: str,
+    allowed: set[str] | None,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any] | None:
-    """只读取本轮清单登记过的产物，避免复用目录时读到旧的可选文件。"""
-    relative = f"{workload_dir.name}/{name}"
-    if allowed is not None and relative not in allowed:
-        return None
-    return _load(workload_dir / name)
+    """只读取本轮清单登记过的产物（相对 artifact_root），避免读到旧文件。"""
+    target = workload_dir / name
+    if allowed is not None:
+        root = artifact_root or workload_dir.parent
+        relative = os.path.relpath(target.resolve(), root.resolve()).replace(os.sep, "/")
+        if relative not in allowed:
+            return None
+    return _load(target)
 
 
 def _workload_row(
-    workload_dir: Path, allowed: set[str] | None = None
+    workload_dir: Path,
+    allowed: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any] | None:
-    table = _read_artifact(workload_dir, "operator_table.json", allowed)
+    table = _read_artifact(workload_dir, "operator_table.json", allowed, artifact_root)
     if table is None:
         return None
     meta = table.get("meta", {})
@@ -80,9 +89,12 @@ def _workload_row(
     window = extra.get("window") or {}
     quality = extra.get("window_quality") or {}
     execution = table.get("workload", {}).get("execution", {})
-    comm = _read_artifact(workload_dir, "comm.json", allowed) or {}
-    diagnosis = _read_artifact(workload_dir, "diagnosis.json", allowed) or {}
-    opportunities = _read_artifact(workload_dir, "opportunities.json", allowed) or {}
+    comm = _read_artifact(workload_dir, "comm.json", allowed, artifact_root) or {}
+    diagnosis = _read_artifact(workload_dir, "diagnosis.json", allowed, artifact_root) or {}
+    opportunities = (
+        _read_artifact(workload_dir, "opportunities.json", allowed, artifact_root)
+        or {}
+    )
 
     records = table.get("records", [])
     total = sum(
@@ -116,12 +128,14 @@ def _workload_row(
 
 
 def _operator_rows(
-    workload_dir: Path, allowed: set[str] | None = None
+    workload_dir: Path,
+    allowed: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    table = _read_artifact(workload_dir, "operator_table.json", allowed)
+    table = _read_artifact(workload_dir, "operator_table.json", allowed, artifact_root)
     if table is None:
         return []
-    diagnosis = _read_artifact(workload_dir, "diagnosis.json", allowed) or {}
+    diagnosis = _read_artifact(workload_dir, "diagnosis.json", allowed, artifact_root) or {}
     top_by_operator: dict[str, dict[str, Any]] = {}
     for item in diagnosis.get("operators", []):
         candidates = item.get("candidates") or []
@@ -165,6 +179,7 @@ def write_summaries(
     *,
     include: set[str] | None = None,
     artifacts: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> tuple[Path, Path]:
     """Read an ``analyze`` output directory and write both CSV files.
 
@@ -182,10 +197,10 @@ def write_summaries(
         for p in root.iterdir()
         if p.is_dir() and (include is None or p.name in include)
     ):
-        row = _workload_row(workload_dir, artifacts)
+        row = _workload_row(workload_dir, artifacts, artifact_root)
         if row is not None:
             workload_rows.append(row)
-        operator_rows.extend(_operator_rows(workload_dir, artifacts))
+        operator_rows.extend(_operator_rows(workload_dir, artifacts, artifact_root))
 
     workload_path = root / "workload_summary.csv"
     operator_path = root / "operator_summary.csv"

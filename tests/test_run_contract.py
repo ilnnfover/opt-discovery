@@ -1289,3 +1289,102 @@ def test_collect_artifacts_and_fingerprints_fail_closed(tmp_path: Path) -> None:
         collect_artifacts({"x": missing}, tmp_path)
     with pytest.raises(FileNotFoundError):
         fingerprint_configs([missing])
+
+
+def test_early_failure_does_not_overwrite_export_csv(tmp_path: Path) -> None:
+    """A1：重复 ID 的早期失败也不得把 --manifest 指向的导出 CSV 覆盖。"""
+    exports = tmp_path / "exports"
+    export = _write_export(exports, "qwen35-prefill")
+    csv_path = export / "PROF_000000_test" / "mindstudio_profiler_output" / "op_summary_1.csv"
+    before = csv_path.read_bytes()
+
+    workloads = tmp_path / "workloads"
+    workloads.mkdir()
+    raw = yaml.safe_load((WORKLOAD_DIR / "prefill_eager.yaml").read_text(encoding="utf-8"))
+    raw["hardware"]["device_count"] = 1
+    for name in ("first", "second"):
+        (workloads / f"{name}.yaml").write_text(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+    out = tmp_path / "out"
+
+    code = main(
+        _args(exports, workloads, out, "--strict", "--manifest", str(csv_path))
+    )
+    assert code == 1
+    assert csv_path.read_bytes() == before
+
+    fallback = out / "run_manifest.json"
+    assert fallback.is_file()
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0
+
+
+def test_external_manifest_drives_downstream_commands(tmp_path: Path) -> None:
+    """A6：外置清单必须被下游显式解析；无清单时默认拒绝扫描旧目录。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    external = tmp_path / "manifests" / "run.json"
+    assert main(_args(exports, workloads, out, "--strict", "--manifest", str(external))) == 0
+
+    stale = out / "qwen35-35b-a3b-prefill-eager" / "comm.json"
+    stale.write_text(json.dumps({"mib_total": 4.0, "unique_tasks": 1}), encoding="utf-8")
+    (exports / "qwen35-prefill" / "PROF_000000_test" / "msprof_0.db").unlink()
+    assert (
+        main(
+            _args(
+                exports,
+                workloads,
+                out,
+                "--strict",
+                "--skip-timeline",
+                "--manifest",
+                str(external),
+            )
+        )
+        == 0
+    )
+
+    # 未指定清单且没有默认清单：拒绝扫描（避免读回旧 4 MiB）
+    assert main(["summary", "--dir", str(out)]) == 1
+    assert main(["report", "--dir", str(out), "--out", str(tmp_path / "r.md")]) == 1
+
+    assert main(["summary", "--dir", str(out), "--manifest", str(external)]) == 0
+    rows = (out / "workload_summary.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert not any("4.0" in row for row in rows)
+    assert main(["check-manifest", "--path", str(external)]) == 0
+
+    report = tmp_path / "report.md"
+    assert (
+        main(
+            [
+                "report",
+                "--dir",
+                str(out),
+                "--out",
+                str(report),
+                "--manifest",
+                str(external),
+            ]
+        )
+        == 0
+    )
+    assert "4.0" not in report.read_text(encoding="utf-8")
+
+
+def test_corrupt_or_missing_manifest_is_not_silently_ignored(tmp_path: Path) -> None:
+    """A6：存在但损坏的清单必须报错；legacy 扫描需要显式开关。"""
+    root = tmp_path / "out"
+    root.mkdir()
+    (root / "run_manifest.json").write_text("{bad json", encoding="utf-8")
+
+    assert main(["summary", "--dir", str(root)]) == 1
+    assert main(["report", "--dir", str(root), "--out", str(tmp_path / "r.md")]) == 1
+
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    assert main(["summary", "--dir", str(legacy)]) == 1
+    assert main(["summary", "--dir", str(legacy), "--allow-legacy"]) == 0

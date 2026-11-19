@@ -19,6 +19,7 @@ keeps every caveat the pipeline produced.  Anything missing is written as
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,22 +46,28 @@ def build_report(
     *,
     title: str = "Optimization Opportunity Report",
     artifacts: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> str:
     """``artifacts``：本轮 run_manifest 登记的相对路径集合；None 表示兼容旧目录。"""
     root = Path(out_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"{root}: 目录不存在")
 
-    def _registered(relative: str) -> bool:
-        return artifacts is None or relative in artifacts
+    def _registered(target: Path) -> bool:
+        if artifacts is None:
+            return True
+        base = artifact_root or root
+        relative = os.path.relpath(target.resolve(), base.resolve()).replace(os.sep, "/")
+        return relative in artifacts
 
     def _load_rel(relative: str) -> dict[str, Any] | None:
-        return _load(root / relative) if _registered(relative) else None
+        target = root / relative
+        return _load(target) if _registered(target) else None
 
     workloads = sorted(
         p
         for p in root.iterdir()
-        if p.is_dir() and _registered(f"{p.name}/operator_table.json")
+        if p.is_dir() and _registered(p / "operator_table.json")
     )
     tables = {w.name: _load(w / "operator_table.json") for w in workloads}
     diagnoses = {w.name: _load_rel(f"{w.name}/diagnosis.json") for w in workloads}
@@ -72,7 +79,7 @@ def build_report(
     comparisons = [
         data
         for path in sorted(root.glob("compare_*.json"))
-        if _registered(path.name) and (data := _load(path))
+        if _registered(path) and (data := _load(path))
     ]
 
     lines: list[str] = []
@@ -321,9 +328,10 @@ def write_report(
     *,
     title: str = "Optimization Opportunity Report",
     artifacts: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> Path:
     root = Path(out_dir)
-    text = build_report(root, title=title, artifacts=artifacts)
+    text = build_report(root, title=title, artifacts=artifacts, artifact_root=artifact_root)
     path = Path(target) if target else root / "report.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")

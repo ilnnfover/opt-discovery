@@ -1,6 +1,6 @@
 # AE-03 独立验收 Review
 
-> 最新结论见文末「AE-03 合并前问题总表」。`e6c0770` 的验收结果为 **FAIL**，PR #2 暂缓合并。
+> 最新结论见文末「A1～A6 整批复验」。`1206818` 的 AE-03 合并验收为 **FAIL**。
 
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
@@ -219,3 +219,29 @@ PR #2 的验收条件是关闭上述两项 P1，并以独立 CLI 复验确认输
 - `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 退出 0，94 passed。
 - 独立 CLI 探针在临时目录执行，脚本为 `/tmp/ae03-inventory.6nleUg.py`、`/tmp/ae03-inventory-more.swi40d.py`、`/tmp/ae03-inventory-boundaries.qEMLGs.py`。固定临时路径与覆盖 YAML 复用上一轮 `/tmp/ae03-input-safety.wCRttt.py` 的实测。同口径 rank 与采集合同证据使用生产函数的独立 Python 探针。
 - 本轮真实 Profiling 测试跳过。NPU、托管 CI、其他解释器和并发写入未在本轮验证。
+
+## A1～A6 整批复验（2026-11-19）
+
+**AE-03 合并验收为 FAIL，PR #2 暂缓合并。** 复验 HEAD `120681897954fef933340f9af622d095eb1b9814`，对照 `e6c0770` 后三个修复提交和实施报告 §14～16。A1 和 A6 各有一组可独立复现的剩余条件。原任务书 §3 将 AE-02 列为 AE-04 的直接依赖，并允许不冲突的并行工作。可以开始 AE-04 的独立设计和测试，生产重构优先等 AE-03 收口。`1206818` 仍不适合作为已验收的 AE-03 基线。
+
+| 项目 | 判定与证据 |
+|---|---|
+| A1 文件保护 | **部分关闭。** 最新生产路径回归覆盖固定临时文件名、配置冲突、报告硬链接和产物符号链接并通过。采集输入在发现完成后才登记，提前失败路径仍有缺口。 |
+| A2 失败清单 | **原反例通过。** 报告目标与输入重合时保护输入并生成新 failed 清单，回归断言旧 run_id 被替换。 |
+| A3 空窗口、缺轮次、低覆盖 | **专项回归通过。** 生产 CLI 构造实际 CSV 并检查 blocking 标记、strict 非零，独立空表比较阻断。 |
+| A4 质量元数据 | **专项回归通过。** 空对象标记、未验证 workload、合成和真实混用均触发阻断。 |
+| A5 rank 约束 | **专项回归通过。** 声明 rank 数参与 check-ranks strict 判定，混合口径下同口径 pair 仍受原阈值校验。 |
+| A6 下游产物读取 | **部分关闭。** 默认有效清单下，独立 CLI 复验确认旧 4 MiB 通信量没有回到 CSV 或 Markdown，校验仍通过。外置、旧默认及损坏默认清单组合仍失败。 |
+
+| 级别 | 编号与位置 | 独立 CLI 实测和影响 | 修复建议 |
+|---|---|---|---|
+| P1 | A1，`opt_discovery/cli.py:1360`、`:1472`、`:1513` | 在临时导出上加入重复 workload ID，并用 `--manifest` 指向该 workload 原始 op_summary CSV。CLI 如期退出 1，却把 CSV 覆盖成 failed 清单。重复 ID 经 `_save` 发布失败时，采集输入尚未登记保护。 | 让所有早期失败都在输入保护范围内选清单目标，保护原始导出，即使配置或发现不能完成。测试在重复 ID、坏配置、发现失败时断言 CSV/DB/日志字节保留。 |
+| P1 | A6，`opt_discovery/cli.py:890`、`:907` | 首轮产生真实形态的 4 MiB 通信记录，次轮移除 DB 并显式跳过 timeline。次轮 CSV 空白且清单校验通过。用外置 `--manifest` 后，独立 `summary` 和 `report` 均退出 0、恢复旧 4 MiB，最新外置清单随后校验失败。有旧默认清单时同样发生。将当前默认清单截断后，两个命令继续按旧目录扫描并返回 0。 | 两个下游入口都应解析明确选定的本轮清单，包括自定义名称和位置，统一相对路径并同步正确清单。已有但无效的清单应报错，历史无清单目录的扫描行为需明确区分。 |
+
+B8 的同目录并发已在 README 明确为不支持，本轮在单进程运行约定下验收。没有以并发限制作为合并阻断。P1 结论来自上表两个顺序执行场景。
+
+- `PYTHONDONTWRITEBYTECODE=1 make check` 通过。
+- `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae03-close-demo.Q1XJlP` 退出 0，272 passed、17 skipped，合成演示通过。
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 退出 0，117 passed。
+- `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-close-probe.VXfLl4.py` 在临时目录独立运行标准 CLI，验证上述 A1、A6 的失败结果及默认清单的正例。
+- 真实 Profiling 用例在本机跳过，NPU 未运行。
