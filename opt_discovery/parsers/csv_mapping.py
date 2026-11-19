@@ -31,14 +31,10 @@ from ..schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskTyp
 from ..schemas.workload import WorkloadSpec
 from .base import ParserCapabilities, ParserError
 
-if TYPE_CHECKING:  # pragma: no cover - 仅类型检查，避免 parsers <-> analyzer 循环导入
-    from ..analyzer.window import Window
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
+    from ..primitives import Window
 
-#: profiler 的 ``Task Duration(us)`` 列里，COMMUNICATION 行实际是 ns，
-#: 其余类型（AI_CORE / AI_VECTOR_CORE / MIX_AIC ...）是 us。
-#: 实测 decode-eager：9685 行通信累计 3.399e10，按 ns=34s 与 48s 窗口自洽；
-#: 按 us 解释则是 33990s，物理上不可能。
-COMMUNICATION_DURATION_SCALE = 0.001
+from ..primitives import COMMUNICATION_DURATION_SCALE
 
 __all__ = [
     "ColumnSpec",
@@ -914,7 +910,7 @@ class _Group:
 
 
 def _busy_union():
-    from ..analyzer.window import IntervalUnion
+    from ..primitives import IntervalUnion
 
     return IntervalUnion()
 
