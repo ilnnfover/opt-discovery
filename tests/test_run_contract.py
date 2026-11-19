@@ -384,6 +384,9 @@ def test_config_failure_replaces_previous_success_manifest(tmp_path: Path, capsy
     manifest = _manifest(out)
     assert manifest["status"] == "failed"
     assert manifest["run_id"] != old_run_id
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["discover"]["status"] == "passed"
+    assert stages["parse"]["status"] == "not_requested"
     assert "配置加载失败" in capsys.readouterr().err
 
 
@@ -480,3 +483,192 @@ def test_partial_timeline_db_blocks_quality(tmp_path: Path) -> None:
     stages = {item["name"]: item for item in manifest["stages"]}
     assert stages["timeline"]["status"] == "failed"
     assert any("partial_db" in item for item in stages["timeline"]["details"]["failed"])
+
+
+def test_timeline_failure_makes_table_uncomparable(tmp_path: Path) -> None:
+    """F1-2：必需 timeline 失败必须随表落盘，独立 compare 也要拒绝。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill", ranks=2)
+    _write_export(exports, "qwen35-prefill-graph-noex", ranks=2)
+    (exports / "qwen35-prefill" / "PROF_000000_test" / "msprof_0.db").write_bytes(
+        b"not a sqlite database"
+    )
+    workloads = _workloads(
+        tmp_path,
+        {
+            "prefill_eager": {"hardware.device_count": 2},
+            "prefill_graph": {"hardware.device_count": 2},
+        },
+    )
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 3
+
+    manifest = _manifest(out)
+    assert manifest["status"] == "partial"
+    assert manifest["comparison_status"] == "incomparable"
+    eager_table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+    table = json.loads(eager_table.read_text(encoding="utf-8"))
+    assert "timeline_unavailable" in {
+        flag["code"] for flag in table["meta"]["extra"]["quality_flags"]
+    }
+
+    graph_table = out / "qwen35-35b-a3b-prefill-graph" / "operator_table.json"
+    compare_dir = tmp_path / "cmp"
+    assert (
+        main(
+            [
+                "compare",
+                "--a",
+                str(eager_table),
+                "--b",
+                str(graph_table),
+                "--out-dir",
+                str(compare_dir),
+                "--strict",
+            ]
+        )
+        == 4
+    )
+
+
+def test_stale_comm_is_not_used_in_summary(tmp_path: Path) -> None:
+    """F1-3：同一 workload 的旧 comm.json 不得进入本轮 CSV。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    stale = out / "qwen35-35b-a3b-prefill-eager" / "comm.json"
+    stale.write_text(
+        json.dumps({"mib_total": 4.0, "unique_tasks": 1}), encoding="utf-8"
+    )
+
+    (exports / "qwen35-prefill" / "PROF_000000_test" / "msprof_0.db").unlink()
+    assert main(_args(exports, workloads, out, "--strict", "--skip-timeline")) == 0
+
+    manifest = _manifest(out)
+    assert "qwen35-35b-a3b-prefill-eager/comm.json" not in {
+        item["path"] for item in manifest["artifacts"]
+    }
+    row = [
+        line
+        for line in (out / "workload_summary.csv").read_text(encoding="utf-8-sig").splitlines()
+        if "qwen35-35b-a3b-prefill-eager" in line
+    ]
+    assert row
+    assert "4.0" not in row[0]
+
+
+def test_discover_error_settles_manifest(tmp_path: Path, capsys) -> None:
+    """F1-4：导出目录存在但无可解析 CSV 时，不得保留旧 success 清单。"""
+    exports = tmp_path / "exports"
+    export = exports / "qwen35-prefill"
+    output = export / "PROF_000000_test" / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    (export / "workload.log").write_text(LOG_TEXT, encoding="utf-8")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "run_manifest.json").write_text(
+        json.dumps({"run_id": "old-run", "status": "success"}), encoding="utf-8"
+    )
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 1
+
+    manifest = _manifest(out)
+    assert manifest["run_id"] != "old-run"
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["discover"]["status"] == "failed"
+    assert stages["discover"]["reason_code"] == "discover_error"
+    assert stages["parse"]["status"] == "not_requested"
+
+
+def test_compare_input_directory_settles_manifest(tmp_path: Path, capsys) -> None:
+    """F1-4：compare 输入是目录时返回 1、写失败清单且错误详情不含绝对路径。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    compare_out = tmp_path / "cmp"
+    compare_out.mkdir()
+    (compare_out / "run_manifest.json").write_text(
+        json.dumps({"run_id": "old-run", "status": "success"}), encoding="utf-8"
+    )
+    code = main(
+        ["compare", "--a", str(tmp_path), "--b", str(table), "--out-dir", str(compare_out)]
+    )
+    assert code == 1
+
+    manifest = json.loads((compare_out / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] != "old-run"
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["load"]["reason_code"] == "load_error"
+    assert str(tmp_path) not in manifest["stages"][0]["details"]["error"]
+    assert "<path>" in manifest["stages"][0]["details"]["error"]
+
+
+def test_compare_custom_manifest_and_missing_sha(tmp_path: Path) -> None:
+    """F2-1：compare 的清单路径也相对清单目录；缺 sha256 必须校验失败。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    compare_out = tmp_path / "cmp"
+    manifest_path = tmp_path / "manifests" / "compare.json"
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(compare_out),
+            "--manifest",
+            str(manifest_path),
+            "--strict",
+        ]
+    )
+    assert code == 0
+    assert main(["check-manifest", "--path", str(manifest_path)]) == 0
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for item in payload["artifacts"]:
+        item.pop("sha256", None)
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert main(["check-manifest", "--path", str(manifest_path)]) == 1
+
+
+def test_skip_timeline_with_tp2_is_not_failure(tmp_path: Path) -> None:
+    """F2-3：显式 --skip-timeline 时，缺 DB 不是失败，而是降级提示。"""
+    exports = tmp_path / "exports"
+    export = _write_export(exports, "qwen35-prefill", ranks=2)
+    for rank in range(2):
+        (export / f"PROF_{rank:06d}_test" / "msprof_0.db").unlink()
+    workloads = _workloads(tmp_path, {"prefill_eager": {"hardware.device_count": 2}})
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict", "--skip-timeline"))
+    assert code == 0
+
+    manifest = _manifest(out)
+    assert manifest["status"] == "success"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["timeline"]["required"] is False
+    assert stages["timeline"]["status"] == "not_requested"
+    assert "timeline_skipped" in manifest["quality_flags"]
+    assert {"rank_merge_inconsistent", "timeline_unavailable"}.isdisjoint(
+        manifest["quality_flags"]
+    )

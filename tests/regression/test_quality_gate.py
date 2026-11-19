@@ -256,3 +256,34 @@ def test_known_blocking_code_without_severity_is_blocking() -> None:
 
     assert report.comparable is False
     assert report.deltas == []
+
+
+def test_known_blocking_code_cannot_be_downgraded_in_json(tmp_path: Path) -> None:
+    """F1-1：已知阻断码改成 degraded 也必须阻断（code 决定最低严重性）。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    target = _table(graph, {"MatMul": 1100.0})
+    path_a = base.write_json(tmp_path / "a.json")
+    path_b = target.write_json(tmp_path / "b.json")
+
+    payload = json.loads(path_a.read_text(encoding="utf-8"))
+    payload["meta"]["extra"]["quality_flags"] = [
+        {"code": RANK_MERGE_INCONSISTENT, "severity": "degraded", "message": "downgraded"}
+    ]
+    path_a.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    out = tmp_path / "cmp"
+    code = main(
+        ["compare", "--a", str(path_a), "--b", str(path_b), "--out-dir", str(out), "--strict"]
+    )
+    assert code == 4
+
+    report = json.loads(
+        (out / "compare_qwen35-prefill-eager_vs_qwen35-prefill-graph.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["comparable"] is False
+    assert report["deltas"] == []
+    assert report["total_ratio"] is None
+    assert "quality_flag_invalid" in {flag["code"] for flag in report["quality_flags"]}

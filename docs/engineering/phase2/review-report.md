@@ -1,5 +1,7 @@
 # AE-03 独立验收 Review
 
+> 最新复审：HEAD `7d10937` 仍为 **FAIL**。见文末「修复后独立复审」。
+
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
 基线为 HEAD 的直接父提交 `e7d8aaea9b8e24d78ff8229780a4bed5927d0c3c`，也与本地 `origin/main` 一致。审查对象为 `feat/ae-03-run-contract` 的 `ea6cd83df3684d1f3c8cba1b7171f8c4dd38a40b`。对照原始任务书 AE-03 和 §5.3、Phase 1 复核、Phase 2 实施报告及完整基线差异（14 个文件）。起始工作区无已跟踪改动，唯一未跟踪文件为原任务书，已纳入验收依据。
@@ -49,3 +51,52 @@
 | 真实 Profiling 数据、NPU、托管 CI、其他 Python 版本 | SKIPPED / NOT RUN | 本轮验证为本机 CPU 和临时采集形态样例。真实测试全量执行时跳过，未独立验证真实数据或 NPU 结果。 |
 
 AE-04 正式验收或合并前，应先修复 P1 项并将已复现的场景纳入回归，特别是从真实格式输入到产物再到独立 compare 的传播、复用目录、异常结算和严格比较契约。审查仅新增本文。
+
+## 修复后独立复审（2026-11-19）
+
+**结论：FAIL。** 双 rank 的标记传播、轮次契约、不可比比值清理已通过复验。仍可复现质量标记降级绕过、timeline 失败后继续比较、旧通信数据进入本轮汇总，以及发现或比较失败后保留旧运行清单。**可以准备 AE-04，暂不以 AE-03 已通过为依据进入 AE-04 正式验收或合并。**
+
+复审提交为 `7d10937a8c95d93195146ee0707f1869f88dcfa7`，对照原审查提交 `ea6cd83` 的 14 文件差异和实施报告 §10。AE-03 整体基线仍为 `e7d8aae`。复审开始时仅有未跟踪的任务书。以下行号以本次 HEAD 为准。
+
+| 上轮编号 | 复审状态 | 核查结果 |
+|---|---|---|
+| P1-1 | 已关闭原假成功反例 | 缺导出、缺日志、默认 timeline 缺 DB 的新增回归通过。显式跳过 timeline 的状态仍有冲突，见 F2-3。 |
+| P1-2 | 部分关闭 | 缺少预期 rank、第三 rank 异常、部分 rank 缺 DB 的回归通过。当前验证使用 rank 数量。输入存在但 timeline 执行失败时，下游仍可把表判为可比，见 F1-2。 |
+| P1-3 | 已关闭原轮次绕过 | 实际 CLI 读入轮次不一致的两表后返回 4，两个比较入口都调用采集契约。 |
+| P1-4 | 已关闭 | 阻断报告保留两侧原始量，total_ratio 为 null、deltas 为空，终端对不可比输出 `total_ratio=-`。 |
+| P1-5 | 部分关闭 | 旧 workload 整行与旧 timeline 不再登记为本轮产物。仍会读取同一 workload 的旧 comm.json，见 F1-3。 |
+| P1-6 | 部分关闭 | 缺映射会替换旧清单，分析端单 workload 写失败有记录。发现异常和独立 compare 执行失败仍可留下旧清单，见 F1-4。 |
+| P1-7 | 部分关闭 | 非法 severity 和缺失 severity 的已知阻断码会阻断。使用合法值 degraded 可绕过，见 F1-1。 |
+| P2-1 | 部分关闭 | analyze 的自定义路径和空 JSON 回归通过。独立 compare 的相对基准仍错，缺哈希仍可通过，见 F2-1。 |
+| P2-2 | 部分关闭 | compare 输入 SHA-256 和 analyze 的配置指纹已补充。compare 读入错误仍把原始路径写入清单，见 F2-2。 |
+| P2-3 | 已关闭 | 新测试使用实际 CSV、轮次日志和 SQLite，调用生产 CLI，重读落盘表后断言 compare 退出 4。隔离移除任一标记挂载，两次均在对应落盘标记断言处失败。原两个 strict xfail 已移除。 |
+| P3-1 | 已关闭 | 新字段移到 generated_at 之后，保留原先位置参数顺序。 |
+
+### 剩余问题
+
+未发现 P0。下列问题以运行契约和原始任务书的验收要求为准。
+
+| 编号 | 位置 | 证据与影响 | 修复建议 |
+|---|---|---|---|
+| F1-1（P1） | `opt_discovery/schemas/quality.py:80`、`:95` | 将真实形态样例落盘表中两个已知 R05/R10 标记的 severity 改为 `degraded`，strict compare 返回 0 且 comparable=true。已知阻断码只在 severity 缺失时得到保护。 | 由已知码的契约决定最低严重性，或将 code/severity 冲突判为无效并阻断。用相同落盘输入验证 degraded 和非法值。 |
+| F1-2（P1） | `opt_discovery/cli.py:1298`、`:1304`、`:1452` | 两张具有完整 CSV rank 的表，损坏 eager 主 DB 后，strict analyze 返回 3，但清单 comparison_status=success，表无质量标记，独立 strict compare 返回 0。R10 检查失败只留在 analyze 清单，消费侧无法判断时长质量未验证。 | 将必需 timeline 的失败或缺失作为可序列化的质量状态，并按受影响的比较范围限制派生结论。用损坏 DB 测试本次内置比较和独立重读。 |
+| F1-3（P1） | `opt_discovery/cli.py:1477`、`opt_discovery/report/summary_csv.py:71`、`:163` | 对同一 workload 先采一条 4 MiB 通信记录，再删除 DB 并显式跳过 timeline。第二次 strict analyze 返回 0，新 workload_summary.csv 仍报 comm_mib=4.0、comm_tasks=1，本轮清单未登记 comm.json，校验却通过。目录级 include 只解决了跨 workload 复用。 | 汇总按本轮产物清单取文件，或读本轮对象。覆盖同一 workload 的可选产物缺失和读取失败。 |
+| F1-4（P1） | `opt_discovery/cli.py:962`、`:1127`、`:1146`、`:1542` | 已有导出目录失去可解析 CSV 时，discover_all 抛错，analyze 返回 1 且清单 run_id 沿用旧运行。独立 compare 的产物路径换成目录后，返回 1 并打印 traceback，旧 success 清单未更新。缺映射虽已写新 failed 清单，parse 仍误记 passed。 | 将发现、配置、比较和写出纳入相同结算。阶段按实际进入和完成情况记录；保证仍可写时落本轮失败状态。测试用实际文件系统故障覆盖两个 CLI 入口。 |
+| F2-1（P2） | `opt_discovery/cli.py:937`、`opt_discovery/experiment/run_manifest.py:246` | 独立 compare 的清单仍按 out_dir 记录相对路径。实测 `--manifest` 指到另一个目录时 compare 返回 0，check-manifest 返回 1。有效顶层结构的 artifact 删除 sha256 后，校验返回 0。 | 两个写入路径统一使用清单父目录。校验产物项是对象且哈希必填，并拒绝无法核实的条目。 |
+| F2-2（P2） | `opt_discovery/cli.py:951`、`:956` | compare 的 load_error 直接存储异常字符串，缺输入文件时可把绝对路径写入清单，与 README 承诺不一致。 | 共享两个入口的路径清理逻辑，清单保留逻辑标签与错误码。 |
+| F2-3（P2） | `opt_discovery/cli.py:1231`、`:1485`、`:1555` | TP=2 的 CSV 与日志完整，显式 `--skip-timeline` 且未提供 DB 时，timeline 标为 required=false、not_requested，运行却因 rank_timeline_incomplete 返回 3。阶段契约与退出条件冲突。 | 明确选择跳过时哪些证据仍为比较所必需。仅为实际要求的 timeline 检查结算失败，或以明确状态限制需 timeline 的结论。 |
+
+### 实际复验
+
+| 检查 | 结果 |
+|---|---|
+| `git diff --check ea6cd83 HEAD` | PASS，无空白错误。 |
+| `PYTHONDONTWRITEBYTECODE=1 make check` | PASS，退出 0，Ruff、mypy（51 文件）、配置验证通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae03-followup-demo.cEJX56` | PASS / SKIPPED，退出 0，236 passed、17 skipped、无 xfail，synthetic demo 完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` | PASS，81 passed，退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 env -u OPT_DISCOVERY_DATA_ROOT python3 scripts/verify_real.py --expect-blocked` | PASS，缺数据闸门返回 0，真实回归状态为 BLOCKED。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-followup-probe.fPfjWg.py`，另用临时样例损坏主 DB 及删除两 rank 的 DB | 双 rank 正常传播、轮次不一致及非法 severity 按预期受限。剩余反例的实际结果见 F1/F2。 |
+| 隔离 `git archive HEAD` 副本，各自移除 R05、R10 的 attach_quality，再分别执行 `python3 -m pytest -q -o addopts= -p no:cacheprovider tests/regression/test_quality_end_to_end.py` | 两次均退出 1，各自在对应落盘标记断言失败。仓库工作树未变异。 |
+| 真实 Profiling 数据、NPU、托管 CI、其他 Python 版本 | BLOCKED / NOT RUN。本次使用 Python 3.12.13。实施报告中的真实数据和其他解释器结果未作为本次实测。 |
+
+进入 AE-04 正式验收或合并前，应关闭 F1 项并将对应反例纳入回归。原表中已关闭的首轮反例无需重复修复。

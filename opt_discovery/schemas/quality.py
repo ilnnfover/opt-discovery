@@ -36,6 +36,10 @@ SQLITE_FALLBACK = "sqlite_fallback"
 RANK_TIMELINE_INCOMPLETE = "rank_timeline_incomplete"
 #: 标记本身无法解析（未知 severity/缺字段）：必须按未验证处理，不能静默丢弃
 QUALITY_FLAG_INVALID = "quality_flag_invalid"
+#: 必需 timeline 未执行（缺 DB 或执行异常）：busy/idle、通信重叠等结论不可用
+TIMELINE_UNAVAILABLE = "timeline_unavailable"
+#: 用户显式 `--skip-timeline`：降级提示，不视为失败
+TIMELINE_SKIPPED = "timeline_skipped"
 
 #: 这些 code 一旦出现就必须阻断比较（即使 severity 字段缺失或被写成字符串）
 KNOWN_BLOCKING_CODES = frozenset(
@@ -44,6 +48,7 @@ KNOWN_BLOCKING_CODES = frozenset(
         RANK_MERGE_INCONSISTENT,
         RANK_DURATION_INCONSISTENT,
         RANK_TIMELINE_INCOMPLETE,
+        TIMELINE_UNAVAILABLE,
         QUALITY_FLAG_INVALID,
     }
 )
@@ -64,6 +69,11 @@ class QualityFlag:
             raise ValueError("quality flag code must not be empty")
         if self.severity not in SEVERITIES:
             raise ValueError(f"unknown severity {self.severity!r}; allowed: {SEVERITIES}")
+        # code 决定最低严重性：已知阻断码不能被调用方“降级”为 degraded
+        if self.code in KNOWN_BLOCKING_CODES and self.severity != BLOCKING:
+            raise ValueError(
+                f"{self.code} 是已知阻断码，severity 不能为 {self.severity!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -159,6 +169,8 @@ __all__ = [
     "RANK_SCOPE_MISMATCH",
     "RANK_TIMELINE_INCOMPLETE",
     "SQLITE_FALLBACK",
+    "TIMELINE_SKIPPED",
+    "TIMELINE_UNAVAILABLE",
     "SCHEMA_VERSION",
     "QUALITY_FLAG_INVALID",
     "KNOWN_BLOCKING_CODES",

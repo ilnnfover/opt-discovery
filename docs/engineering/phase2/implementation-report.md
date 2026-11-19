@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**236 passed, 17 skipped**（253 用例，无 xfail）。
+全量：**243 passed, 17 skipped**（260 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 236 passed, 17 skipped（253 用例） |
-| `python -m pytest tests/regression` | 0 | 66 passed |
+| `python -m pytest` | 0 | 243 passed, 17 skipped（260 用例） |
+| `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 236 passed, 17 skipped |
+| 3.11 全量 | 0 | 243 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -213,5 +213,36 @@ if blocking_flags:
 | P2-3 | 质量测试手工挂标记，未锁定传播 | 新增 `test_quality_end_to_end.py`：真实 CSV+log+db → analyze → 落盘 JSON → 独立 compare 读盘并退出 4 | `test_rank_and_duration_flags_propagate_to_compare` |
 | P3-1 | `quality_flags` 插在旧字段中间，位置参数有风险 | 移到 `ComparisonReport` 末尾（`generated_at` 之后）；仓库内构造均为关键字参数 | 全部 compare 测试 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **236 passed, 17 skipped**（253 用例，66 个回归）；
+验证（3.12 / 3.11）：`make check` 0；`pytest` **243 passed, 17 skipped**（260 用例，67 个回归）；
 真实数据 16 passed / 1 skipped；`verify-real --expect-blocked` 0。
+
+## 11. 第二轮复审修复（F1/F2，2026-11-19）
+
+复审基线 `7d10937`。逐项处置：
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| **F1-1** | 已知阻断码可被 `severity=degraded` 降级 | `QualityFlag.__post_init__`：`code` 属于 `KNOWN_BLOCKING_CODES` 时 severity 必须为 blocking，否则抛错；`from_dict` 解析时冲突 → `quality_flag_invalid`（blocking） | `test_known_blocking_code_cannot_be_downgraded_in_json` |
+| **F1-2** | timeline 失败只记数在 manifest，表无标记，独立 compare 仍 0 | timeline 缺 DB/执行异常 → `timeline_unavailable`（blocking）随表落盘；比较入口读取后 `comparable=False` | `test_timeline_failure_makes_table_uncomparable`（损坏主 DB + 独立 compare 4） |
+| **F1-3** | 同一 workload 的旧 `comm.json` 进入本轮 CSV | `write_summaries(..., artifacts=本轮清单路径)`，只读取本轮登记过的可选产物 | `test_stale_comm_is_not_used_in_summary` |
+| **F1-4** | 发现异常沿用旧清单；compare 输入目录抛栈；配置失败 parse 误记 passed | `discover_all` 包失败结算（`discover_error`）；compare 的 mkdir/读取/执行/写出全部结算并写本轮 failed 清单；`_analyze_stages` 增加 `failure_stage`：配置失败时 parse 及之后 `not_requested` | `test_discover_error_settles_manifest`、`test_compare_input_directory_settles_manifest`、`test_config_failure_replaces_previous_success_manifest`（含 parse 断言） |
+| **F2-1** | compare 的清单仍相对 out_dir；缺 sha256 可通过 | compare 与 analyze 统一以**清单父目录**为 artifact 根；`verify_manifest` 要求每项为对象且 sha256 必填 | `test_compare_custom_manifest_and_missing_sha` |
+| **F2-2** | compare 的 load_error 写入原始绝对路径 | 抽出 `_redact_error(exc, roots)`，两个入口共享；compare 的 load/执行错误均脱敏 | `test_compare_input_directory_settles_manifest`（断言 `<path>` 且无 tmp 路径） |
+| **F2-3** | 显式 `--skip-timeline` 仍做 DB 覆盖检查，导致 status 与阶段冲突 | 跳过时不再检查 DB 覆盖，改为 `timeline_skipped`（degraded）；仅为“必须执行 timeline”结算失败 | `test_skip_timeline_with_tp2_is_not_failure` |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上一轮的做法 | 缺口 |
+|---|---|---|
+| F1-1 降级绕过 | 只在 `severity` 缺失时按 code 默认 blocking | 把 severity 当作可信输入，没有“code 决定下限”的约束 |
+| F1-2 timeline 失败不可判定 | 失败只写入 manifest 的 stage/详情 | 没有把“时间线不可用”转成随表落盘的质量状态；消费端只看表 |
+| F1-3 旧 comm 进 CSV | 汇总按 workload 目录过滤（`include`） | 仍按目录读文件，未按本轮产物清单读；可选产物残留未被发现 |
+| F1-4 旧清单/误记 passed | 只覆盖了“单 workload 写失败”和“缺映射”两条路径 | `discover_all`、compare 的 mkdir/执行/写出未纳入结算；`_save` 没有“阶段未执行”的概念 |
+| F2-1 清单根目录 | analyze 已改为相对清单目录 | compare 仍用 `out_dir`，两个入口不一致；校验只在 sha 存在时比较 |
+| F2-2 路径泄漏 | analyze 有脱敏，compare 直接用 `str(exc)` | 脱敏逻辑未共享 |
+| F2-3 跳过冲突 | 无条件执行 DB 覆盖检查 | 没有区分“用户显式跳过”与“必需 timeline 失败” |
+
+共性原因：上一轮把“代码路径已修”当作“消费端可判定”，缺少“落盘产物 → 独立进程重读”的反例。
+本轮为每条 F 项都补了读取磁盘/跨进程的断言，并用变异验证确认断言是承重的。
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **243 passed, 17 skipped**（260 用例，67 个回归）。

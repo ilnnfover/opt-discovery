@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                253 个用例（236 个 CPU 用例 + 17 个真实数据集成用例）
+tests/                260 个用例（243 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -422,7 +422,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 236 passed, 17 skipped（缺真实导出时）
+python -m pytest -q                      # 243 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
@@ -462,7 +462,9 @@ python -m opt_discovery.cli check-manifest --path <out>/run_manifest.json
 时长截断（`rank_duration_inconsistent`）为阻断型标记，随 `ParseMeta.extra["quality_flags"]` 落盘；
 `compare` 读取后直接判 `comparable=False`、不输出 deltas/`total_ratio`，并在 `reasons` 中说明原因；
 比较入口同时应用采集契约（与 `check-runs` 同一实现），轮次/阶段/硬件不一致时同样不可比。
-标记字段存在但无法解析（如非法 `severity`）按 `quality_flag_invalid` 阻断，不会静默忽略。
+已知阻断码由 code 决定最低严重性（`severity=degraded` 也会被拒）；标记字段无法解析按
+`quality_flag_invalid` 阻断，不会静默忽略。timeline 失败/缺失会转成 blocking 标记随表落盘，
+独立 `compare` 读取后同样拒绝。
 
 加一个 Workload：在 `configs/workloads/<model>/` 放 YAML，填 `labels.export_dir`，
 填完采集条件后置 `verified: true`（未核对的组会被判"不可比"）。

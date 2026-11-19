@@ -92,6 +92,7 @@ from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
+from .schemas.quality import DEGRADED, TIMELINE_SKIPPED, TIMELINE_UNAVAILABLE, QualityFlag
 from .schemas.quality import attach as attach_quality
 from .schemas.quality import blocking as blocking_quality
 from .schemas.workload import WorkloadSpec
@@ -889,7 +890,11 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def cmd_compare(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[compare] 无法创建输出目录: {exc}", file=sys.stderr)
+        return MANIFEST_EXIT_FAILED
     strict = bool(getattr(args, "strict", False))
     run_id = getattr(args, "run_id", None) or new_run_id("compare")
     manifest_path = Path(getattr(args, "manifest", None) or (out_dir / "run_manifest.json"))
@@ -934,12 +939,17 @@ def cmd_compare(args: argparse.Namespace) -> int:
             stages=tuple(stages),
             quality_flags=quality_codes,
             comparison_status=comparison_status,
-            artifacts=collect_artifacts(artifacts, out_dir),
+            # 与 analyze 一致：产物路径相对清单父目录，支持清单写在输出目录之外
+            artifacts=collect_artifacts(artifacts, manifest_path.parent),
             inputs=inputs,
             tool=tool_info(),
             previous_run_id=previous_run_id,
         )
-        target = write_manifest(manifest_path, manifest)
+        try:
+            target = write_manifest(manifest_path, manifest)
+        except OSError as exc:
+            print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
         print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
         if strict:
             return STATUS_EXIT[status]
@@ -949,19 +959,38 @@ def cmd_compare(args: argparse.Namespace) -> int:
         a = OperatorTable.read_json(args.a)
         b = OperatorTable.read_json(args.b)
     except Exception as exc:  # noqa: BLE001 - 输入错误要可判定，不能抛栈
-        print(f"[compare] 读取输入失败: {exc}", file=sys.stderr)
+        detail = _redact_error(
+            exc, (out_dir, manifest_path.parent, Path(args.a).parent, Path(args.b).parent)
+        )
+        print(f"[compare] 读取输入失败: {detail}", file=sys.stderr)
         _finish(
             STATUS_FAILED,
             stages=[
-                StageRecord("load", True, STAGE_FAILED, "load_error", details={"error": str(exc)}),
+                StageRecord("load", True, STAGE_FAILED, "load_error", details={"error": detail}),
                 StageRecord("compare", True, STAGE_NOT_REQUESTED),
             ],
         )
         return MANIFEST_EXIT_FAILED
 
-    report = compare_tables(a, b, top=args.top)
-    target = report.write_json(out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json")
-    artifacts[f"compare_{a.workload_id}_vs_{b.workload_id}.json"] = target
+    try:
+        report = compare_tables(a, b, top=args.top)
+        target = report.write_json(
+            out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
+        )
+        artifacts[f"compare_{a.workload_id}_vs_{b.workload_id}.json"] = target
+    except Exception as exc:  # noqa: BLE001 - 执行/写出失败也要结算清单
+        detail = _redact_error(exc, (out_dir, manifest_path.parent))
+        print(f"[compare] 执行或写出失败: {detail}", file=sys.stderr)
+        _finish(
+            STATUS_FAILED,
+            stages=[
+                StageRecord("load", True, STAGE_PASSED),
+                StageRecord(
+                    "compare", True, STAGE_FAILED, "compare_error", details={"error": detail}
+                ),
+            ],
+        )
+        return MANIFEST_EXIT_FAILED
     print(f"[compare] {report.a_id} -> {report.b_id}  comparable={report.comparable}")
     for reason in report.reasons:
         print(f"  ! {reason}")
@@ -1066,13 +1095,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             artifacts[label] = path
 
     def _error(exc: BaseException) -> str:
-        text = f"{type(exc).__name__}: {exc}"
-        for root in (exports_root, workloads_dir, out):
-            if str(root):
-                text = text.replace(str(root), "<path>")
-        return text
+        return _redact_error(exc, (exports_root, workloads_dir, out))
 
-    def _save(status: str, *, has_tables: bool, discover_ok: bool = True) -> int:
+    def _save(
+        status: str,
+        *,
+        has_tables: bool,
+        discover_ok: bool = True,
+        failure_stage: str | None = None,
+    ) -> int:
         inputs["configs"] = fingerprint_configs(config_paths)
         stages = _analyze_stages(
             args,
@@ -1089,6 +1120,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             comparison_status=comparison_status,
             comparison_failed=comparison_failed,
             source_map_failed=source_map_failed,
+            failure_stage=failure_stage,
         )
         manifest = RunManifest(
             run_id=run_id,
@@ -1124,7 +1156,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         _save(STATUS_FAILED, has_tables=False, discover_ok=False)
         return MANIFEST_EXIT_FAILED
 
-    bundles = discover_all(workloads_dir, exports_root)
+    try:
+        bundles = discover_all(workloads_dir, exports_root)
+    except Exception as exc:  # noqa: BLE001 - 发现失败也要写本轮 failed 清单
+        print(f"[analyze] 导出发现失败: {_error(exc)}", file=sys.stderr)
+        _save(
+            STATUS_FAILED,
+            has_tables=False,
+            discover_ok=False,
+            failure_stage="discover",
+        )
+        return MANIFEST_EXIT_FAILED
     by_id = {bundle.workload_id: bundle for bundle in bundles}
     for workload in expected_workloads:
         if workload.labels.get("export_dir") and workload.workload_id not in by_id:
@@ -1155,7 +1197,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         engine = DiagnosisEngine(ruleset, device_profile=device_profile)
     except Exception as exc:  # noqa: BLE001
         print(f"[analyze] 配置加载失败: {_error(exc)}", file=sys.stderr)
-        _save(STATUS_FAILED, has_tables=False)
+        _save(STATUS_FAILED, has_tables=False, failure_stage="parse")
         return MANIFEST_EXIT_FAILED
 
     tables: dict[str, OperatorTable] = {}
@@ -1228,12 +1270,22 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 db_ranks += 1
             db_files.extend(found)
 
-        # R10 + timeline 覆盖：TP>1 但只找到部分 DB 时，busy/idle 结论不完整
-        coverage_flags = timeline_coverage_flags(db_ranks, expected_ranks(bundle))
-        if coverage_flags:
-            attach_quality(table.meta, coverage_flags)
-            quality_flags.extend(coverage_flags)
-            timeline_failures.append(f"{workload_id}:partial_db({db_ranks})")
+        # R10 + timeline 覆盖：只有“必须执行 timeline”时，缺 DB 才算质量异常
+        if skip_timeline:
+            skipped_flag = QualityFlag(
+                code=TIMELINE_SKIPPED,
+                severity=DEGRADED,
+                message="显式跳过 timeline：busy/idle 与通信重叠结论不可用，算子级对比仍可进行",
+                source="cli",
+            )
+            attach_quality(table.meta, (skipped_flag,))
+            quality_flags.append(skipped_flag)
+        else:
+            coverage_flags = timeline_coverage_flags(db_ranks, expected_ranks(bundle))
+            if coverage_flags:
+                attach_quality(table.meta, coverage_flags)
+                quality_flags.extend(coverage_flags)
+                timeline_failures.append(f"{workload_id}:partial_db({db_ranks})")
 
         try:
             report = engine.diagnose_table(table)
@@ -1270,6 +1322,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             if not db_files:
                 workload_timeline_failed = True
                 timeline_failures.append(f"{workload_id}:missing_db")
+                missing_flag = QualityFlag(
+                    code=TIMELINE_UNAVAILABLE,
+                    severity="blocking",
+                    message="必需 timeline 未执行（缺 msprof_*.db）：时间线相关结论不可用",
+                    source="timeline",
+                )
+                attach_quality(table.meta, (missing_flag,))
+                quality_flags.append(missing_flag)
                 print("    ! timeline: 缺 msprof_*.db（必需步骤未完成）")
             else:
                 try:
@@ -1299,6 +1359,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     print(f"    ! timeline 失败: {_error(exc)}")
                     workload_timeline_failed = True
                     timeline_failures.append(f"{workload_id}:{_error(exc)}")
+                    failed_flag = QualityFlag(
+                        code=TIMELINE_UNAVAILABLE,
+                        severity="blocking",
+                        message=f"必需 timeline 执行失败（{_error(exc)}）：时间线相关结论不可用",
+                        source="timeline",
+                        details={"error": _error(exc)},
+                    )
+                    attach_quality(table.meta, (failed_flag,))
+                    quality_flags.append(failed_flag)
 
         try:
             table.write_json(out / workload_id / "operator_table.json")
@@ -1474,7 +1543,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"      -> {target}")
 
     try:
-        workload_csv, operator_csv = write_summaries(out, include=set(selected_ids))
+        workload_csv, operator_csv = write_summaries(
+            out, include=set(selected_ids), artifacts=set(artifacts)
+        )
         _record(workload_csv, workload_csv.name)
         _record(operator_csv, operator_csv.name)
         print(f"\n[summary] {workload_csv.name} / {operator_csv.name}")
@@ -1520,9 +1591,13 @@ def _analyze_stages(
     comparison_status: str,
     comparison_failed: bool,
     source_map_failed: bool,
+    failure_stage: str | None = None,
 ) -> list[StageRecord]:
     """把本轮 run 状态映射为阶段清单（AE-03 契约的可审计部分）。"""
     skip_timeline = bool(getattr(args, "skip_timeline", False))
+    early = failure_stage in ("discover", "parse")
+    parse_executed = failure_stage not in ("discover", "parse") and discover_ok
+    later_executed = failure_stage is None
     parse_failed = bool(missing_logs or window_failures or parse_failures)
     discover_failed = not discover_ok or bool(missing_exports)
     compare_failed = comparison_failed or comparison_status in (
@@ -1534,7 +1609,11 @@ def _analyze_stages(
             "discover",
             True,
             STAGE_FAILED if discover_failed else STAGE_PASSED,
-            ("no_export" if not discover_ok else "missing_export")
+            (
+                "discover_error"
+                if failure_stage == "discover"
+                else ("no_export" if not discover_ok else "missing_export")
+            )
             if discover_failed
             else None,
             details={"missing": list(missing_exports)},
@@ -1543,7 +1622,7 @@ def _analyze_stages(
             "parse",
             True,
             STAGE_NOT_REQUESTED
-            if not discover_ok
+            if not parse_executed
             else (STAGE_FAILED if parse_failed else STAGE_PASSED),
             "missing_or_failed_workload" if parse_failed else None,
             details={
@@ -1556,7 +1635,7 @@ def _analyze_stages(
             "timeline",
             not skip_timeline,
             STAGE_NOT_REQUESTED
-            if skip_timeline
+            if (skip_timeline or not parse_executed)
             else (
                 STAGE_FAILED
                 if timeline_failures
@@ -1564,7 +1643,9 @@ def _analyze_stages(
             ),
             (
                 None
-                if skip_timeline or (timeline_runs and not timeline_failures)
+                if skip_timeline
+                or not parse_executed
+                or (timeline_runs and not timeline_failures)
                 else ("timeline_failed" if timeline_failures else "no_workload")
             ),
             details={"failed": list(timeline_failures), "runs": timeline_runs},
@@ -1572,16 +1653,26 @@ def _analyze_stages(
         StageRecord(
             "diagnosis",
             True,
-            STAGE_PASSED if (has_tables and not diagnosis_failures) else STAGE_FAILED,
+            (
+                STAGE_NOT_REQUESTED
+                if early
+                else (STAGE_PASSED if (has_tables and not diagnosis_failures) else STAGE_FAILED)
+            ),
             None if not diagnosis_failures else "diagnosis_failed",
             details={"failed": list(diagnosis_failures)},
         ),
         StageRecord(
             "opportunities",
             True,
-            STAGE_PASSED
-            if (has_tables and not diagnosis_failures and not output_failures)
-            else STAGE_FAILED,
+            (
+                STAGE_NOT_REQUESTED
+                if early
+                else (
+                    STAGE_PASSED
+                    if (has_tables and not diagnosis_failures and not output_failures)
+                    else STAGE_FAILED
+                )
+            ),
             "artifact_write_failed" if output_failures else None,
             details={"failed": list(output_failures)},
         ),
@@ -1589,7 +1680,7 @@ def _analyze_stages(
             "source_map",
             False,
             STAGE_NOT_REQUESTED
-            if not getattr(args, "source_map", False)
+            if (not later_executed or not getattr(args, "source_map", False))
             else (STAGE_FAILED if source_map_failed else STAGE_PASSED),
             "source_map_failed" if source_map_failed else None,
         ),
@@ -1597,7 +1688,10 @@ def _analyze_stages(
             "compare",
             False,
             STAGE_NOT_REQUESTED
-            if (comparison_status == COMPARISON_NOT_REQUESTED and not comparison_failed)
+            if (
+                not later_executed
+                or (comparison_status == COMPARISON_NOT_REQUESTED and not comparison_failed)
+            )
             else (STAGE_FAILED if compare_failed else STAGE_PASSED),
             (
                 "compare_failed"
@@ -1610,6 +1704,15 @@ def _analyze_stages(
             ),
         ),
     ]
+
+
+def _redact_error(exc: BaseException, roots: tuple[Path, ...]) -> str:
+    """错误详情进入清单/日志前去掉绝对路径，保留异常类型与原因。"""
+    text = f"{type(exc).__name__}: {exc}"
+    for root in roots:
+        if str(root):
+            text = text.replace(str(root), "<path>")
+    return text
 
 
 def _fmt_ratio(report: ComparisonReport) -> str:

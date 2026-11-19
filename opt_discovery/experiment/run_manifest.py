@@ -244,16 +244,22 @@ def verify_manifest(path: str | Path) -> list[str]:
         problems.append("artifacts 不是列表")
         return problems
     for item in payload.get("artifacts") or ():
+        if not isinstance(item, dict):
+            problems.append(f"artifact 项不是对象: {type(item).__name__}")
+            continue
         relative = item.get("path")
         if not relative:
             problems.append("artifact 缺少 path")
+            continue
+        expected = item.get("sha256")
+        if not isinstance(expected, str) or not expected:
+            problems.append(f"artifact 缺少 sha256: {relative}")
             continue
         target = root / relative
         if not target.is_file():
             problems.append(f"缺少产物: {relative}")
             continue
-        expected = item.get("sha256")
-        if expected and sha256_of(target) != expected:
+        if sha256_of(target) != expected:
             problems.append(f"产物被修改: {relative}")
     return problems
 
