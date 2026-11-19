@@ -111,7 +111,7 @@ class KernelEvent:
 
 ## 6. 测试与验证
 
-新增 `tests/test_events.py`（17 条）：
+新增 `tests/test_events.py`（23 条）：
 
 - op_summary filter/clip 语义、COMMUNICATION 单位缩放、来源行号、rank、坏行/零时长跳过；
 - 缺时间列报 `EventReadError`；生成器惰性；
@@ -123,8 +123,8 @@ class KernelEvent:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check` | 0 | Ruff / mypy 53 文件 / validate |
-| `python -m pytest`（3.12） | 0 | 306 passed, 17 skipped（323 用例） |
-| `python -m pytest`（3.11） | 0 | 306 passed, 17 skipped |
+| `python -m pytest`（3.12） | 0 | 312 passed, 17 skipped（329 用例） |
+| `python -m pytest`（3.11） | 0 | 312 passed, 17 skipped |
 | `make verify DEMO_OUT=/tmp/ae04-demo2` | 0 | 合成演示完成 |
 | `tests/test_real_data.py`（授权数据） | 0 | 16 passed, 1 skipped |
 | `verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED |
@@ -163,7 +163,7 @@ class KernelEvent:
 
 P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语义，作为已知差异记录；若切换口径需单独结果验收。
 
-验证：`make check` 0；`pytest` **306 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **312 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
 
 ## 10. 增量复核修复（2026-11-19）
 
@@ -176,4 +176,17 @@ P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语�
 
 说明：Timeline 的“整任务时长 / 窗口 busy”历史口径仍未改变（P2-1），仅将内部并集坐标改为窗口相对；对输出字段的语义没有切换。
 
-验证：`make check` 0；`pytest` **306 passed, 17 skipped**（323 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **312 passed, 17 skipped**（323 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+
+## 11. 第二轮增量复核修复（2026-11-19）
+
+| 级别 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1 | Parser 接入共享行归一化后丢失旧语义：千分位数字、零时长、`N/A`/缺失起点 | `normalize_instance_row` 增加 `number_parser` 与 `allow_zero_duration`；Parser 传入 `_to_float`、允许 0 时长；窗口路径先用 `_row_start` 区分“缺起点（skipped+warning）”与“窗口外”；不再使用合成起点 0 | `test_parser_keeps_number_format_zero_and_missing_timestamp` |
+| P1 | Host 并集把相对坐标 `0.0` 当作未初始化 | 用显式 `is None` 判断 `host_seg_start/host_seg_end`，不再 `or start` | `test_host_union_treats_zero_relative_end_as_valid`（两次调用 busy 20µs） |
+| P1 | epoch 裁剪上限、相邻 100ns、无窗 busy、Parser 窗口质量仍丢精度 | `window_span(clip)` 用 `available = end - start` 扣减；TASK/CANN 先用整数 ns 减共同原点再换算；无窗 Host 以首个 Host 调用为原点；Parser 的忙碌并集改用窗口相对坐标 | `test_epoch_clip_is_bounded_by_window_end`、`test_epoch_adjacent_ns_events_keep_both_durations`、`test_no_window_single_ns_event_has_busy`、`test_parser_window_quality_uses_relative_busy` |
+| P1 | Parser 与 Timeline 复用实例标准化 | Parser 与 `_iter_op_rows` 共用 `normalize_instance_row`（起点/时长/类型/单位/窗口策略）；Parser 保留映射扩展、聚合、额外指标与 `start` 策略，Timeline 保留 `intersect`/`clip` | `test_parser_and_reader_share_epoch_normalization` |
+
+说明：Timeline 的“整任务时长/窗口 busy”历史口径（P2-1）仍未切换，只调整内部相对坐标。
+
+验证：`make check` 0；`pytest` **312 passed, 17 skipped**（329 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。

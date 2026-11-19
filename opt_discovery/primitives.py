@@ -81,7 +81,10 @@ def window_span(
     if start_us >= window.end_us:
         return None
     left = max(0.0, window.start_us - start_us)
-    right = max(0.0, end_us - window.end_us)
+    available = window.end_us - start_us
+    if available <= 0.0:
+        return None
+    right = max(0.0, duration_us - available)
     clipped_duration = duration_us - left - right
     if clipped_duration <= 0.0:
         return None

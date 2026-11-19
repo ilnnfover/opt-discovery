@@ -178,6 +178,8 @@ def normalize_instance_row(
     window: Window | None = None,
     policy: str = "intersect",
     resolver=_task_type,
+    number_parser=float,
+    allow_zero_duration: bool = False,
 ) -> NormalizedRow | None:
     """Shared normalization for one instance row (Parser and Timeline both use it).
 
@@ -189,11 +191,17 @@ def normalize_instance_row(
     if start_idx is not None and start_idx >= len(row):
         return None
     try:
-        duration_value = float(row[duration_idx])
-        start_value = float(row[start_idx]) if start_idx is not None else 0.0
-    except ValueError:
+        parsed_duration = number_parser(row[duration_idx])
+        parsed_start = (
+            number_parser(row[start_idx]) if start_idx is not None else 0.0
+        )
+    except (TypeError, ValueError):
         return None
-    if duration_value <= 0.0:
+    if parsed_duration is None or parsed_start is None:
+        return None
+    duration_value = float(parsed_duration)
+    start_value = float(parsed_start)
+    if duration_value < 0.0 or (duration_value == 0.0 and not allow_zero_duration):
         return None
     raw_type = row[type_idx] if type_idx is not None and type_idx < len(row) else None
     task_type = resolver(raw_type)
@@ -357,7 +365,9 @@ def _has_table(connection: sqlite3.Connection, name: str) -> bool:
 
 
 def _iter_task_rows(
-    db_path: str | Path, window: Window | None
+    db_path: str | Path,
+    window: Window | None,
+    origin_us: float | None = 0.0,
 ) -> Iterator[tuple[float, float]]:
     path = Path(db_path)
     if not path.is_file():
@@ -372,10 +382,13 @@ def _iter_task_rows(
             sql += " where endNs >= ? and startNs <= ?"
             params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
         sql += " order by startNs"
+        origin_ns = int(origin_us * NS_PER_US) if origin_us is not None else None
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
+            if origin_ns is None:
+                origin_ns = start_ns
             duration_ns = int(row[1]) - start_ns
-            yield start_ns / NS_PER_US, duration_ns / NS_PER_US
+            yield (start_ns - origin_ns) / NS_PER_US, duration_ns / NS_PER_US
     finally:
         connection.close()
 
@@ -398,10 +411,16 @@ def iter_task_intervals(
 
 
 def iter_task_span_rows(
-    db_path: str | Path, *, window: Window | None = None
+    db_path: str | Path,
+    *,
+    window: Window | None = None,
+    origin_us: float | None = 0.0,
 ) -> Iterator[tuple[float, float]]:
-    """``(start_us, duration_us)`` TASK view (epoch-safe duration)."""
-    yield from _iter_task_rows(db_path, window)
+    """``(start_us, duration_us)`` TASK view (epoch-safe duration).
+
+    ``origin_us`` 把绝对 epoch 时间平移到小坐标；不传时以首个任务为原点。
+    """
+    yield from _iter_task_rows(db_path, window, origin_us)
 
 
 def iter_task_spans(
@@ -413,7 +432,10 @@ def iter_task_spans(
 
 
 def iter_host_spans(
-    db_path: str | Path, *, window: Window | None = None
+    db_path: str | Path,
+    *,
+    window: Window | None = None,
+    origin_us: float | None = 0.0,
 ) -> Iterator[tuple[float, float, str]]:
     """Tuple view ``(start_us, duration_us, name)`` for timeline attribution."""
     path = Path(db_path)
@@ -432,10 +454,17 @@ def iter_host_spans(
             sql += " where a.endNs >= ? and a.startNs <= ?"
             params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
         sql += " order by a.startNs"
+        origin_ns = int(origin_us * NS_PER_US) if origin_us is not None else None
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
+            if origin_ns is None:
+                origin_ns = start_ns
             duration_ns = int(row[1]) - start_ns
-            yield start_ns / NS_PER_US, duration_ns / NS_PER_US, str(row[2] or "unknown")
+            yield (
+                (start_ns - origin_ns) / NS_PER_US,
+                duration_ns / NS_PER_US,
+                str(row[2] or "unknown"),
+            )
     finally:
         connection.close()
 

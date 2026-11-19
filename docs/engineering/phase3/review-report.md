@@ -81,3 +81,39 @@
 | `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，59 passed，包含六组指定回归。 |
 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-delta-probe.lriJLZ.py` | 独立临时 CSV/SQLite 反例直调生产 Reader 和 `summarize`，并用隔离的 `fb71da6` 对照。文件乱序、区间精度和右边界裁剪的验收预期为 FAIL，实际值见上表。 |
 | `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，缺真实数据根目录。命令退出 0 表示缺数据闸门如预期生效。真实 Profiling、NPU 和托管 CI 均未验证。 |
+
+## 第二次增量复核（2026-11-19）
+
+**AE-04 验收结论为 FAIL。暂不允许合并或进入 AE-05。** 审查分支 `feat/ae-04-event-contract`，对照 `e8630ef..62e661a` 和实施报告 §10。复核范围为上轮三项 P1 及此次修复直接改变的路径。复核开始时已有未跟踪的 `docs/tasks/`，本次只追加本报告。
+
+### 受影响的 DoD
+
+| 验收项 | 结论 | 实测 |
+|---|---|---|
+| 分片读取、全局排序和区间并集 | PASS，上轮问题关闭 | `summarize` 对乱序单文件得到 2 项、20 µs，对乱序三分片得到 3 项、30 µs，有序三分片仍为 4 项、40 µs。 |
+| 两个生产消费者复用实例标准化 | PASS，复用条款关闭 | Timeline 的 CSV Reader 和 `MappingCsvParser.parse` 实际调用同一 `normalize_instance_row`。内置映射下，普通 0.1 µs 与 COMMUNICATION 100 ns 两行在两侧均汇总为 0.2 µs。映射及窗口兼容性见下表。 |
+| epoch 精度、窗口裁剪及归因 | FAIL，上轮问题部分关闭 | 上轮窗口样例的 device/Host busy 从 0/0 恢复到 0.2/0.1 µs，右边界起点正确排除。跨右边界裁剪、连续短 SQLite 事件、无窗回退及 Parser busy 仍有误。本次坐标改动还引入了窗口左边界的 Host 并集回归。 |
+| 原有 Parser 结果、质量元数据和 Timeline 指标兼容 | FAIL | 同一 CSV/SQLite fixture 与 `e8630ef` 对照，复现下表的任务分类、单位、窗口行数和 Host busy 回归。 |
+
+### 阻断项
+
+| 级别 | 代码位置 | 实际证据与影响 | 修复建议 |
+|---|---|---|---|
+| P1 · Parser 忽略任务类型映射与默认值 | `opt_discovery/parsers/csv_mapping.py:423`、`:488`、`:653`、`:795`；`opt_discovery/events.py:180`、`:199` | 对同一 CSV，用带默认 `kernel` 的配置解析空任务类型，`e8630ef` 得 `kernel`，`62e661a` 得 `unknown`。显式把 `CustomCollective` 映射为 `communication` 后，值为 10,000 的时长从 `communication / 10 µs` 变为 `other / 10,000 µs`。共享入口采用默认分类器并把结果送入 `_accumulate`，覆盖了 Parser 的配置语义，影响时长和按任务类型筛选的额外指标。 | 让 Parser 调用共享入口时传入映射解析器，保留默认类型。用生产 Parser 测试空任务类型、自定义通信别名、COMMUNICATION 单次缩放和额外指标。 |
+| P1 · Parser 窗口内实例被漏计，缺失时间戳被当成 0 | `opt_discovery/parsers/csv_mapping.py:419`、`:445`、`:462`、`:501`；`opt_discovery/events.py:184`、`:191` | 窗口 `[1000,3000]` 内有带 CSV 引号的 `"1,020" / "1,000"`、0 时长和 `N/A` 时间戳三行。`e8630ef` 保留前两行并记 `outside=0, skipped=1`，`62e661a` 得空表、`outside=3, skipped=0`。缺少时间戳列的 CSV 放入 `[0,100]` 时，旧版跳过并记该轮 0 行，新版按起点 0 纳入并记该轮 1 行。现有数字格式、调用数和缺失轮次判定均受影响。 | 共享行处理时沿用 Parser 的数字格式和零时长规则。区分缺时钟、缺时长和真正窗口外的行，保持原统计与告警，窗口筛选禁止使用合成起点。 |
+| P1 · Host 并集把合法端点 0 当成缺失 | `opt_discovery/analyzer/timeline.py:670`、`:683`、`:709` | `summarize` 在 `[100,200] µs` 内按既有相交口径纳入 `[90,100]`、`[130,140]` 两次 Host 调用。旧版与完整区间并集预期均为 20 µs，新版为 50 µs。第一段结束于相对坐标 0，`host_seg_end or start` 把两段之间的空白算进 busy。 | 用显式 `None` 检查判断并集端点是否初始化，并给真实 `summarize` 增加左边界与分离调用的回归。 |
+| P1 · epoch 精度仍在裁剪、区间和窗口质量计算时丢失 | `opt_discovery/primitives.py:69`、`:83`；`opt_discovery/events.py:378`、`:438`；`opt_discovery/analyzer/timeline.py:516`、`:670`；`opt_discovery/parsers/csv_mapping.py:491` | 设 `E=1_790_000_000_000_000 µs`。从 `E` 开始的 0.3 µs 事件裁到 `E+0.25` 后仍返回 0.3 µs。两条相邻的 100 ns TASK 和 CANN_API 记录在有窗 Timeline 中各只计 0.1 µs，预期各 0.2 µs，两个起点在换算绝对浮点 µs 时已合并。无窗 Timeline 对单条 100 ns 仍输出 device/Host busy 0/0。生产 Parser 对 0.5 µs 窗口里的 0.1 µs 任务保留算子时长，却报告窗口 busy 为 0 并误标 `degraded`，预期 busy ratio 为 20%。 | 用相对坐标计算裁剪，并在 SQLite 整数时钟上先减共同原点再换算。窗口和无窗聚合保持 device、Host、MSTX 同一坐标约定，Parser 的 busy 计量用相对起点和标准化时长。对实际消费者断言裁剪上限、两段独立区间、无窗 busy 与窗口质量。 |
+
+本次未发现 P0。上轮已关闭的事件身份和点窗口包装维持原结论。上轮关于整任务时长与窗口 busy 的历史口径及 P3 记录仍为非阻断项。
+
+### 实际验证
+
+| 命令 | 结果 |
+|---|---|
+| `git diff --check e8630ef HEAD` | PASS，退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 make check` | PASS，Ruff、mypy（53 文件）、配置验证通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae04-final-demo.UJOyPk` | PASS，306 passed、17 skipped，合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，63 passed，包含指定六组回归。 |
+| 在 `git archive e8630ef` 的临时副本中只移入新版 `tests/test_events.py`，以 `pytest -k 'summarize_epoch_short_event_has_busy or window_clip_drops_event_at_right_boundary or summarize_handles_unordered_slices or parser_and_reader_share_epoch_normalization'` 执行 | 旧版 3 failed、1 passed、13 deselected。前三例分别捕获旧版短事件、右边界、乱序错误。Parser/Reader 时长相等用例在旧版同样通过，共享调用路径由当前生产代码对照确认。 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-delta-probe.lriJLZ.py`，及在当前和隔离的上一提交运行 `/tmp/ae04-final-probe.6uBVXI/probe.py` | 通过真实 Parser、Reader 和 Timeline 重跑旧反例并对照最新变化。排序、右边界起点和原单条有窗样例通过，新增或剩余不符见阻断项。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，未配置真实数据根目录。退出 0 仅说明缺数据闸门正常。真实 Profiling 未执行，NPU、托管 CI 未运行。 |

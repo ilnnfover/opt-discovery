@@ -420,35 +420,54 @@ class MappingCsvParser:
                         start_pos = file_columns.fields.get("row_start_time")
                         duration_pos = file_columns.fields.get("total_time_us")
                         if duration_pos is not None:
-                            row_metrics = normalize_instance_row(
-                                row,
-                                start_idx=start_pos,
-                                duration_idx=duration_pos,
-                                type_idx=file_columns.fields.get("task_type"),
-                                operator_idx=file_columns.fields.get("operator"),
-                                start_scale=(
-                                    _to_us(
-                                        1.0,
-                                        self.mapping.fields["row_start_time"].unit,
-                                    )
-                                    if start_pos is not None
-                                    and "row_start_time" in self.mapping.fields
-                                    else 1.0
-                                ),
-                                duration_scale=_to_us(
-                                    1.0, self.mapping.fields["total_time_us"].unit
-                                ),
-                                window=window,
-                                # Parser 保留“起点在窗口内”的历史策略
-                                policy="start" if window is not None else "intersect",
+                            start_scale = (
+                                _to_us(
+                                    1.0,
+                                    self.mapping.fields["row_start_time"].unit,
+                                )
+                                if start_pos is not None
+                                and "row_start_time" in self.mapping.fields
+                                else 1.0
                             )
-                            if row_metrics is None:
-                                if window is not None:
-                                    rows_outside += 1
+                            duration_scale = _to_us(
+                                1.0, self.mapping.fields["total_time_us"].unit
+                            )
+                            if window is not None:
+                                # 保持旧语义：缺起点先记 skipped，不当作窗口外
+                                timestamp = _row_start(file_columns, row, self.mapping)
+                                if timestamp is None:
+                                    meta.skipped_rows += 1
+                                    meta.add_warning(
+                                        "row_without_start",
+                                        "缺少可解析的时间戳，无法判断是否在窗口内，已跳过",
+                                        f"{file.name}:{line_no}",
+                                    )
                                     continue
-                            else:
-                                timestamp = row_metrics.start_us
-                                if window is not None:
+                                row_metrics = normalize_instance_row(
+                                    row,
+                                    start_idx=start_pos,
+                                    duration_idx=duration_pos,
+                                    type_idx=file_columns.fields.get("task_type"),
+                                    operator_idx=file_columns.fields.get("operator"),
+                                    start_scale=start_scale,
+                                    duration_scale=duration_scale,
+                                    window=None,
+                                    number_parser=_to_float,
+                                    allow_zero_duration=True,
+                                )
+                                if row_metrics is not None and row_metrics.start_us != timestamp:
+                                    timestamp = row_metrics.start_us
+                                if row_metrics is not None:
+                                    span = window_span(
+                                        timestamp,
+                                        row_metrics.duration_us,
+                                        window,
+                                        policy="start",
+                                    )
+                                    if span is None:
+                                        rows_outside += 1
+                                        continue
+                                    timestamp = span[0]
                                     for (
                                         round_index,
                                         round_start,
@@ -459,6 +478,19 @@ class MappingCsvParser:
                                                 round_counts.get(round_index, 0) + 1
                                             )
                                             break
+                            else:
+                                row_metrics = normalize_instance_row(
+                                    row,
+                                    start_idx=start_pos,
+                                    duration_idx=duration_pos,
+                                    type_idx=file_columns.fields.get("task_type"),
+                                    operator_idx=file_columns.fields.get("operator"),
+                                    start_scale=start_scale,
+                                    duration_scale=duration_scale,
+                                    window=None,
+                                    number_parser=_to_float,
+                                    allow_zero_duration=True,
+                                )
                     elif window is not None:
                         timestamp = _row_start(file_columns, row, self.mapping)
                         if timestamp is None:
@@ -489,7 +521,10 @@ class MappingCsvParser:
                         duration_override=row_metrics.duration_us if row_metrics else None,
                     )
                     if timestamp is not None and duration is not None:
-                        union.add(timestamp, timestamp + duration)
+                        # 窗口内 busy 用相对坐标累计，避免 epoch 加法吞掉亚微秒时长
+                        origin = window.start_us if window is not None else 0.0
+                        relative = timestamp - origin
+                        union.add(relative, relative + duration)
                 meta.extra["files"].append({"path": str(file), "rows": rows_in_file})
 
         records = [

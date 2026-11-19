@@ -21,6 +21,7 @@ from opt_discovery.events import (
 )
 from opt_discovery.primitives import (
     COMMUNICATION_DURATION_SCALE,
+    NS_PER_US,
     Interval,
     Window,
 )
@@ -398,3 +399,161 @@ def test_parser_and_reader_share_epoch_normalization(tmp_path: Path) -> None:
     )
     assert parser_total == pytest.approx(0.2)
     assert reader_total == pytest.approx(0.2)
+
+
+def _summary_parser(tmp_path: Path):
+    from opt_discovery.parsers.csv_mapping import CsvMapping, MappingCsvParser
+    from opt_discovery.schemas.workload import WorkloadSpec
+
+    parser = MappingCsvParser(
+        CsvMapping.load(
+            Path(__file__).resolve().parent.parent
+            / "configs"
+            / "parsers"
+            / "ascend_op_summary.yaml"
+        )
+    )
+    workload = WorkloadSpec.from_dict(
+        {
+            "workload_id": "wl",
+            "model": {"name": "m", "dtype": "bfloat16"},
+            "hardware": {"device": "Ascend 910B", "device_count": 1},
+            "execution": {"phase": "prefill", "mode": "eager"},
+            "input": {"batch_size": 1, "input_length": 1024},
+            "verified": True,
+        }
+    )
+    return parser, workload
+
+
+def test_parser_keeps_number_format_zero_and_missing_timestamp(tmp_path: Path) -> None:
+    """P1 · Parser 回归：千分位、零时长、N/A 起点的旧语义必须保留。"""
+    parser, workload = _summary_parser(tmp_path)
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        '0,MatMul,AI_CORE,"1,020","1,000"\n'
+        "0,MatMul,AI_CORE,1500,0\n"
+        "0,MatMul,AI_CORE,N/A,100\n",
+        encoding="utf-8",
+    )
+    window = Window(1000.0, 3000.0, rounds=(1,), round_spans=((1, 1000.0, 3000.0),))
+    table = parser.parse(path, workload, window=window)
+
+    assert table.records[0].calls == 2
+    assert table.meta.skipped_rows == 1
+    assert table.meta.extra["rows_outside_window"] == 0
+    assert table.meta.extra["round_row_counts"] == {1: 2}
+
+    # 表头缺起点列：保持“跳过 + 该轮 0 行”，不得用合成起点 0 计入窗口
+    missing = tmp_path / "op_summary_2.csv"
+    missing.write_text(
+        "Device_id,OP Type,Task Type,Task Duration(us)\n"
+        "0,MatMul,AI_CORE,100\n",
+        encoding="utf-8",
+    )
+    table2 = parser.parse(missing, workload, window=window)
+    assert table2.meta.skipped_rows == 1
+    assert table2.meta.extra["rows_outside_window"] == 0
+    assert table2.meta.extra["round_row_counts"] == {1: 0}
+
+
+def test_host_union_treats_zero_relative_end_as_valid(tmp_path: Path) -> None:
+    """P1 · Host 并集：相对坐标 0 是合法端点，不能当作未初始化。"""
+    db = _prof_with_csv(tmp_path, ["0,MatMul,AI_CORE,150,10"])
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "insert into CANN_API values (1, ?, ?)", (90_000, 100_000)
+    )
+    connection.execute(
+        "insert into CANN_API values (1, ?, ?)", (130_000, 140_000)
+    )
+    connection.commit()
+    connection.close()
+    window = Window(100.0, 200.0, rounds=(1,))
+
+    summary = timeline.summarize(db, window)
+
+    assert summary.host_acl_calls == 2
+    assert summary.host_acl_busy_us == pytest.approx(20.0)
+
+
+def test_epoch_clip_is_bounded_by_window_end(tmp_path: Path) -> None:
+    epoch = 1_790_000_000_000_000.0
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "DeviceId,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch},0.3\n".replace("DeviceId", "Device_id"),
+        encoding="utf-8",
+    )
+    window = Window(epoch, epoch + 0.25, rounds=(1,))
+    events = list(iter_op_summary_events(path, window=window, clip=True))
+    assert [event.duration_us for event in events] == pytest.approx([0.25])
+
+
+def test_epoch_adjacent_ns_events_keep_both_durations(tmp_path: Path) -> None:
+    epoch = 1_790_000_000_000_000.0
+    ns = int(epoch * NS_PER_US)
+    db = tmp_path / "PROF_000000_test" / "msprof_0.db"
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    for offset in (0, 100):
+        connection.execute(
+            "insert into TASK values (?, ?)", (ns + offset, ns + offset + 100)
+        )
+        connection.execute(
+            "insert into CANN_API values (1, ?, ?)",
+            (ns + offset, ns + offset + 100),
+        )
+    connection.commit()
+    connection.close()
+    window = Window(epoch, epoch + 1.0, rounds=(1,))
+
+    summary = timeline.summarize(db, window)
+
+    assert summary.task_count == 2
+    assert summary.device_busy_us == pytest.approx(0.2)
+    assert summary.host_acl_busy_us == pytest.approx(0.2)
+
+
+def test_no_window_single_ns_event_has_busy(tmp_path: Path) -> None:
+    epoch = 1_790_000_000_000_000.0
+    ns = int(epoch * NS_PER_US)
+    db = tmp_path / "PROF_000000_test" / "msprof_0.db"
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    connection.execute("insert into TASK values (?, ?)", (ns, ns + 100))
+    connection.execute("insert into CANN_API values (1, ?, ?)", (ns, ns + 100))
+    connection.commit()
+    connection.close()
+
+    summary = timeline.summarize(db, None)
+
+    assert summary.task_count == 1
+    assert summary.device_busy_us == pytest.approx(0.1)
+    assert summary.host_acl_busy_us == pytest.approx(0.1)
+
+
+def test_parser_window_quality_uses_relative_busy(tmp_path: Path) -> None:
+    epoch = 1_790_000_000_000_000.0
+    parser, workload = _summary_parser(tmp_path)
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch},0.1\n",
+        encoding="utf-8",
+    )
+    window = Window(epoch, epoch + 0.5, rounds=(1,), round_spans=((1, epoch, epoch + 0.5),))
+    table = parser.parse(path, workload, window=window)
+
+    quality = table.meta.extra["window_quality"]
+    assert quality["busy_ratio"] == pytest.approx(0.2)
+    assert quality["degraded"] is False

@@ -474,11 +474,11 @@ def _rank_intervals(
         intervals.sort(key=lambda item: item.start_us)
         return intervals, "op_summary", str(paths[0])
     try:
-        spans = list(iter_task_span_rows(db_path, window=window))
+        spans = list(iter_task_span_rows(db_path, window=window, origin_us=origin))
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
     return (
-        [Interval(start - origin, start - origin + duration) for start, duration in spans],
+        [Interval(start, start + duration) for start, duration in spans],
         "task_table",
         None,
     )
@@ -504,16 +504,24 @@ def _rank_summary(db_path: str | Path, window: Window, span_us: float) -> dict:
 
 def _device_gap_stats(
     db_path: str | Path, window: Window | None, min_gap_us: float
-) -> tuple[float, float, int, list[float], list[tuple[float, float]]]:
+) -> tuple[float, float, int, list[float], list[tuple[float, float]], float]:
     """Stream TASK spans: busy union, gap durations, and gaps >= threshold."""
     busy = 0.0
     durations: list[float] = []
     big_gaps: list[tuple[float, float]] = []
     tasks = 0
+    origin = 0.0
+    first = True
     segment_start: float | None = None
     segment_end: float | None = None
     try:
-        for start, duration in iter_task_span_rows(db_path, window=window):
+        for start, duration in iter_task_span_rows(
+            db_path, window=window, origin_us=None
+        ):
+            if first:
+                origin = start
+                start = 0.0
+                first = False
             end = start + duration
             tasks += 1
             if segment_start is None:
@@ -535,13 +543,15 @@ def _device_gap_stats(
         busy += segment_end - segment_start
     if tasks == 0:
         raise TimelineError(f"{db_path}: 窗口内没有 device task，无法分析")
-    return busy, tasks, len(durations), durations, big_gaps
+    return busy, tasks, len(durations), durations, big_gaps, origin
 
 
-def _host_stream(db_path: str | Path, window: Window | None):
-    """Yield (start_us, end_us, name) in start order via the shared reader."""
+def _host_stream(
+    db_path: str | Path, window: Window | None, origin_us: float | None = 0.0
+):
+    """Yield (start_us, duration_us, name) in start order via the shared reader."""
     try:
-        yield from iter_host_spans(db_path, window=window)
+        yield from iter_host_spans(db_path, window=window, origin_us=origin_us)
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
 
@@ -591,6 +601,8 @@ def summarize(
     merge-joined against the recorded gaps, so memory stays bounded.
     """
     per_rank: tuple[dict, ...] = ()
+    #: None = 无窗口时由 Host 读取器以首个 Host 调用为原点
+    gap_origin: float | None = None
     busy_all = 0.0
     asymmetry = 0.0
     duration_inconsistent = False
@@ -634,6 +646,7 @@ def summarize(
             if busy_source != "op_summary":
                 task_fallback_ranks = [Path(db_path).name]
             merged = _merge(intervals)
+            gap_origin = window.start_us
             device_busy = sum(end - start for start, end in merged)
             gap_durations, big_gaps = _gaps_from_merged(
                 merged, window.duration_us, min_gap_us, top_n
@@ -641,9 +654,14 @@ def summarize(
             gap_count = len(gap_durations)
             tasks = len(intervals)
         else:
-            device_busy, tasks, gap_count, gap_durations, big_gaps = _device_gap_stats(
-                db_path, window, min_gap_us
-            )
+            (
+                device_busy,
+                tasks,
+                gap_count,
+                gap_durations,
+                big_gaps,
+                _device_origin,
+            ) = _device_gap_stats(db_path, window, min_gap_us)
 
     if window is not None:
         span = window.duration_us
@@ -652,6 +670,7 @@ def summarize(
     span = max(span, 0.0)
     device_idle = max(0.0, span - device_busy)
 
+    mstx_origin = gap_origin if gap_origin is not None else 0.0
     # 同一 gap 内可能有多线程并发事件，必须取「并集」而不是累加，否则会超过 100%
     overlaps = [0.0] * len(big_gaps)
     gap_seg_start = [None] * len(big_gaps)
@@ -667,9 +686,9 @@ def summarize(
     gap_ends = [item[1] for item in big_gaps]
     cursor = 0
 
-    origin = window.start_us if window is not None else 0.0
-    for start_abs, duration, name in _host_stream(db_path, window):
-        start = start_abs - origin
+    for start, duration, name in _host_stream(
+        db_path, window, origin_us=gap_origin
+    ):
         end = start + duration
         host_calls += 1
         bucket = name_counts.setdefault(name, [0, 0.0])
@@ -680,12 +699,12 @@ def summarize(
             submit_time += duration
 
         # 全局 Host 忙碌并集
-        if host_seg_start is None:
+        if host_seg_start is None or host_seg_end is None:
             host_seg_start, host_seg_end = start, end
-        elif start <= (host_seg_end or start):
-            host_seg_end = max(host_seg_end or end, end)
+        elif start <= host_seg_end:
+            host_seg_end = max(host_seg_end, end)
         else:
-            host_busy += (host_seg_end or start) - host_seg_start
+            host_busy += host_seg_end - host_seg_start
             host_seg_start, host_seg_end = start, end
 
         if not big_gaps:
@@ -706,8 +725,8 @@ def summarize(
                     gap_seg_start[index], gap_seg_end[index] = a, b
             index += 1
 
-    if host_seg_start is not None:
-        host_busy += (host_seg_end or host_seg_start) - host_seg_start
+    if host_seg_start is not None and host_seg_end is not None:
+        host_busy += host_seg_end - host_seg_start
     for index in range(len(big_gaps)):
         seg_start = gap_seg_start[index]
         if seg_start is not None:
@@ -750,12 +769,13 @@ def summarize(
         for gap_start, gap_end in silent_gaps:
             pieces = [
                 (
-                    max(gap_start, item.start_us - origin),
-                    min(gap_end, item.end_us - origin),
+                    max(gap_start, item.start_us - mstx_origin),
+                    min(gap_end, item.end_us - mstx_origin),
                     item.name,
                 )
                 for item in mstx_ranges
-                if item.end_us - origin > gap_start and item.start_us - origin < gap_end
+                if item.end_us - mstx_origin > gap_start
+                and item.start_us - mstx_origin < gap_end
             ]
             if not pieces:
                 continue
