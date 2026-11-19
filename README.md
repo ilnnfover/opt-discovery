@@ -383,6 +383,8 @@ python -m opt_discovery.cli check-collection --dir $PROF_ROOT/unified
 
 ```
 opt_discovery/
+├── primitives.py     低层时间/区间类型（Window/Interval），不依赖 analyzer
+├── events.py         共享 KernelEvent / TASK / Host 事件读取器（流式）
 ├── schemas/          数据契约：单位/指标+来源/算子表/Workload/证据/机会
 ├── collectors/       目录发现、workload.log 轮次、MSTX 打点
 ├── parsers/          CSV（映射驱动、流式、多切片）、sqlite 回填、合成数据
@@ -399,7 +401,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                306 个用例（289 个 CPU 用例 + 17 个真实数据集成用例）
+tests/                335 个用例（318 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -422,7 +424,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 289 passed, 17 skipped（缺真实导出时）
+python -m pytest -q                      # 318 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检

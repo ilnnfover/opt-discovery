@@ -31,16 +31,14 @@ from ..schemas.operator import OperatorRecord, OperatorTable, ParseMeta, TaskTyp
 from ..schemas.workload import WorkloadSpec
 from .base import ParserCapabilities, ParserError
 
-if TYPE_CHECKING:  # pragma: no cover - 仅类型检查，避免 parsers <-> analyzer 循环导入
-    from ..analyzer.window import Window
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
+    from ..primitives import Window
 
-#: profiler 的 ``Task Duration(us)`` 列里，COMMUNICATION 行实际是 ns，
-#: 其余类型（AI_CORE / AI_VECTOR_CORE / MIX_AIC ...）是 us。
-#: 实测 decode-eager：9685 行通信累计 3.399e10，按 ns=34s 与 48s 窗口自洽；
-#: 按 us 解释则是 33990s，物理上不可能。
-COMMUNICATION_DURATION_SCALE = 0.001
+from ..events import normalize_instance_row
+from ..primitives import COMMUNICATION_DURATION_SCALE, normalize_duration, window_span
 
 __all__ = [
+    "COMMUNICATION_DURATION_SCALE",
     "ColumnSpec",
     "ExtraMetricSpec",
     "AggregateSpec",
@@ -416,7 +414,88 @@ class MappingCsvParser:
                 for line_no, row in enumerate(reader, start=2):
                     meta.row_count += 1
                     rows_in_file += 1
-                    if window is not None:
+                    row_metrics = None
+                    timestamp = None
+                    if self.mapping.row_semantics == "instance":
+                        start_pos = file_columns.fields.get("row_start_time")
+                        duration_pos = file_columns.fields.get("total_time_us")
+                        if duration_pos is not None:
+                            start_scale = (
+                                _to_us(
+                                    1.0,
+                                    self.mapping.fields["row_start_time"].unit,
+                                )
+                                if start_pos is not None
+                                and "row_start_time" in self.mapping.fields
+                                else 1.0
+                            )
+                            duration_scale = _to_us(
+                                1.0, self.mapping.fields["total_time_us"].unit
+                            )
+                            if window is not None:
+                                # 保持旧语义：先按有效起点筛窗口/轮次，再处理时长
+                                timestamp = _row_start(file_columns, row, self.mapping)
+                                if timestamp is None:
+                                    meta.skipped_rows += 1
+                                    meta.add_warning(
+                                        "row_without_start",
+                                        "缺少可解析的时间戳，无法判断是否在窗口内，已跳过",
+                                        f"{file.name}:{line_no}",
+                                    )
+                                    continue
+                                span = window_span(
+                                    timestamp, 0.0, window, policy="start"
+                                )
+                                if span is None:
+                                    rows_outside += 1
+                                    continue
+                                timestamp = span[0]
+                                for (
+                                    round_index,
+                                    round_start,
+                                    round_end,
+                                ) in window.round_spans:
+                                    if round_start <= timestamp <= round_end:
+                                        round_counts[round_index] = (
+                                            round_counts.get(round_index, 0) + 1
+                                        )
+                                        break
+                                type_pos = file_columns.fields.get("task_type")
+                                row_metrics = normalize_instance_row(
+                                    row,
+                                    start_idx=start_pos,
+                                    duration_idx=duration_pos,
+                                    task_type_override=self._resolve_task_type(
+                                        row[type_pos]
+                                        if type_pos is not None and type_pos < len(row)
+                                        else None
+                                    ),
+                                    operator_idx=file_columns.fields.get("operator"),
+                                    start_scale=start_scale,
+                                    duration_scale=duration_scale,
+                                    window=None,
+                                    number_parser=_to_float,
+                                    allow_zero_duration=True,
+                                )
+                            else:
+                                type_pos = file_columns.fields.get("task_type")
+                                row_metrics = normalize_instance_row(
+                                    row,
+                                    start_idx=start_pos,
+                                    duration_idx=duration_pos,
+                                    task_type_override=self._resolve_task_type(
+                                        row[type_pos]
+                                        if type_pos is not None and type_pos < len(row)
+                                        else None
+                                    ),
+                                    operator_idx=file_columns.fields.get("operator"),
+                                    start_scale=start_scale,
+                                    duration_scale=duration_scale,
+                                    window=None,
+                                    number_parser=_to_float,
+                                    allow_zero_duration=True,
+                                )
+                    elif window is not None:
                         timestamp = _row_start(file_columns, row, self.mapping)
                         if timestamp is None:
                             meta.skipped_rows += 1
@@ -426,7 +505,7 @@ class MappingCsvParser:
                                 f"{file.name}:{line_no}",
                             )
                             continue
-                        if not window.contains(timestamp):
+                        if window_span(timestamp, 0.0, window, policy="start") is None:
                             rows_outside += 1
                             continue
                         for round_index, round_start, round_end in window.round_spans:
@@ -435,13 +514,21 @@ class MappingCsvParser:
                                     round_counts.get(round_index, 0) + 1
                                 )
                                 break
-                    else:
-                        timestamp = None
                     duration = self._accumulate(
-                        row, file_columns, groups, meta, file, line_no
+                        row,
+                        file_columns,
+                        groups,
+                        meta,
+                        file,
+                        line_no,
+                        task_type_override=row_metrics.task_type if row_metrics else None,
+                        duration_override=row_metrics.duration_us if row_metrics else None,
                     )
                     if timestamp is not None and duration is not None:
-                        union.add(timestamp, timestamp + duration)
+                        # 窗口内 busy 用相对坐标累计，避免 epoch 加法吞掉亚微秒时长
+                        origin = window.start_us if window is not None else 0.0
+                        relative = timestamp - origin
+                        union.add(relative, relative + duration)
                 meta.extra["files"].append({"path": str(file), "rows": rows_in_file})
 
         records = [
@@ -585,6 +672,9 @@ class MappingCsvParser:
         meta: ParseMeta,
         file: Path,
         line_no: int,
+        *,
+        task_type_override: TaskType | None = None,
+        duration_override: float | None = None,
     ) -> float | None:
         """Fold one row into its group; returns the row duration in us if known."""
         operator_index = columns.fields.get("operator")
@@ -599,7 +689,7 @@ class MappingCsvParser:
             return None
 
         task_type_index = columns.fields.get("task_type")
-        task_type = self._resolve_task_type(
+        task_type = task_type_override or self._resolve_task_type(
             row[task_type_index]
             if task_type_index is not None and task_type_index < len(row)
             else None
@@ -627,16 +717,17 @@ class MappingCsvParser:
 
         group.task_types[task_type] = group.task_types.get(task_type, 0) + 1
 
-        duration = None
+        duration = duration_override
         total_index = columns.fields.get("total_time_us")
-        if total_index is not None:
+        if duration is None and total_index is not None:
             value = _to_float(row[total_index] if total_index < len(row) else None)
             if value is not None:
-                duration = _to_us(value, self.mapping.fields["total_time_us"].unit)
-                # profiler 的 Task Duration 列，COMMUNICATION 行实际是 ns，
-                # 其余（AI_CORE/AI_VECTOR_CORE/...）是 us。见 README「通信时长单位」。
-                if task_type is TaskType.COMMUNICATION:
-                    duration *= COMMUNICATION_DURATION_SCALE
+                # 单位换算 + COMMUNICATION ns 缩放由 primitives 统一处理，
+                # 与 events.py 的实例读取器共用同一入口。
+                duration = normalize_duration(
+                    _to_us(value, self.mapping.fields["total_time_us"].unit),
+                    task_type=task_type,
+                )
 
         if self.mapping.row_semantics == "instance":
             if duration is None:
@@ -914,7 +1005,7 @@ class _Group:
 
 
 def _busy_union():
-    from ..analyzer.window import IntervalUnion
+    from ..primitives import IntervalUnion
 
     return IntervalUnion()
 
