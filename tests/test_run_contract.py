@@ -1348,9 +1348,9 @@ def test_external_manifest_drives_downstream_commands(tmp_path: Path) -> None:
         == 0
     )
 
-    # 未指定清单且没有默认清单：拒绝扫描（避免读回旧 4 MiB）
-    assert main(["summary", "--dir", str(out)]) == 1
-    assert main(["report", "--dir", str(out), "--out", str(tmp_path / "r.md")]) == 1
+    # 未指定清单时，默认位置的指针指向本轮外置清单，不能读回旧 4 MiB
+    assert main(["summary", "--dir", str(out)]) == 0
+    assert main(["report", "--dir", str(out), "--out", str(tmp_path / "r.md")]) == 0
 
     assert main(["summary", "--dir", str(out), "--manifest", str(external)]) == 0
     rows = (out / "workload_summary.csv").read_text(encoding="utf-8-sig").splitlines()
@@ -1388,3 +1388,133 @@ def test_corrupt_or_missing_manifest_is_not_silently_ignored(tmp_path: Path) -> 
     legacy.mkdir()
     assert main(["summary", "--dir", str(legacy)]) == 1
     assert main(["summary", "--dir", str(legacy), "--allow-legacy"]) == 0
+
+
+def _a1_scenario(
+    tmp_path: Path, scenario: str, target_name: str
+) -> tuple[list[str], int, dict[str, Path]]:
+    """构造 A1 的四种早期失败，返回 CLI 参数、期望退出码和输入路径。"""
+    exports = tmp_path / "exports"
+    workloads = tmp_path / "workloads"
+    workloads.mkdir()
+    out = tmp_path / "out"
+    raw = yaml.safe_load((WORKLOAD_DIR / "prefill_eager.yaml").read_text(encoding="utf-8"))
+    raw["hardware"]["device_count"] = 1
+    (workloads / "prefill_eager.yaml").write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+    if scenario == "discover_failure":
+        _write_export(exports, "qwen35-prefill")
+    elif scenario == "output_dir_failure":
+        _write_export(exports, "qwen35-prefill")
+        out.write_text("not a directory", encoding="utf-8")
+    else:
+        _write_export(exports, "qwen35-prefill")
+        if scenario == "duplicate_ids":
+            (workloads / "duplicate.yaml").write_text(
+                yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+            )
+        elif scenario == "bad_yaml":
+            (workloads / "broken.yaml").write_text("hardware: [unclosed", encoding="utf-8")
+        else:  # pragma: no cover
+            raise AssertionError(scenario)
+
+    export = exports / "qwen35-prefill"
+    prof = export / "PROF_000000_test"
+    paths = {
+        "op_summary_1.csv": prof / "mindstudio_profiler_output" / "op_summary_1.csv",
+        "msprof_0.db": prof / "msprof_0.db",
+        "workload.log": export / "workload.log",
+    }
+    args = _args(
+        exports,
+        workloads,
+        out,
+        "--strict",
+        "--manifest",
+        str(paths[target_name]),
+    )
+    return args, 1, paths
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["duplicate_ids", "bad_yaml", "discover_failure", "output_dir_failure"],
+)
+@pytest.mark.parametrize("target_name", ["op_summary_1.csv", "msprof_0.db", "workload.log"])
+def test_early_failures_never_modify_collection_inputs(
+    tmp_path: Path, scenario: str, target_name: str, monkeypatch
+) -> None:
+    """A1：重复 ID/坏 YAML/发现失败/输出目录失败都不得改动 CSV/DB/日志。"""
+    args, expected, paths = _a1_scenario(tmp_path, scenario, target_name)
+    before = {name: path.read_bytes() for name, path in paths.items()}
+    if scenario == "discover_failure":
+
+        def _boom(*args, **kwargs):
+            raise OSError("synthetic discovery failure")
+
+        monkeypatch.setattr("opt_discovery.cli.discover_all", _boom)
+
+    code = main(args)
+    assert code == expected
+    for name, path in paths.items():
+        assert path.read_bytes() == before[name], f"{scenario}: {name} 被修改"
+
+
+def test_old_default_manifest_is_replaced_by_pointer(tmp_path: Path) -> None:
+    """A6：旧默认清单不得继续生效；新外置清单应通过默认位置指针被发现。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    assert json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))["status"] == "success"
+
+    stale = out / "qwen35-35b-a3b-prefill-eager" / "comm.json"
+    stale.write_text(json.dumps({"mib_total": 4.0, "unique_tasks": 1}), encoding="utf-8")
+    (exports / "qwen35-prefill" / "PROF_000000_test" / "msprof_0.db").unlink()
+    external = tmp_path / "manifests" / "run.json"
+    assert (
+        main(
+            _args(
+                exports,
+                workloads,
+                out,
+                "--strict",
+                "--skip-timeline",
+                "--manifest",
+                str(external),
+            )
+        )
+        == 0
+    )
+
+    pointer = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+    assert pointer.get("pointer")
+    assert main(["summary", "--dir", str(out)]) == 0
+    rows = (out / "workload_summary.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert not any("4.0" in row for row in rows)
+    assert main(["check-manifest", "--path", str(external)]) == 0
+    assert main(["check-manifest", "--path", str(out / "run_manifest.json")]) == 0
+
+
+def test_invalid_manifest_blocks_downstream_and_preserves_state(tmp_path: Path) -> None:
+    """A6：无效清单必须报错，不得改写 CSV 或破坏当前有效清单。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    external = tmp_path / "manifests" / "run.json"
+    assert main(_args(exports, workloads, out, "--strict", "--manifest", str(external))) == 0
+    csv_before = (out / "workload_summary.csv").read_bytes()
+
+    (out / "run_manifest.json").write_text("{bad json", encoding="utf-8")
+    assert main(["summary", "--dir", str(out)]) == 1
+    assert main(["report", "--dir", str(out), "--out", str(tmp_path / "r.md")]) == 1
+    assert (out / "workload_summary.csv").read_bytes() == csv_before
+    assert main(["check-manifest", "--path", str(external)]) == 0
+
+    (external).write_text("[]", encoding="utf-8")
+    assert main(["summary", "--dir", str(out), "--manifest", str(external)]) == 1
+    assert main(["report", "--dir", str(out), "--manifest", str(external), "--out", str(tmp_path / "r2.md")]) == 1

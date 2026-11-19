@@ -254,6 +254,12 @@ def verify_manifest(path: str | Path) -> list[str]:
 
     if not isinstance(payload, dict):
         return [f"清单不是 JSON 对象: {type(payload).__name__}"]
+    pointer = payload.get("pointer")
+    if isinstance(pointer, str) and pointer:
+        resolved = (manifest_path.parent / pointer).resolve()
+        if not resolved.is_file():
+            return [f"清单指针指向的文件不存在: {pointer}"]
+        return verify_manifest(resolved)
 
     problems: list[str] = []
     if str(payload.get("schema_version")) != SCHEMA_VERSION:
@@ -388,6 +394,55 @@ def tool_info(repo_root: Path | None = None) -> dict[str, Any]:
     return info
 
 
+def write_manifest_pointer(default_path: str | Path, target: str | Path) -> Path:
+    """在默认位置写一个指向自定义清单的指针（避免下游读到旧默认清单）。"""
+    default = Path(default_path)
+    target_path = Path(target)
+    default.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "pointer": os.path.relpath(target_path.resolve(), default.parent.resolve()).replace(
+            os.sep, "/"
+        ),
+    }
+    try:
+        run_id = json.loads(target_path.read_text(encoding="utf-8")).get("run_id")
+        if run_id:
+            payload["run_id"] = run_id
+    except (OSError, ValueError):
+        pass
+    handle, tmp_name = tempfile.mkstemp(
+        dir=default.parent, prefix=f".{default.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, default)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return default
+
+
+def resolve_manifest_path(path: str | Path) -> Path:
+    """如果给定的清单是 pointer，返回它指向的真实清单路径。"""
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return target
+    pointer = payload.get("pointer") if isinstance(payload, dict) else None
+    if not isinstance(pointer, str) or not pointer:
+        return target
+    resolved = (target.parent / pointer).resolve()
+    return resolved
+
+
 def fingerprint_configs(paths: Sequence[Path]) -> list[dict[str, Any]]:
     """配置指纹：只记文件名 + sha256，不写绝对路径；缺失/不可读即失败。"""
     items: list[dict[str, Any]] = []
@@ -409,6 +464,8 @@ def artifact_allowlist(manifest_path: str | Path) -> set[str] | None:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if not isinstance(payload, dict):
+        return None
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, list):
         return None
@@ -426,6 +483,8 @@ def manifest_workload_ids(manifest_path: str | Path) -> set[str]:
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return set()
+    if not isinstance(payload, dict):
         return set()
     return {
         item["workload_id"]
@@ -509,6 +568,8 @@ __all__ = [
     "fingerprint_configs",
     "manifest_workload_ids",
     "refresh_manifest_artifacts",
+    "resolve_manifest_path",
+    "write_manifest_pointer",
     "new_run_id",
     "read_manifest",
     "sha256_of",

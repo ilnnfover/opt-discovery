@@ -1,6 +1,6 @@
 # AE-03 独立验收 Review
 
-> 最新结论见文末「A1～A6 整批复验」。`1206818` 的 AE-03 合并验收为 **FAIL**。
+> 最新结论见文末「剩余 P1 复验」。`cea8074` 的 AE-03 合并验收为 **FAIL**。
 
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
@@ -245,3 +245,14 @@ B8 的同目录并发已在 README 明确为不支持，本轮在单进程运行
 - `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 退出 0，117 passed。
 - `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-close-probe.VXfLl4.py` 在临时目录独立运行标准 CLI，验证上述 A1、A6 的失败结果及默认清单的正例。
 - 真实 Profiling 用例在本机跳过，NPU 未运行。
+
+## 剩余 P1 复验（2026-11-19）
+
+**PR #2 暂缓合并，AE-03 验收仍为 FAIL。** 本轮只复验 `1206818..cea80742bf9b8f584fa142516d9859e4eb6c55f1` 对 A1、A6 的修复。原任务书允许 AE-04 不冲突的设计和测试并行，建议共用生产模块的重构以通过验收的基线为起点。
+
+| 项目 | 通过的场景 | 仍阻断的实测场景 |
+|---|---|---|
+| A1 输入保护 | 重复 workload ID 时，以原始 CSV 为 `--manifest`，退出 1 且原始字节保留。 | 一个有效 workload YAML 和一个语法损坏的 YAML 同时存在时，相同命令退出 1，却覆盖有效 workload 的原始 CSV。输出目录为普通文件时也复现。普通配置加载失败和 mkdir 失败分支的列表推导会因坏 YAML 丢掉可识别输入，随后仍写失败清单。应让所有失败结算都保护采集输入，或者在无法确立保护边界时禁用该目标。位置 `opt_discovery/cli.py:1364`、`:1514`。 |
+| A6 下游清单选择 | 显式传入外置清单后，summary/report 均成功，旧 4 MiB 未回到 CSV 或 Markdown，清单校验通过。默认清单缺失、JSON 截断或顶层数组时，两命令非零退出。 | 首轮写默认清单、次轮复用目录并改写外置清单后，旧默认清单仍被接受。无参数的 summary/report 都返回 0、呈现旧 4 MiB，之后最新外置清单校验失败。应明确记录输出目录对应的当前清单，或使较旧、与目录内容不匹配的默认清单无法被静默采用。位置 `opt_discovery/cli.py:894`、`:900`。 |
+
+`make check` 通过。`make verify DEMO_OUT=/tmp/ae03-accept-demo.pq6rXP` 退出 0，275 passed、17 skipped，合成演示通过。专项 `python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 通过 120 项。独立 CLI 探针 `/tmp/ae03-last-replay.nXTZw4.py` 在临时目录验证输入字节、CSV、报告和清单完整性。真实 Profiling 数据用例在本机跳过，NPU 未运行。

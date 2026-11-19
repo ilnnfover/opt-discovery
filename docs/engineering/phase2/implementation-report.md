@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**275 passed, 17 skipped**（292 用例，无 xfail）。
+全量：**289 passed, 17 skipped**（306 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 275 passed, 17 skipped（292 用例） |
+| `python -m pytest` | 0 | 289 passed, 17 skipped（306 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 275 passed, 17 skipped |
+| 3.11 全量 | 0 | 289 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -263,7 +263,7 @@ if blocking_flags:
 | P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
 | P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
 
 ## 13. 合并前复验修复（2026-11-19）
 
@@ -281,7 +281,7 @@ if blocking_flags:
 
 现在规则统一为：**清单不得与输入或本轮产物重合**；有冲突时优先退到同目录 `run_manifest.json`，无法安全落盘则不写并返回非零，绝不覆盖输入。
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
 
 ## 14. 合并前问题总表 · 批次 1（A1/A2/B1/B4）
 
@@ -304,7 +304,7 @@ if blocking_flags:
 | B1 校验边界 | 只校验 `artifacts` 项与部分顶层字段 | 没有要求 `stages` 存在/类型正确，也没有 success 的完成态约束 |
 | B4 重复 ID | 假定每个 YAML 的 `workload_id` 唯一 | `discover_all` 用字典按 ID 合并，重复时静默覆盖 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
 
 ## 15. 合并前问题总表 · 批次 2（A3/A4/A5/B3）
 
@@ -325,7 +325,7 @@ if blocking_flags:
 | A5 全局 scope | `same_scope = len({scopes}) == 1` 作用于全部 rank | 多 rank 时一个 full 表就会让同口径 pair 走中位数弱校验 |
 | B3 可选步骤 | comm 失败只 `print` | 清单没有对应阶段，无法区分“未请求/缺数据/失败” |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
 
 ## 16. 合并前问题总表 · 批次 3（A6/B2/B5/B6/B7）
 
@@ -349,7 +349,7 @@ if blocking_flags:
 
 B8（同目录并发/中断）本轮不修：单用户 CLI 无锁语义，已在 README 明确“同一输出目录不支持并发”，需要并发请使用独立目录。TOCTOU 的极端窗口仍属已知限制。
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
 
 ## 17. 输入保护与下游清单复验修复（2026-11-19）
 
@@ -366,4 +366,24 @@ B8（同目录并发/中断）本轮不修：单用户 CLI 无锁语义，已在
 | 外置清单不可见 | 下游只读默认 `<out>/run_manifest.json` | 没有 `--manifest` 入口；外置清单路径（`../`）无法用 out 目录相对路径匹配 |
 | 损坏清单静默 legacy | `artifact_allowlist` 失败返回 `None`，下游继续扫目录 | “清单无效”与“从未有清单”被混为一谈；缺失清单时自动 legacy 扫描会读回旧产物 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **275 passed, 17 skipped**（292 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。
+
+## 18. 验收条件专项修复（A1/A6，2026-11-19）
+
+| 验收项 | 场景 | 修复/证据 |
+|---|---|---|
+| A1 输入保护 | 重复 ID、坏 YAML、发现失败、输出目录创建失败 | 新增目录级保护：`exports_root` / `workloads_dir` 下的任何路径都视为输入（`_under`），`_collides` 直接阻断；早期失败（含 YAML 解析失败，此时无法枚举 workload）也不会把清单写到采集目录；`_protect_export_inputs` 仍用于精确登记。参数化回归覆盖 4 场景 × CSV/DB/日志，断言字节不变 |
+| A6 产物隔离 | 默认清单 | 默认清单直接生效；`summary`/`report` 只读登记产物，CSV 重建后刷新哈希，`check-manifest` 通过 |
+| A6 产物隔离 | 外置清单 | `--manifest` 显式指定；产物路径以清单父目录为根解析；回归断言不读回旧 4 MiB 且外置清单可校验 |
+| A6 产物隔离 | 旧默认清单 | 自定义清单写入后，在默认位置原子写**指针**（`{"pointer": ..., "run_id": ...}`）；下游解析指针，旧成功清单不再生效；`check-manifest` 支持指针 |
+| A6 产物隔离 | 无效清单 | 损坏的默认/外置清单直接返回 1，不回退目录扫描，不改写 CSV；无清单时默认拒绝，只有 `--allow-legacy` 才扫描旧目录 |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| 坏 YAML 仍可覆盖 CSV | 只在能加载 YAML 后按 `export_dir` 登记；坏 YAML 走 `_save` 前没有输入集 | 保护依赖“枚举成功”，没有目录级兜底 |
+| 旧默认清单继续生效 | 外置清单只写自定义路径，默认位置保持旧的完整清单 | 下游只认默认路径，无法发现本轮外置清单；没有指针/失效机制 |
+| 无效清单回退扫描 | `artifact_allowlist` 返回 `None` 后继续 legacy | “无清单”与“清单损坏”未区分；数组/空对象还会抛异常 |
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **289 passed, 17 skipped**（306 用例）。

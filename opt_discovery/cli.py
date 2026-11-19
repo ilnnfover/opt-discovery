@@ -73,10 +73,12 @@ from .experiment.run_manifest import (
     new_run_id,
     read_manifest,
     refresh_manifest_artifacts,
+    resolve_manifest_path,
     sha256_of,
     tool_info,
     verify_manifest,
     write_manifest,
+    write_manifest_pointer,
 )
 from .experiment.run_manifest import (
     EXIT_FAILED as MANIFEST_EXIT_FAILED,
@@ -897,11 +899,12 @@ def _downstream_manifest(
         if not path.is_file():
             print(f"  ! 清单不存在: {path}", file=sys.stderr)
             return None, None, None, MANIFEST_EXIT_FAILED
-        artifacts = artifact_allowlist(path)
-        if artifacts is None:
+        resolved = resolve_manifest_path(path)
+        artifacts = artifact_allowlist(resolved)
+        if artifacts is None or not resolved.is_file():
             print(f"  ! 清单无法解析: {path}", file=sys.stderr)
             return None, None, None, MANIFEST_EXIT_FAILED
-        return path, artifacts, path.parent, 0
+        return resolved, artifacts, resolved.parent, 0
     if not getattr(args, "allow_legacy", False):
         print(
             "  ! 缺少 run_manifest.json；确需扫描旧目录请加 --allow-legacy",
@@ -1018,6 +1021,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         try:
             target = write_manifest(target_path, manifest)
             print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            _publish_manifest_pointer(target, out_dir / "run_manifest.json")
         except OSError as exc:
             print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
 
@@ -1092,6 +1096,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         except OSError as exc:
             print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
             return MANIFEST_EXIT_FAILED
+        _publish_manifest_pointer(target, out_dir / "run_manifest.json")
         print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
         if strict:
             return STATUS_EXIT[status]
@@ -1286,7 +1291,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     for config_path in config_paths:
         _protect(config_path)
 
+    def _under(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
     def _collides(path: Path, extra: tuple[Path, ...] = ()) -> bool:
+        # 采集根目录/工作目录下的任何文件都是输入（即使还没 discover）
+        if _under(path, exports_root) or _under(path, workloads_dir):
+            return True
         candidates = list(protected_inputs) + list(artifacts.values()) + list(extra)
         return any(_same_file(path, item) for item in candidates)
 
@@ -1353,6 +1368,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         try:
             target = write_manifest(target_path, manifest)
             print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            _publish_manifest_pointer(target, out / "run_manifest.json")
         except OSError as exc:
             print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
 
@@ -1443,6 +1459,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             try:
                 target = write_manifest(fallback, failed)
                 print(f"[manifest] status=failed run_id={run_id} -> {target}")
+                _publish_manifest_pointer(target, out / "run_manifest.json")
             except OSError as exc:
                 print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
             return MANIFEST_EXIT_FAILED
@@ -1482,6 +1499,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             try:
                 target = write_manifest(fallback, failed)
                 print(f"[manifest] status=failed run_id={run_id} -> {target}")
+                _publish_manifest_pointer(target, out / "run_manifest.json")
             except OSError as write_exc:
                 print(f"[analyze] 写 run_manifest 失败: {write_exc}", file=sys.stderr)
             return MANIFEST_EXIT_FAILED
@@ -1505,6 +1523,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         except OSError as exc:
             print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
             return MANIFEST_EXIT_FAILED
+        _publish_manifest_pointer(target, out / "run_manifest.json")
         print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
         if strict:
             return STATUS_EXIT[status]
@@ -2242,6 +2261,15 @@ def _redact_error(exc: BaseException, roots: tuple[Path, ...]) -> str:
         if str(root):
             text = text.replace(str(root), "<path>")
     return text
+
+
+def _publish_manifest_pointer(target: Path, default_path: Path) -> None:
+    """自定义清单写完后，在默认位置留下指针，避免下游读旧默认清单。"""
+    try:
+        if target.resolve() != default_path.resolve():
+            write_manifest_pointer(default_path, target)
+    except OSError as exc:
+        print(f"  ! 写清单指针失败: {exc}", file=sys.stderr)
 
 
 def _fmt_ratio(report: ComparisonReport) -> str:
