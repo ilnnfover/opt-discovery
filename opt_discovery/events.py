@@ -37,12 +37,15 @@ __all__ = [
     "HostCall",
     "KernelEvent",
     "SourceReference",
+    "NormalizedRow",
     "TaskIntervalEvent",
     "iter_host_calls",
     "iter_host_spans",
     "iter_op_summary_events",
     "iter_op_summary_intervals",
+    "iter_op_summary_spans",
     "iter_task_intervals",
+    "iter_task_span_rows",
     "iter_task_spans",
     "op_summary_paths",
 ]
@@ -86,6 +89,17 @@ class KernelEvent:
 
     def interval(self) -> Interval:
         return Interval(self.start_us, self.end_us)
+
+
+@dataclass(frozen=True)
+class NormalizedRow:
+    """One instance row after unit/task-type/window normalization."""
+
+    start_us: float
+    duration_us: float
+    task_type: TaskType
+    operator: str | None
+    stream_id: int | None
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,61 @@ def _indices(
     return start_idx, duration_idx, type_idx, operator_idx, stream_idx
 
 
+def normalize_instance_row(
+    row: list[str],
+    *,
+    start_idx: int | None,
+    duration_idx: int,
+    type_idx: int | None = None,
+    operator_idx: int | None = None,
+    stream_idx: int | None = None,
+    start_scale: float = 1.0,
+    duration_scale: float = 1.0,
+    window: Window | None = None,
+    policy: str = "intersect",
+    resolver=_task_type,
+) -> NormalizedRow | None:
+    """Shared normalization for one instance row (Parser and Timeline both use it).
+
+    ``start_idx=None`` is allowed for no-window Parser paths; the returned start
+    is 0.0 and the caller must not use it for window/round logic.
+    """
+    if duration_idx >= len(row):
+        return None
+    if start_idx is not None and start_idx >= len(row):
+        return None
+    try:
+        duration_value = float(row[duration_idx])
+        start_value = float(row[start_idx]) if start_idx is not None else 0.0
+    except ValueError:
+        return None
+    if duration_value <= 0.0:
+        return None
+    raw_type = row[type_idx] if type_idx is not None and type_idx < len(row) else None
+    task_type = resolver(raw_type)
+    duration_us = normalize_duration(
+        duration_value, unit_scale=duration_scale, task_type=task_type
+    )
+    span = window_span(start_value * start_scale, duration_us, window, policy=policy)
+    if span is None:
+        return None
+    operator = (
+        row[operator_idx] if operator_idx is not None and operator_idx < len(row) else None
+    )
+    stream_id = (
+        _optional_int(row[stream_idx])
+        if stream_idx is not None and stream_idx < len(row)
+        else None
+    )
+    return NormalizedRow(
+        start_us=span[0],
+        duration_us=span[1],
+        task_type=task_type,
+        operator=operator.strip() if operator is not None else None,
+        stream_id=stream_id,
+    )
+
+
 def _optional_int(raw: str | None) -> int | None:
     if raw is None:
         return None
@@ -179,39 +248,26 @@ def _iter_op_rows(
         start_idx, duration_idx, type_idx, operator_idx, stream_idx = _indices(
             header, source_path
         )
-        width = max(start_idx, duration_idx)
         policy = "clip" if clip else "intersect"
         for row_number, row in enumerate(reader, start=2):
-            if len(row) <= width:
-                continue
-            try:
-                start_us = float(row[start_idx])
-                duration_value = float(row[duration_idx])
-            except ValueError:
-                continue
-            if duration_value <= 0.0:
-                continue
-            raw_type = row[type_idx] if type_idx is not None and type_idx < len(row) else None
-            task_type = _task_type(raw_type)
-            # 先缩放时长再决定窗口，避免在 epoch 上“先加后减”丢精度
-            duration_us = normalize_duration(duration_value, task_type=task_type)
-            span = window_span(start_us, duration_us, window, policy=policy)
-            if span is None:
-                continue
-            operator = (
-                row[operator_idx] if operator_idx is not None and operator_idx < len(row) else ""
+            normalized = normalize_instance_row(
+                row,
+                start_idx=start_idx,
+                duration_idx=duration_idx,
+                type_idx=type_idx,
+                operator_idx=operator_idx,
+                stream_idx=stream_idx,
+                window=window,
+                policy=policy,
             )
-            stream_id = (
-                _optional_int(row[stream_idx])
-                if stream_idx is not None and stream_idx < len(row)
-                else None
-            )
+            if normalized is None:
+                continue
             yield (
-                span[0],
-                span[1],
-                task_type,
-                operator.strip() or None,
-                stream_id,
+                normalized.start_us,
+                normalized.duration_us,
+                normalized.task_type,
+                normalized.operator or None,
+                normalized.stream_id,
                 row_number,
             )
 
@@ -243,6 +299,19 @@ def iter_op_summary_events(
             source=SourceReference(kind="op_summary", path=str(source_path), row=row_number),
             stream_id=stream_id,
         )
+
+
+def iter_op_summary_spans(
+    path: str | Path,
+    *,
+    window: Window | None = None,
+    clip: bool = False,
+) -> Iterator[tuple[float, float]]:
+    """``(start_us, duration_us)`` view that preserves epoch-compatible duration."""
+    for start_us, duration_us, _task, _operator, _stream, _row in _iter_op_rows(
+        path, window, clip
+    ):
+        yield start_us, duration_us
 
 
 def iter_op_summary_intervals(
@@ -326,6 +395,13 @@ def iter_task_intervals(
             duration_us=duration_us,
             source=SourceReference(kind="task_table", path=path),
         )
+
+
+def iter_task_span_rows(
+    db_path: str | Path, *, window: Window | None = None
+) -> Iterator[tuple[float, float]]:
+    """``(start_us, duration_us)`` TASK view (epoch-safe duration)."""
+    yield from _iter_task_rows(db_path, window)
 
 
 def iter_task_spans(

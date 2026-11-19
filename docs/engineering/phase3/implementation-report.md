@@ -111,7 +111,7 @@ class KernelEvent:
 
 ## 6. 测试与验证
 
-新增 `tests/test_events.py`（13 条）：
+新增 `tests/test_events.py`（17 条）：
 
 - op_summary filter/clip 语义、COMMUNICATION 单位缩放、来源行号、rank、坏行/零时长跳过；
 - 缺时间列报 `EventReadError`；生成器惰性；
@@ -123,8 +123,8 @@ class KernelEvent:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check` | 0 | Ruff / mypy 53 文件 / validate |
-| `python -m pytest`（3.12） | 0 | 302 passed, 17 skipped（319 用例） |
-| `python -m pytest`（3.11） | 0 | 302 passed, 17 skipped |
+| `python -m pytest`（3.12） | 0 | 306 passed, 17 skipped（323 用例） |
+| `python -m pytest`（3.11） | 0 | 306 passed, 17 skipped |
 | `make verify DEMO_OUT=/tmp/ae04-demo2` | 0 | 合成演示完成 |
 | `tests/test_real_data.py`（授权数据） | 0 | 16 passed, 1 skipped |
 | `verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED |
@@ -163,4 +163,17 @@ class KernelEvent:
 
 P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语义，作为已知差异记录；若切换口径需单独结果验收。
 
-验证：`make check` 0；`pytest` **302 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **306 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+
+## 10. 增量复核修复（2026-11-19）
+
+| 级别 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1 | 乱序输入少算 Timeline busy | `_rank_intervals` 在跨分片拼接后全局按起点排序；`summarize` 的相对并集复用该顺序 | `test_summarize_handles_unordered_slices`（3 分片乱序 → 3 任务、30µs、gap 0） |
+| P1 | epoch 短事件在 Timeline 归零、右边界裁剪失准 | Timeline 以窗口起点为相对坐标做并集（`Interval` 只在相对坐标上相加）；Host/MSTX 同步平移；`window_span(clip=True)` 排除起点恰好落在 `window.end_us` 的事件 | `test_summarize_epoch_short_event_has_busy`（busy 0.1µs）、`test_window_clip_drops_event_at_right_boundary` |
+| P1 | Parser 未接入共享实例 Reader | 新增 `events.normalize_instance_row()`：一次完成起点/时长/任务类型/单位/窗口裁剪；Timeline 的 `_iter_op_rows` 与 `MappingCsvParser` 都调用它。Parser 仍负责映射扩展、聚合与额外指标，窗口策略分别为 `start`（Parser）与 `intersect`/`clip`（Timeline） | `test_parser_and_reader_share_epoch_normalization`（同一 CSV，Parser/Reader 均 0.2µs） |
+| P2 | 非阻断项 | 无窗口 TASK 已用共享 spans；点窗口包装保持旧语义（上一轮已修） | 已有回归 |
+
+说明：Timeline 的“整任务时长 / 窗口 busy”历史口径仍未改变（P2-1），仅将内部并集坐标改为窗口相对；对输出字段的语义没有切换。
+
+验证：`make check` 0；`pytest` **306 passed, 17 skipped**（323 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。

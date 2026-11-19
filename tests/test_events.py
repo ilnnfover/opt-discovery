@@ -283,3 +283,118 @@ def test_point_window_wrappers_keep_historical_filter(tmp_path: Path) -> None:
     connection.close()
     intervals = timeline.load_task_intervals(db, 1.0, 1.0)
     assert [(item.start_us, item.end_us) for item in intervals] == [(1.0, 1.1)]
+
+
+def _prof_with_csv(tmp_path: Path, rows: list[str], name: str = "op_summary_1.csv") -> Path:
+    prof = tmp_path / "PROF_000000_test"
+    output = prof / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    (output / name).write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        + "\n".join(rows)
+        + "\n",
+        encoding="utf-8",
+    )
+    db = prof / "msprof_0.db"
+    connection = sqlite3.connect(db)
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.commit()
+    connection.close()
+    return db
+
+
+def test_summarize_epoch_short_event_has_busy(tmp_path: Path) -> None:
+    """P1-3：epoch 上的 0.1µs 事件在 summarize 里必须产生正的 busy。"""
+    epoch = 1_790_000_000_000_000.0
+    db = _prof_with_csv(tmp_path, [f"0,MatMul,AI_CORE,{epoch},0.1"])
+    window = Window(epoch, epoch + 1.0, rounds=(1,))
+
+    summary = timeline.summarize(db, window)
+
+    assert summary.task_count == 1
+    assert summary.device_busy_us == pytest.approx(0.1)
+    assert summary.device_idle_us == pytest.approx(0.9)
+
+
+def test_window_clip_drops_event_at_right_boundary(tmp_path: Path) -> None:
+    epoch = 1_790_000_000_000_000.0
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch + 2},0.1\n",
+        encoding="utf-8",
+    )
+    window = Window(epoch, epoch + 2.0, rounds=(1,))
+    assert list(iter_op_summary_events(path, window=window, clip=True)) == []
+
+
+def test_summarize_handles_unordered_slices(tmp_path: Path) -> None:
+    """P1 · 乱序分片：并集前必须全局按起点排序。"""
+    db = _prof_with_csv(
+        tmp_path,
+        ["0,op_a,AI_CORE,30,10"],
+        name="op_summary_slice_1.csv",
+    )
+    output = db.parent / "mindstudio_profiler_output"
+    (output / "op_summary_slice_2.csv").write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        "0,op_b,AI_CORE,10,10\n",
+        encoding="utf-8",
+    )
+    (output / "op_summary_slice_10.csv").write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        "0,op_c,AI_CORE,20,10\n",
+        encoding="utf-8",
+    )
+    window = Window(0.0, 100.0, rounds=(1,))
+
+    summary = timeline.summarize(db, window)
+
+    assert summary.task_count == 3
+    assert summary.device_busy_us == pytest.approx(30.0)
+    assert summary.gap_count == 0
+
+
+def test_parser_and_reader_share_epoch_normalization(tmp_path: Path) -> None:
+    """P1-1：Parser 与 Reader 对同一 CSV 的实例时长一致。"""
+    from opt_discovery.parsers.csv_mapping import CsvMapping, MappingCsvParser
+    from opt_discovery.schemas.workload import WorkloadSpec
+
+    epoch = 1_790_000_000_000_000.0
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch},0.1\n"
+        f"0,hcom_allReduce_,COMMUNICATION,{epoch},100\n",
+        encoding="utf-8",
+    )
+    workload = WorkloadSpec.from_dict(
+        {
+            "workload_id": "wl",
+            "model": {"name": "m", "dtype": "bfloat16"},
+            "hardware": {"device": "Ascend 910B", "device_count": 1},
+            "execution": {"phase": "prefill", "mode": "eager"},
+            "input": {"batch_size": 1, "input_length": 1024},
+            "verified": True,
+        }
+    )
+    parser = MappingCsvParser(
+        CsvMapping.load(
+            Path(__file__).resolve().parent.parent
+            / "configs"
+            / "parsers"
+            / "ascend_op_summary.yaml"
+        )
+    )
+    table = parser.parse(path, workload)
+    parser_total = sum(
+        record.total_time_us.value
+        for record in table.records
+        if record.total_time_us is not None
+    )
+    reader_total = sum(
+        event.duration_us for event in iter_op_summary_events(path)
+    )
+    assert parser_total == pytest.approx(0.2)
+    assert reader_total == pytest.approx(0.2)

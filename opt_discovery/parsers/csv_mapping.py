@@ -34,6 +34,7 @@ from .base import ParserCapabilities, ParserError
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
     from ..primitives import Window
 
+from ..events import normalize_instance_row
 from ..primitives import COMMUNICATION_DURATION_SCALE, normalize_duration, window_span
 
 __all__ = [
@@ -413,7 +414,52 @@ class MappingCsvParser:
                 for line_no, row in enumerate(reader, start=2):
                     meta.row_count += 1
                     rows_in_file += 1
-                    if window is not None:
+                    row_metrics = None
+                    timestamp = None
+                    if self.mapping.row_semantics == "instance":
+                        start_pos = file_columns.fields.get("row_start_time")
+                        duration_pos = file_columns.fields.get("total_time_us")
+                        if duration_pos is not None:
+                            row_metrics = normalize_instance_row(
+                                row,
+                                start_idx=start_pos,
+                                duration_idx=duration_pos,
+                                type_idx=file_columns.fields.get("task_type"),
+                                operator_idx=file_columns.fields.get("operator"),
+                                start_scale=(
+                                    _to_us(
+                                        1.0,
+                                        self.mapping.fields["row_start_time"].unit,
+                                    )
+                                    if start_pos is not None
+                                    and "row_start_time" in self.mapping.fields
+                                    else 1.0
+                                ),
+                                duration_scale=_to_us(
+                                    1.0, self.mapping.fields["total_time_us"].unit
+                                ),
+                                window=window,
+                                # Parser 保留“起点在窗口内”的历史策略
+                                policy="start" if window is not None else "intersect",
+                            )
+                            if row_metrics is None:
+                                if window is not None:
+                                    rows_outside += 1
+                                    continue
+                            else:
+                                timestamp = row_metrics.start_us
+                                if window is not None:
+                                    for (
+                                        round_index,
+                                        round_start,
+                                        round_end,
+                                    ) in window.round_spans:
+                                        if round_start <= timestamp <= round_end:
+                                            round_counts[round_index] = (
+                                                round_counts.get(round_index, 0) + 1
+                                            )
+                                            break
+                    elif window is not None:
                         timestamp = _row_start(file_columns, row, self.mapping)
                         if timestamp is None:
                             meta.skipped_rows += 1
@@ -423,7 +469,6 @@ class MappingCsvParser:
                                 f"{file.name}:{line_no}",
                             )
                             continue
-                        # 实例行沿用“起点在窗口内”的筛选策略（与 Timeline 的相交策略分开）
                         if window_span(timestamp, 0.0, window, policy="start") is None:
                             rows_outside += 1
                             continue
@@ -433,10 +478,15 @@ class MappingCsvParser:
                                     round_counts.get(round_index, 0) + 1
                                 )
                                 break
-                    else:
-                        timestamp = None
                     duration = self._accumulate(
-                        row, file_columns, groups, meta, file, line_no
+                        row,
+                        file_columns,
+                        groups,
+                        meta,
+                        file,
+                        line_no,
+                        task_type_override=row_metrics.task_type if row_metrics else None,
+                        duration_override=row_metrics.duration_us if row_metrics else None,
                     )
                     if timestamp is not None and duration is not None:
                         union.add(timestamp, timestamp + duration)
@@ -583,6 +633,9 @@ class MappingCsvParser:
         meta: ParseMeta,
         file: Path,
         line_no: int,
+        *,
+        task_type_override: TaskType | None = None,
+        duration_override: float | None = None,
     ) -> float | None:
         """Fold one row into its group; returns the row duration in us if known."""
         operator_index = columns.fields.get("operator")
@@ -597,7 +650,7 @@ class MappingCsvParser:
             return None
 
         task_type_index = columns.fields.get("task_type")
-        task_type = self._resolve_task_type(
+        task_type = task_type_override or self._resolve_task_type(
             row[task_type_index]
             if task_type_index is not None and task_type_index < len(row)
             else None
@@ -625,9 +678,9 @@ class MappingCsvParser:
 
         group.task_types[task_type] = group.task_types.get(task_type, 0) + 1
 
-        duration = None
+        duration = duration_override
         total_index = columns.fields.get("total_time_us")
-        if total_index is not None:
+        if duration is None and total_index is not None:
             value = _to_float(row[total_index] if total_index < len(row) else None)
             if value is not None:
                 # 单位换算 + COMMUNICATION ns 缩放由 primitives 统一处理，

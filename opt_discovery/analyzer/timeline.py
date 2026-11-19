@@ -40,6 +40,8 @@ from ..events import (
     EventReadError,
     iter_host_spans,
     iter_op_summary_intervals,
+    iter_op_summary_spans,
+    iter_task_span_rows,
     iter_task_spans,
     op_summary_paths,
 )
@@ -460,14 +462,23 @@ def _rank_intervals(
     Returns ``(intervals, source, op_csv_path)``，source 为 ``op_summary`` 或
     ``task_table``。
     """
+    origin = window.start_us
     paths = op_summary_paths(db_path)
     if paths:
         intervals: list[Interval] = []
         for path in paths:
-            intervals.extend(iter_op_summary_intervals(path, window=window))
+            for start_us, duration_us in iter_op_summary_spans(path, window=window):
+                intervals.append(
+                    Interval(start_us - origin, start_us - origin + duration_us)
+                )
+        intervals.sort(key=lambda item: item.start_us)
         return intervals, "op_summary", str(paths[0])
+    try:
+        spans = list(iter_task_span_rows(db_path, window=window))
+    except EventReadError as exc:
+        raise TimelineError(str(exc)) from exc
     return (
-        load_task_intervals(db_path, window.start_us, window.end_us),
+        [Interval(start - origin, start - origin + duration) for start, duration in spans],
         "task_table",
         None,
     )
@@ -502,9 +513,8 @@ def _device_gap_stats(
     segment_start: float | None = None
     segment_end: float | None = None
     try:
-        for span in iter_task_spans(db_path, window=window):
-            start = span.start_us
-            end = span.end_us
+        for start, duration in iter_task_span_rows(db_path, window=window):
+            end = start + duration
             tasks += 1
             if segment_start is None:
                 segment_start, segment_end = start, end
@@ -531,8 +541,7 @@ def _device_gap_stats(
 def _host_stream(db_path: str | Path, window: Window | None):
     """Yield (start_us, end_us, name) in start order via the shared reader."""
     try:
-        for start_us, duration_us, name in iter_host_spans(db_path, window=window):
-            yield start_us, start_us + duration_us, name
+        yield from iter_host_spans(db_path, window=window)
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
 
@@ -658,8 +667,10 @@ def summarize(
     gap_ends = [item[1] for item in big_gaps]
     cursor = 0
 
-    for start, end, name in _host_stream(db_path, window):
-        duration = end - start
+    origin = window.start_us if window is not None else 0.0
+    for start_abs, duration, name in _host_stream(db_path, window):
+        start = start_abs - origin
+        end = start + duration
         host_calls += 1
         bucket = name_counts.setdefault(name, [0, 0.0])
         bucket[0] += 1
@@ -738,9 +749,13 @@ def summarize(
         per_name: dict[str, float] = {}
         for gap_start, gap_end in silent_gaps:
             pieces = [
-                (max(gap_start, item.start_us), min(gap_end, item.end_us), item.name)
+                (
+                    max(gap_start, item.start_us - origin),
+                    min(gap_end, item.end_us - origin),
+                    item.name,
+                )
                 for item in mstx_ranges
-                if item.end_us > gap_start and item.start_us < gap_end
+                if item.end_us - origin > gap_start and item.start_us - origin < gap_end
             ]
             if not pieces:
                 continue

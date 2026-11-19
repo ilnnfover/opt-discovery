@@ -77,6 +77,9 @@ def window_span(
         return start_us, duration_us
     if policy != "clip":
         raise ValueError(f"unknown window policy: {policy!r}")
+    # 右边界为开区间：起点正好落在 window.end_us 的事件没有交集
+    if start_us >= window.end_us:
+        return None
     left = max(0.0, window.start_us - start_us)
     right = max(0.0, end_us - window.end_us)
     clipped_duration = duration_us - left - right

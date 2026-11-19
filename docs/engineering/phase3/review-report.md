@@ -47,3 +47,37 @@
 新增测试使用真实 Reader 与临时 CSV/SQLite，普通时长、单次缩放和裁剪有独立预期。包装一致性用例共用相同的 Reading 逻辑，不能独立发现共同错误。`inspect.isgenerator` 只能确认函数返回生成器，本次大样例的实际内存测量补上了这一证据。指定回归中，R01 不覆盖 Timeline 全分片，R08 不覆盖短时长与大 epoch 的组合，R10/R12 也均未覆盖新身份字段。这些缺口与全绿的 CPU 套件并存。
 
 合并验收取决于 P1-1～P1-4。优先把标准 Reader 的全分片、时间与身份契约接到两个实际消费者，并用这些反例同时验证 Parser 与 Timeline。P2/P3 作为非阻断记录。AE-05 依赖稳定的 AE-04 边界，建议在上述核心 DoD 通过后进入。
+
+## 修复后增量复核（2026-11-19）
+
+**最终验收结论为 FAIL。暂不允许合并 AE-04，也暂不允许进入依赖该事件契约的 AE-05。** 本次仅复核 `feat/ae-04-event-contract` 上 `fb71da6..e8630ef` 的修复和直接经过的生产路径，依据原任务书及实施报告 §9。工作区复核前已有未跟踪的 `docs/tasks/`，本次只追加审查记录。
+
+### 上轮问题与受影响 DoD
+
+| 上轮项 | 增量结果 | 生产证据 |
+|---|---|---|
+| P1-1 两个消费者复用实例 Reader | **未关闭** | Parser 与 Timeline 共用时长换算和窗口策略函数。Parser 仍自行读取和解释 `op_summary` 实例行，只有 Timeline 消费实例 Reader。 |
+| P1-2 Timeline 漏读分片 | **原问题关闭，修复路径出现 P1 回归** | 真实 `summarize` 读取有序的 slice_1、slice_2、slice_10，得到 4 项任务、40 µs busy。乱序行或分片仍能读全，但 busy 少算。 |
+| P1-3 epoch 短事件归零 | **部分关闭** | 普通 CSV 0.1 µs、COMMUNICATION 100 ns、TASK 差值 100 ns 和 CANN_API 差值 100 ns 都能在结构化事件上保留 0.1 µs。实际 Timeline 的区间和 busy 仍会归零，`clip=True` 还会保留从窗口右边界开始的短事件。 |
+| P1-4 实例身份 | **关闭** | SHA `e8630ef` 上的 Reader 实测保留流号 17、18，未指定 rank 时返回 `None`。生产 Reader 测试覆盖显式 rank=1，以及缺算子身份的行仅可进入区间视图。 |
+
+上轮非阻断项中，无窗口 TASK 路径已接入共享 spans，点窗口包装的历史行为通过了针对性测试。整任务时长与窗口占用的历史口径及 P3 记录维持原定级。本次增量复核未发现 P0。
+
+### 剩余阻断项
+
+| 级别 | 代码位置 | 实际证据与影响 | 修复建议 |
+|---|---|---|---|
+| P1 · 乱序输入少算 Timeline busy | `opt_discovery/analyzer/timeline.py:371`、`:463`、`:478`、`:627`；`tests/test_events.py:243` | 临时标准导出中，同一 CSV 按 `[30,40]`、`[10,20]` 写两行。用同一数据运行 `summarize`，`fb71da6` 得 2 项任务、20 µs，`e8630ef` 得 2 项、10 µs。三个分片按自然文件顺序给出 `[30,40]`、`[10,20]`、`[20,30]` 时，得到 3 项、10 µs，预期 30 µs。修复沿文件顺序拼接，省去了旧包装的时间排序，`_merge` 直接依赖起点顺序。新增分片测试只核对 Reader 输出条数和时长总和，未经过该区间并集计算。 | 在区间并集前恢复全局起点排序。用 `summarize` 对照乱序单文件、乱序分片和按时间排序的等价数据，并核对 busy 和 gap。 |
+| P1 · 短事件在 Timeline 中归零且窗口裁剪失准 | `opt_discovery/events.py:248`、`:331`；`opt_discovery/analyzer/timeline.py:531`、`:627`、`:661`；`opt_discovery/primitives.py:69`；`tests/test_events.py:208` | 以 `1_790_000_000_000_000 µs` 为起点，事件 Reader 得 0.1 µs，CSV/TASK 区间视图均得 0.0 µs，实际 `summarize` 有 2 项 device task，device busy 和 Host busy 均为 0.0 µs。以该 epoch 为窗口右边界，起点正好落在右边界的 0.1 µs CSV 事件经 `clip=True` 后仍返回 0.1 µs，预期无交集。有关路径将时长加回大浮点时间戳后再用于区间计算。新增测试断言了事件字段，未验证实际聚合或该边界。 | 在相交、裁剪和聚合时保留整数 ns 或使用窗口相对坐标。对 `summarize` 及裁剪 API 覆盖同一 epoch fixture，断言正的 busy 和窗口右边界排除。 |
+| P1 · 实例 Reader 复用仍未达到核心 DoD | `docs/tasks/Opt-Discovery-Agent-Engineering-Task.md:219`；`opt_discovery/events.py:175`、`:248`；`opt_discovery/parsers/csv_mapping.py:393`、`:417`、`:635`、`:921`；`opt_discovery/analyzer/timeline.py:467` | 代码跟踪确认 Timeline 调用 `iter_op_summary_intervals`，Parser 则进入自己的 `csv.reader` 循环、解析时间戳并分类。共享 `normalize_duration` 和 `window_span` 已减少重复计算。任务书要求已有消费者共用实例 Reader，第二个生产消费者仍未接入。 | 让两个生产入口共享可配置的实例行读取与标准化路径。Parser 保留映射额外字段、聚合及起点筛选，Timeline 保留相交筛选。测试从两条入口读取同一份导出，核对各自承诺的结果。 |
+
+### 实际验证
+
+| 命令 | 结果 |
+|---|---|
+| `git diff --check fb71da6 HEAD` | PASS，退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 make check` | PASS，Ruff、mypy（53 个文件）和配置验证退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae04-followup-demo.1NYVtu` | PASS，302 passed、17 skipped，合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，59 passed，包含六组指定回归。 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-delta-probe.lriJLZ.py` | 独立临时 CSV/SQLite 反例直调生产 Reader 和 `summarize`，并用隔离的 `fb71da6` 对照。文件乱序、区间精度和右边界裁剪的验收预期为 FAIL，实际值见上表。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，缺真实数据根目录。命令退出 0 表示缺数据闸门如预期生效。真实 Profiling、NPU 和托管 CI 均未验证。 |
