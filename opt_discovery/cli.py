@@ -92,7 +92,15 @@ from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
-from .schemas.quality import DEGRADED, TIMELINE_SKIPPED, TIMELINE_UNAVAILABLE, QualityFlag
+from .schemas.quality import (
+    DEGRADED,
+    EMPTY_WINDOW,
+    LOW_ROUND_COVERAGE,
+    MISSING_ROUNDS,
+    TIMELINE_SKIPPED,
+    TIMELINE_UNAVAILABLE,
+    QualityFlag,
+)
 from .schemas.quality import attach as attach_quality
 from .schemas.quality import blocking as blocking_quality
 from .schemas.workload import WorkloadSpec
@@ -797,9 +805,13 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
         )
         return 2
 
-    assessment = assess_rank_tables(tables, sources, scopes)
+    expected = expected_ranks(bundle)
+    assessment = assess_rank_tables(tables, sources, scopes, expected=expected)
     ranks = assessment.ranks
-    print(f"[check-ranks] {bundle.workload_id}  ranks={list(ranks)}")
+    print(
+        f"[check-ranks] {bundle.workload_id}  ranks={list(ranks)}  "
+        f"声明={expected} 可解析={len(tables)}"
+    )
     for digest in assessment.digests:
         print(
             f"  rank{digest.rank}: {digest.source:22s} scope={digest.scope:7s} "
@@ -1159,6 +1171,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     diagnosis_failures: list[str] = []
     timeline_failures: list[str] = []
     output_failures: list[str] = []
+    comm_failures: list[str] = []
+    comm_attempts = 0
+    comm_runs = 0
     comparison_failed = False
     timeline_runs = 0
     is_synthetic = False
@@ -1283,6 +1298,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             comparison_failed=comparison_failed,
             source_map_failed=source_map_failed,
             duplicate_ids=duplicate_ids,
+            comm_failures=comm_failures,
+            comm_attempts=comm_attempts,
+            comm_runs=comm_runs,
             failure_stage=failure_stage,
         )
         if _collides(manifest_path):
@@ -1473,9 +1491,46 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             )
             continue
         tables[workload_id] = table
+        quality_flags: list = []
+
+        # A3：空窗口 / 缺轮次 / 低覆盖是可选数据质量问题，必须随表落盘。
+        window_quality = table.meta.extra.get("window_quality") or {}
+        window_flags: list = []
+        if table.meta.row_count == 0 or not table.records:
+            window_flags.append(
+                QualityFlag(
+                    code=EMPTY_WINDOW,
+                    severity="blocking",
+                    message="窗口内没有任何算子记录：不能作为比较输入",
+                    source="parser",
+                    details={"rounds": list(window.rounds)},
+                )
+            )
+        for round_index in window_quality.get("missing_rounds") or ():
+            window_flags.append(
+                QualityFlag(
+                    code=MISSING_ROUNDS,
+                    severity="blocking",
+                    message=f"round {round_index} 无任务行：calls/累计时间偏低，不可直接比较",
+                    source="parser",
+                    details={"round": round_index, "rounds": list(window.rounds)},
+                )
+            )
+        for round_index in window_quality.get("low_rounds") or ():
+            window_flags.append(
+                QualityFlag(
+                    code=LOW_ROUND_COVERAGE,
+                    severity="blocking",
+                    message=f"round {round_index} 行数不足同组中位数一半：疑似数据截断",
+                    source="parser",
+                    details={"round": round_index},
+                )
+            )
+        if window_flags:
+            attach_quality(table.meta, window_flags)
+            quality_flags.extend(window_flags)
 
         # R05：rank 合并质量必须先于诊断/对比完成，并随表落盘供 compare 消费。
-        quality_flags: list = []
         try:
             assessment, rank_flags, _ = assess_bundle(
                 bundle, parser, SqliteOpReportParser(), window
@@ -1530,12 +1585,14 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             continue
 
         if db_files:
+            comm_attempts += 1
             try:
                 volume = summarize_comm(db_files[0])
                 table.meta.extra["comm_volume"] = volume.to_dict()
                 _guard_output(out / workload_id / "comm.json")
                 volume.write_json(out / workload_id / "comm.json")
                 _record(out / workload_id / "comm.json", f"{workload_id}/comm.json")
+                comm_runs += 1
                 if volume.available:
                     print(
                         f"    comm: {volume.bytes_total / 1024**2:.1f} MiB "
@@ -1544,6 +1601,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     )
             except Exception as exc:  # noqa: BLE001
                 print(f"    ! comm 失败: {_error(exc)}")
+                comm_failures.append(f"{workload_id}:{_error(exc)}")
 
         workload_timeline_failed = False
         if not skip_timeline:
@@ -1838,6 +1896,9 @@ def _analyze_stages(
     comparison_failed: bool,
     source_map_failed: bool,
     duplicate_ids: list[str] | None = None,
+    comm_failures: list[str] | None = None,
+    comm_attempts: int = 0,
+    comm_runs: int = 0,
     failure_stage: str | None = None,
 ) -> list[StageRecord]:
     """把本轮 run 状态映射为阶段清单（AE-03 契约的可审计部分）。"""
@@ -1904,6 +1965,29 @@ def _analyze_stages(
                 else ("timeline_failed" if timeline_failures else "no_workload")
             ),
             details={"failed": list(timeline_failures), "runs": timeline_runs},
+        ),
+        StageRecord(
+            "comm",
+            False,
+            (
+                STAGE_NOT_REQUESTED
+                if not later_executed
+                else (
+                    STAGE_FAILED
+                    if comm_failures
+                    else (STAGE_PASSED if comm_runs else STAGE_SKIPPED)
+                )
+            ),
+            (
+                "comm_failed"
+                if comm_failures
+                else (None if comm_attempts or not later_executed else "no_db")
+            ),
+            details={
+                "failed": list(comm_failures or ()),
+                "attempts": comm_attempts,
+                "runs": comm_runs,
+            },
         ),
         StageRecord(
             "diagnosis",

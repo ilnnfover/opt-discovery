@@ -171,11 +171,18 @@ def assess_rank_tables(
     tables: Mapping[int, OperatorTable],
     sources: Mapping[int, str],
     scopes: Mapping[int, str],
+    *,
+    expected: int | None = None,
 ) -> RankMergeAssessment:
-    """比较全部 rank（以排序后的第一个为基线）；任一 peer 不一致即整体不一致。"""
+    """比较全部 rank（以排序后的第一个为基线）；任一 peer 不一致即整体不一致。
+
+    scope 是 **per-pair** 的：一个窗口 rank 与一个全量 rank 比较时走单次耗时中位数，
+    但两个窗口 rank 之间仍必须满足 calls/total 约束（旧实现用全局 scope，会被第三个
+    full rank 把同口径 pair 降级为弱校验）。
+    """
     ranks = tuple(sorted(tables))
     base = tables[ranks[0]]
-    same_scope = len({scopes[index] for index in ranks}) == 1
+    any_scope_mismatch = False
 
     digests = tuple(
         RankDigest(
@@ -196,14 +203,27 @@ def assess_rank_tables(
     consistent = True
     reasons: list[str] = []
 
+    if expected is not None and len(ranks) < expected:
+        consistent = False
+        reasons.append(
+            f"采集契约声明 {expected} 个 rank，实际可解析 {len(ranks)} 个"
+        )
+
     for position, peer_rank in enumerate(ranks[1:]):
+        pair_same_scope = scopes[ranks[0]] == scopes[peer_rank]
+        any_scope_mismatch = any_scope_mismatch or not pair_same_scope
         peer_rows, peer_calls, peer_total, peer_median = _pair_rows_and_ratios(
-            base, tables[peer_rank], same_scope=same_scope
+            base, tables[peer_rank], same_scope=pair_same_scope
         )
         if position == 0:
             rows = peer_rows
             calls_ratio, total_ratio, median_avg_ratio = peer_calls, peer_total, peer_median
-        if same_scope:
+        scope_label = (
+            f"{scopes[ranks[0]]}"
+            if pair_same_scope
+            else f"{scopes[ranks[0]]} vs {scopes[peer_rank]}"
+        )
+        if pair_same_scope:
             ok = (
                 peer_calls is not None
                 and peer_total is not None
@@ -212,7 +232,7 @@ def assess_rank_tables(
             )
             if not ok:
                 reasons.append(
-                    f"rank{ranks[0]} vs rank{peer_rank}: "
+                    f"rank{ranks[0]} vs rank{peer_rank}（{scope_label}）："
                     f"calls_ratio={peer_calls if peer_calls is not None else 'NA'}、"
                     f"total_ratio={peer_total if peer_total is not None else 'NA'} "
                     f"超出允许范围 {CALLS_RATIO_RANGE}/{TOTAL_RATIO_RANGE}"
@@ -224,7 +244,7 @@ def assess_rank_tables(
             )
             if not ok:
                 reasons.append(
-                    f"rank{ranks[0]} vs rank{peer_rank}: 单次耗时比中位数="
+                    f"rank{ranks[0]} vs rank{peer_rank}（{scope_label}）：单次耗时比中位数="
                     f"{peer_median if peer_median is not None else 'NA'} "
                     f"超出允许范围 {MEDIAN_AVG_RATIO_RANGE}"
                 )
@@ -233,7 +253,7 @@ def assess_rank_tables(
     return RankMergeAssessment(
         ranks=(ranks[0], ranks[1] if len(ranks) > 1 else ranks[0]),
         digests=digests,
-        same_scope=same_scope,
+        same_scope=not any_scope_mismatch,
         calls_ratio=calls_ratio,
         total_ratio=total_ratio,
         median_avg_ratio=median_avg_ratio,
@@ -329,7 +349,7 @@ def assess_bundle(
             flags.extend(unverified_flags(f"只有 {len(tables)} 个 rank 可比较"))
         return None, tuple(flags), tables
 
-    assessment = assess_rank_tables(tables, sources, scopes)
+    assessment = assess_rank_tables(tables, sources, scopes, expected=expected)
     return assessment, assessment.quality_flags() + tuple(flags), tables
 
 

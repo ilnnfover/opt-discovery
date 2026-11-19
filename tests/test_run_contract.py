@@ -1076,3 +1076,84 @@ def test_check_manifest_rejects_bad_shapes(tmp_path: Path, capsys) -> None:
         path.write_text(json.dumps(payload), encoding="utf-8")
         assert main(["check-manifest", "--path", str(path)]) == 1
     assert "Traceback" not in capsys.readouterr().err
+
+
+def _window_rows(round1: int, round2: int) -> list[tuple[str, int, float]]:
+    rows: list[tuple[str, int, float]] = [
+        ("MatMul", 1001_100_000 + index, 100.0) for index in range(round1)
+    ]
+    rows.extend(("Add", 1003_100_000 + index, 100.0) for index in range(round2))
+    return rows
+
+
+def test_empty_window_is_blocking(tmp_path: Path) -> None:
+    """A3：窗口内零行不能发布成功。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill", rows=[("MatMul", 900_000_000, 100.0)])
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 3
+
+    manifest = _manifest(out)
+    assert "empty_window" in manifest["quality_flags"]
+    table = json.loads(
+        (out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "empty_window" in {
+        flag["code"] for flag in table["meta"]["extra"]["quality_flags"]
+    }
+
+
+def test_missing_round_is_blocking(tmp_path: Path) -> None:
+    """A3：请求的第 2 轮没有任务行时不得发布成功。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill", rows=_window_rows(3, 0))
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 3
+
+    manifest = _manifest(out)
+    assert "missing_rounds" in manifest["quality_flags"]
+
+
+def test_low_round_coverage_is_blocking(tmp_path: Path) -> None:
+    """A3：某轮行数远低于同组中位数（疑似截断）时不得发布成功。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill", rows=_window_rows(10, 1))
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 3
+
+    manifest = _manifest(out)
+    assert "low_round_coverage" in manifest["quality_flags"]
+
+
+def test_optional_comm_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:
+    """B3：可选 comm 失败不影响退出码，但必须出现在清单阶段里。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic comm failure")
+
+    monkeypatch.setattr("opt_discovery.cli.summarize_comm", _boom)
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 0
+
+    manifest = _manifest(out)
+    assert manifest["status"] == "success"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["comm"]["required"] is False
+    assert stages["comm"]["status"] == "failed"
+    assert stages["comm"]["reason_code"] == "comm_failed"
+    assert any("comm failure" in item for item in stages["comm"]["details"]["failed"])

@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**255 passed, 17 skipped**（272 用例，无 xfail）。
+全量：**265 passed, 17 skipped**（282 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 255 passed, 17 skipped（272 用例） |
+| `python -m pytest` | 0 | 265 passed, 17 skipped（282 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 255 passed, 17 skipped |
+| 3.11 全量 | 0 | 265 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -263,7 +263,7 @@ if blocking_flags:
 | P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
 | P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
 
 ## 13. 合并前复验修复（2026-11-19）
 
@@ -281,7 +281,7 @@ if blocking_flags:
 
 现在规则统一为：**清单不得与输入或本轮产物重合**；有冲突时优先退到同目录 `run_manifest.json`，无法安全落盘则不写并返回非零，绝不覆盖输入。
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
 
 ## 14. 合并前问题总表 · 批次 1（A1/A2/B1/B4）
 
@@ -304,4 +304,25 @@ if blocking_flags:
 | B1 校验边界 | 只校验 `artifacts` 项与部分顶层字段 | 没有要求 `stages` 存在/类型正确，也没有 success 的完成态约束 |
 | B4 重复 ID | 假定每个 YAML 的 `workload_id` 唯一 | `discover_all` 用字典按 ID 合并，重复时静默覆盖 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
+
+## 15. 合并前问题总表 · 批次 2（A3/A4/A5/B3）
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| A3 | 空窗口、缺轮次、低覆盖仍发布 success；独立 compare 空表也出 deltas | analyze 依 `window_quality` 生成 blocking 标记：`empty_window`、`missing_rounds`、`low_round_coverage`，随表落盘；`compare_tables` 对任一侧 `records` 为空追加 `empty_table`（blocking） | `test_empty_window_is_blocking`、`test_missing_round_is_blocking`、`test_low_round_coverage_is_blocking`、`test_empty_table_is_not_comparable` |
+| A4 | `quality_flags={}` 被当缺字段；合成/实测混用只单向警告；`verified=false` 仍可比 | `parse_meta_flags` 区分“缺字段”与“存在但类型错误”（`{}` → `quality_flag_invalid`）；compare 增加 `synthetic_mismatch`（双向）与 `verified_false`（blocking） | `test_quality_flags_empty_mapping_is_invalid`、`test_synthetic_and_measured_mix_is_blocked`、`test_unverified_workload_is_not_comparable` |
+| A5 | 全局 scope 让第三个 full rank 把同口径 pair 降级；check-ranks 不校验声明 rank 数 | `assess_rank_tables` 改为 **per-pair** scope，并接受 `expected` 核对声明数；`check-ranks` 传入 `hardware.device_count`，输出「声明/可解析」 | `test_mixed_scope_does_not_downgrade_same_scope_pair`、`test_check_ranks_uses_declared_rank_count` |
+| B3 | 可选 comm 失败只在终端提示 | 新增 `comm` 阶段（required=false）：`failed/comm_error`、`passed`、`skipped/no_db`，失败详情进清单 | `test_optional_comm_failure_is_recorded` |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| A3 空窗口/缺轮次 | parser 只设置 `window_quality.degraded` 与 warning，analyze 照常 success | 质量只停留在“分析内提示”，没有转成随表落盘的 blocking 状态，独立 compare 读不到 |
+| A4 `{}` | `(extra.get("quality_flags") or ())` 把空 dict 当缺字段 | 没区分“字段不存在”与“字段存在但类型错误” |
+| A4 合成/verified | 只对 `not a.is_synthetic and b.is_synthetic` 单项 warning；`comparable_with` 从未读 `verified` | 缺少双向与 blocking 规则；README 的 verified 契约未落到代码 |
+| A5 全局 scope | `same_scope = len({scopes}) == 1` 作用于全部 rank | 多 rank 时一个 full 表就会让同口径 pair 走中位数弱校验 |
+| B3 可选步骤 | comm 失败只 `print` | 清单没有对应阶段，无法区分“未请求/缺数据/失败” |
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。

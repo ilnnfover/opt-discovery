@@ -40,6 +40,18 @@ QUALITY_FLAG_INVALID = "quality_flag_invalid"
 TIMELINE_UNAVAILABLE = "timeline_unavailable"
 #: 用户显式 `--skip-timeline`：降级提示，不视为失败
 TIMELINE_SKIPPED = "timeline_skipped"
+#: 窗口内零行：无法作为任何比较输入
+EMPTY_WINDOW = "empty_window"
+#: 请求的轮次在 op_summary 中没有任何行（profiling 丢数据）
+MISSING_ROUNDS = "missing_rounds"
+#: 某轮行数远低于同组中位数（疑似截断）
+LOW_ROUND_COVERAGE = "low_round_coverage"
+#: 合成数据与实测数据被放在一起比较
+SYNTHETIC_MISMATCH = "synthetic_mismatch"
+#: 采集条件未核对（verified=false）
+VERIFIED_FALSE = "verified_false"
+#: 表没有任何算子记录（手工/空导出）
+EMPTY_TABLE = "empty_table"
 
 #: 这些 code 一旦出现就必须阻断比较（即使 severity 字段缺失或被写成字符串）
 KNOWN_BLOCKING_CODES = frozenset(
@@ -50,6 +62,12 @@ KNOWN_BLOCKING_CODES = frozenset(
         RANK_TIMELINE_INCOMPLETE,
         TIMELINE_UNAVAILABLE,
         QUALITY_FLAG_INVALID,
+        EMPTY_WINDOW,
+        MISSING_ROUNDS,
+        LOW_ROUND_COVERAGE,
+        SYNTHETIC_MISMATCH,
+        VERIFIED_FALSE,
+        EMPTY_TABLE,
     }
 )
 
@@ -113,8 +131,12 @@ def degraded(flags: Iterable[QualityFlag]) -> tuple[QualityFlag, ...]:
 
 def parse_meta_flags(meta: Any) -> tuple[tuple[QualityFlag, ...], tuple[str, ...]]:
     """读取标记并返回无法解析的条目（不能静默丢弃，否则阻断标记会消失）。"""
-    raw = (getattr(meta, "extra", None) or {}).get("quality_flags") or ()
+    extra = getattr(meta, "extra", None) or {}
+    raw = extra.get("quality_flags")
+    if raw is None:
+        return (), ()
     if not isinstance(raw, (list, tuple)):
+        # `{}`、字符串、数字都是“存在但格式错误”，不能当成缺字段静默放过
         return (), (f"quality_flags 不是列表: {type(raw).__name__}",)
     flags: list[QualityFlag] = []
     problems: list[str] = []
@@ -166,8 +188,14 @@ __all__ = [
     "RANK_DURATION_INCONSISTENT",
     "RANK_MERGE_INCONSISTENT",
     "RANK_MERGE_UNVERIFIED",
+    "EMPTY_TABLE",
+    "EMPTY_WINDOW",
+    "LOW_ROUND_COVERAGE",
+    "MISSING_ROUNDS",
     "RANK_SCOPE_MISMATCH",
     "RANK_TIMELINE_INCOMPLETE",
+    "SYNTHETIC_MISMATCH",
+    "VERIFIED_FALSE",
     "SQLITE_FALLBACK",
     "TIMELINE_SKIPPED",
     "TIMELINE_UNAVAILABLE",

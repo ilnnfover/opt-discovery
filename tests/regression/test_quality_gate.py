@@ -287,3 +287,91 @@ def test_known_blocking_code_cannot_be_downgraded_in_json(tmp_path: Path) -> Non
     assert report["deltas"] == []
     assert report["total_ratio"] is None
     assert "quality_flag_invalid" in {flag["code"] for flag in report["quality_flags"]}
+
+
+def test_empty_table_is_not_comparable() -> None:
+    """A3：任一侧记录为空都不得产出差异。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    empty = OperatorTable(
+        workload=graph,
+        records=[],
+        meta=ParseMeta(parser="fixture"),
+    )
+
+    report = compare_tables(base, empty)
+
+    assert report.comparable is False
+    assert any("empty_table" in reason for reason in report.reasons)
+    assert report.deltas == []
+    assert report.to_dict()["total_ratio"] is None
+
+
+def test_quality_flags_empty_mapping_is_invalid() -> None:
+    """A4：`quality_flags={}` 是格式错误，不能当作“没有标记”。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0})
+    base.meta.extra["quality_flags"] = {}
+    target = _table(graph, {"MatMul": 1100.0})
+
+    report = compare_tables(base, target)
+
+    assert report.comparable is False
+    assert any("quality_flag_invalid" in reason for reason in report.reasons)
+
+
+def test_synthetic_and_measured_mix_is_blocked() -> None:
+    """A4：合成数据与实测数据混用不得输出定量结论（双向）。"""
+    eager, graph = _pair()
+    synthetic = OperatorTable(
+        workload=eager,
+        records=_table(eager, {"MatMul": 1000.0}).records,
+        meta=ParseMeta(parser="synthetic", is_synthetic=True),
+    )
+    measured = _table(graph, {"MatMul": 1100.0})
+
+    for left, right in ((synthetic, measured), (measured, synthetic)):
+        report = compare_tables(left, right)
+        assert report.comparable is False
+        assert any("synthetic_mismatch" in reason for reason in report.reasons)
+        assert report.deltas == []
+
+
+def test_unverified_workload_is_not_comparable() -> None:
+    """A4：verified=false 与 README 契约一致，判不可比。"""
+    eager = make_workload(
+        "qwen35-prefill-eager",
+        mode=ExecutionMode.EAGER,
+        graph_mode=GraphMode.NONE,
+        verified=False,
+    )
+    graph = make_workload(
+        "qwen35-prefill-graph",
+        mode=ExecutionMode.GRAPH,
+        graph_mode=GraphMode.FULL_AND_PIECEWISE,
+    )
+    report = compare_tables(_table(eager, {"MatMul": 1000.0}), _table(graph, {"MatMul": 1100.0}))
+
+    assert report.comparable is False
+    assert any("verified_false" in reason for reason in report.reasons)
+    assert report.deltas == []
+
+
+def test_mixed_scope_does_not_downgrade_same_scope_pair() -> None:
+    """A5：第三个 full-scope rank 不能把两个 window rank 的强校验降级。"""
+    eager, _graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0}, calls={"MatMul": 10})
+    weak_peer = _table(eager, {"MatMul": 4000.0}, calls={"MatMul": 40})
+    full_peer = _table(eager, {"MatMul": 4000.0}, calls={"MatMul": 40})
+
+    assessment = assess_rank_tables(
+        {0: base, 1: weak_peer, 2: full_peer},
+        {0: "op_summary(窗口)", 1: "op_summary(窗口)", 2: "sqlite(全量)"},
+        {0: "window", 1: "window", 2: "full"},
+    )
+
+    assert assessment.consistent is False
+    assert any(
+        "rank0 vs rank1" in reason and "calls_ratio" in reason
+        for reason in assessment.reasons
+    )

@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                272 个用例（255 个 CPU 用例 + 17 个真实数据集成用例）
+tests/                282 个用例（265 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -422,7 +422,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 255 passed, 17 skipped（缺真实导出时）
+python -m pytest -q                      # 265 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检

@@ -20,6 +20,10 @@ from typing import Any
 
 from ..schemas.operator import OperatorTable
 from ..schemas.quality import (
+    BLOCKING,
+    EMPTY_TABLE,
+    SYNTHETIC_MISMATCH,
+    VERIFIED_FALSE,
     QualityFlag,
     blocking,
     degraded,
@@ -188,6 +192,38 @@ def compare_tables(
     flags_a, problems_a = parse_meta_flags(a.meta)
     flags_b, problems_b = parse_meta_flags(b.meta)
     quality_flags = flags_a + flags_b
+    meta_flags: list[QualityFlag] = []
+    if bool(a.meta.is_synthetic) != bool(b.meta.is_synthetic):
+        meta_flags.append(
+            QualityFlag(
+                code=SYNTHETIC_MISMATCH,
+                severity=BLOCKING,
+                message="合成数据与实测数据混用：只能做描述性对照，不能输出速度差或因果结论",
+                source="meta",
+                details={"a_synthetic": a.meta.is_synthetic, "b_synthetic": b.meta.is_synthetic},
+            )
+        )
+    if not a.workload.verified or not b.workload.verified:
+        meta_flags.append(
+            QualityFlag(
+                code=VERIFIED_FALSE,
+                severity=BLOCKING,
+                message="采集条件未核对（verified=false）：不可作为可信观测直接比较",
+                source="workload",
+                details={"a_verified": a.workload.verified, "b_verified": b.workload.verified},
+            )
+        )
+    if not a.records or not b.records:
+        meta_flags.append(
+            QualityFlag(
+                code=EMPTY_TABLE,
+                severity=BLOCKING,
+                message="至少一侧没有任何算子记录：不能作为比较输入",
+                source="table",
+                details={"a_records": len(a.records), "b_records": len(b.records)},
+            )
+        )
+    quality_flags = quality_flags + tuple(meta_flags)
     for label, problems in ((a.workload_id, problems_a), (b.workload_id, problems_b)):
         invalid = invalid_flag(problems, source=label)
         if invalid is not None:
