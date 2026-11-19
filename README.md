@@ -401,7 +401,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                335 个用例（318 个 CPU 用例 + 17 个真实数据集成用例）
+tests/                369 个用例（352 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -411,7 +411,7 @@ tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 
 # 全新 CPU 环境：安装开发依赖（Python >=3.10，CI 覆盖 3.10 / 3.12）
 python -m pip install -e ".[dev]"
 
-make check        # ruff + mypy + CLI validate（无需 NPU / 真实数据）
+make check        # ruff + arch-lint + mypy + CLI validate（无需 NPU / 真实数据）
 make verify       # 普通测试 + 回归 + synthetic demo
 make verify-real  # 真实数据回归；缺数据打印 BLOCKED 且退出码 2（不是 PASS）
 
@@ -424,7 +424,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 318 passed, 17 skipped（缺真实导出时）
+python -m pytest -q                      # 352 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
