@@ -18,6 +18,7 @@ from opt_discovery.events import (
     iter_op_summary_events,
     iter_op_summary_intervals,
     iter_task_intervals,
+    iter_task_span_rows,
 )
 from opt_discovery.primitives import (
     COMMUNICATION_DURATION_SCALE,
@@ -557,3 +558,145 @@ def test_parser_window_quality_uses_relative_busy(tmp_path: Path) -> None:
     quality = table.meta.extra["window_quality"]
     assert quality["busy_ratio"] == pytest.approx(0.2)
     assert quality["degraded"] is False
+
+
+def test_parser_uses_configured_task_type_and_scaling(tmp_path: Path) -> None:
+    """P1-1：空类型用 kernel 默认值，自定义通信别名按 0.001 缩放。"""
+    from dataclasses import replace
+
+    from opt_discovery.parsers.csv_mapping import MappingCsvParser
+
+    parser, workload = _summary_parser(tmp_path)
+    mapping = replace(
+        parser.mapping,
+        task_type_map={**parser.mapping.task_type_map, "custom_comm": "communication"},
+    )
+    parser = MappingCsvParser(mapping)
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        "0,MatMul,,100,100\n"
+        "0,hcom_custom,custom_comm,200,10000\n",
+        encoding="utf-8",
+    )
+    table = parser.parse(path, workload)
+    records = {record.operator: record for record in table.records}
+
+    assert records["MatMul"].task_type is TaskType.KERNEL
+    assert records["MatMul"].total_time_us.value == pytest.approx(100.0)
+    assert records["hcom_custom"].task_type is TaskType.COMMUNICATION
+    assert records["hcom_custom"].total_time_us.value == pytest.approx(10.0)
+
+
+def test_parser_filters_window_before_missing_duration(tmp_path: Path) -> None:
+    """P1-2：合法起点先计窗口/轮次，缺时长再跳过。"""
+    parser, workload = _summary_parser(tmp_path)
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        "0,outside,AI_CORE,10,N/A\n"
+        "0,inside_missing,AI_CORE,120,N/A\n"
+        "0,inside_ok,AI_CORE,160,10\n",
+        encoding="utf-8",
+    )
+    window = Window(
+        100.0,
+        200.0,
+        rounds=(1, 2),
+        round_spans=((1, 100.0, 150.0), (2, 150.0, 200.0)),
+    )
+    table = parser.parse(path, workload, window=window)
+
+    assert table.meta.extra["rows_outside_window"] == 1
+    assert table.meta.skipped_rows == 1
+    assert table.meta.extra["round_row_counts"] == {1: 1, 2: 1}
+    operators = {record.operator: record.calls for record in table.records}
+    assert "outside" not in operators
+    assert operators["inside_ok"] == 1
+
+
+def _gap_db(tmp_path: Path) -> Path:
+    db = tmp_path / "PROF_000000_test" / "msprof_0.db"
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    for start_us, end_us in ((1000, 1250), (1450, 1600)):
+        connection.execute(
+            "insert into TASK values (?, ?)",
+            (int(start_us * 1000), int(end_us * 1000)),
+        )
+    connection.execute("insert into CANN_API values (1, ?, ?)", (1_250_000, 1_450_000))
+    connection.commit()
+    connection.close()
+    return db
+
+
+def _mstx():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        available=True,
+        ranges=(SimpleNamespace(start_us=1250.0, end_us=1450.0, name="x"),),
+        sync_us=0.0,
+    )
+
+
+def test_gap_attribution_uses_common_origin(tmp_path: Path) -> None:
+    """P1-3：单 rank/多 rank/无窗与 MSTX 使用同一原点，覆盖 200µs。"""
+    db = _gap_db(tmp_path)
+    window = Window(1000.0, 1600.0, rounds=(1,))
+
+    single = timeline.summarize(db, window)
+    assert single.idle_covered_by_acl_us == pytest.approx(200.0)
+    assert single.gaps_by_class.get("acl_busy") == 1
+
+    multi = timeline.summarize(db, window, extra_db_paths=(db,))
+    assert multi.idle_covered_by_acl_us == pytest.approx(200.0)
+    assert multi.gaps_by_class.get("acl_busy") == 1
+
+    no_window = timeline.summarize(db, None)
+    assert no_window.idle_covered_by_acl_us == pytest.approx(200.0)
+
+    connection = sqlite3.connect(db)
+    connection.execute("delete from CANN_API")
+    connection.commit()
+    connection.close()
+    mstx = timeline.summarize(db, None, mstx=_mstx())
+    assert mstx.silent_covered_by_mstx_us == pytest.approx(200.0)
+
+
+def test_ns_boundaries_and_csv_intersection_precision(tmp_path: Path) -> None:
+    """P1-4：SQLite 用精确整数 ns，CSV 相交不先加 epoch。"""
+    from opt_discovery.events import ns_from_us
+
+    epoch = 1_790_000_000_000_000.0
+    assert ns_from_us(epoch + 0.25) == int(epoch) * 1000 + 250
+
+    boundary = int(epoch) * 1000 + 250
+    db = tmp_path / "PROF_000000_test" / "msprof_0.db"
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    for start, end in ((boundary - 50, boundary + 2), (boundary + 100, boundary + 200)):
+        connection.execute("insert into TASK values (?, ?)", (start, end))
+        connection.execute("insert into CANN_API values (1, ?, ?)", (start, end))
+    connection.commit()
+    connection.close()
+    window = Window(epoch + 0.25, epoch + 1.0, rounds=(1,))
+
+    assert len(list(iter_task_span_rows(db, window=window))) == 2
+    assert len(list(iter_host_calls(db, window=window))) == 2
+
+    csv_path = tmp_path / "op_summary_1.csv"
+    csv_path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch},0.2\n",
+        encoding="utf-8",
+    )
+    assert list(iter_op_summary_events(csv_path, window=window)) == []

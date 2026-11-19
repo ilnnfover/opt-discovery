@@ -117,3 +117,55 @@
 | 在 `git archive e8630ef` 的临时副本中只移入新版 `tests/test_events.py`，以 `pytest -k 'summarize_epoch_short_event_has_busy or window_clip_drops_event_at_right_boundary or summarize_handles_unordered_slices or parser_and_reader_share_epoch_normalization'` 执行 | 旧版 3 failed、1 passed、13 deselected。前三例分别捕获旧版短事件、右边界、乱序错误。Parser/Reader 时长相等用例在旧版同样通过，共享调用路径由当前生产代码对照确认。 |
 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-delta-probe.lriJLZ.py`，及在当前和隔离的上一提交运行 `/tmp/ae04-final-probe.6uBVXI/probe.py` | 通过真实 Parser、Reader 和 Timeline 重跑旧反例并对照最新变化。排序、右边界起点和原单条有窗样例通过，新增或剩余不符见阻断项。 |
 | `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，未配置真实数据根目录。退出 0 仅说明缺数据闸门正常。真实 Profiling 未执行，NPU、托管 CI 未运行。 |
+
+## 第三次增量复核（2026-11-19）
+
+**AE-04 验收结论为 FAIL。暂不允许合并或进入 AE-05。** 本次审查 `feat/ae-04-event-contract` 上的 `62e661a..d9950de`，对照实施报告 §11，仅复测上轮四项 P1 和修复直接影响的路径。开始时已有未跟踪的 `docs/tasks/`，本次只追加审查报告。
+
+### 上轮问题与 DoD
+
+| 验收项 | 结论 | 实际证据 |
+|---|---|---|
+| 实例标准化复用 | PASS | Parser 和 Timeline 仍走共享实例行标准化。已关闭的分片排序用原探针复测，单文件 20 µs、三分片 30 µs。 |
+| Parser 任务类型映射和单位 | FAIL，原问题未关闭 | 再次用同一映射和 CSV 得到 `unknown` 和 `other / 10,000 µs`，预期 `kernel` 和 `communication / 10 µs`。 |
+| Parser 窗口筛选和质量记录 | 部分通过 | 千分位数字、零时长、`N/A` 起点及缺时间戳列的原反例通过。合法起点配缺失时长时，窗口筛选和轮次计数仍偏离原契约。 |
+| Host 左边界并集 | PASS，原问题关闭 | 两个合法调用的总 busy 由 50 µs 恢复为 20 µs。设备空闲归因有独立回归，见下表。 |
+| epoch 精度和区间分析 | 部分通过 | 跨右边界裁剪为 0.25 µs，窗口内相邻短事件聚合为 0.2 µs，无窗单事件 device/Host busy 为 0.1/0.1 µs，Parser busy ratio 为 20% 且质量未降级。SQLite 窗口边界仍可漏事件，多 rank 和无窗空闲归因回退。 |
+
+### 剩余阻断项
+
+| 级别 | 代码位置 | 影响和复现证据 | 修复建议 |
+|---|---|---|---|
+| P1 · Parser 仍忽略任务类型映射 | `opt_discovery/parsers/csv_mapping.py:446`、`:482`、`:520`、`:830`；`opt_discovery/events.py:180` | 两个 Parser 调用都没有传其映射分类器。`e8630ef` 对空类型应用 `kernel` 默认值，对自定义通信别名的 10,000 ns 得 10 µs。`62e661a` 和 `d9950de` 均输出 `unknown` 及 `other / 10,000 µs`。任务分类、时间及按类型筛选的指标受影响。 | 在 Parser 的有窗及无窗入口传入 `self._resolve_task_type`，以默认值、自定义通信别名及缩放结果验证。 |
+| P1 · 缺时长时绕过 Parser 起点窗口筛选 | `opt_discovery/parsers/csv_mapping.py:435`、`:460`、`:513` | 窗口 `[100,200]`，两轮 `[100,150]`、`[150,200]`。输入为窗口外起点 10、窗口内起点 120，两行时长均为 `N/A`，再加入起点 160 的有效任务。`e8630ef` 输出 `outside=1, skipped=1, rounds={1:1,2:1}`，`d9950de` 输出 `outside=0, skipped=2, rounds={1:0,2:1}`，并生成一个原本应由窗口筛掉的算子组。该轮误标无采集数据。 | 解析出起点后先做窗口筛选和轮次计数，再处理时长和聚合，保持缺时长与缺起点的既有统计口径。 |
+| P1 · 多 rank 和无窗空闲归因使用不同时间原点 | `opt_discovery/analyzer/timeline.py:611`、`:649`、`:663`、`:673`、`:689`、`:769`；使用入口 `opt_discovery/cli.py:375`、`:1789` | 两段 TASK 位于 `[1000,1250]`、`[1450,1600]` µs，另分别用一个 Host 调用和一个真实 SQLite MSTX 标记完整覆盖 200 µs 空洞。`62e661a` 在单 rank 有窗、多 rank 有窗、无窗均给 Host 覆盖 200 µs，单独的 MSTX 样例也覆盖 200 µs。`d9950de` 单 rank 有窗保持 200 µs，其余两条路径的 Host 和 MSTX 覆盖均为 0，Host 分类从 `acl_busy` 变为 `host_silent`。多 rank 未设置窗口原点，无窗未传递 TASK 原点，导致归因结果随入口变化。 | 给设备、Host 与 MSTX 使用共同时间原点。有窗统一用窗口起点，无窗传递首个 TASK 的实际原点。在三条生产路径核对覆盖量和分类。 |
+| P1 · SQLite 窗口界限在筛选前丢失 ns 精度 | `opt_discovery/events.py:382`、`:385`、`:454`、`:457` | 取 `E=1_790_000_000_000_000 µs`，窗口起点 `E+0.25 µs` 应对应 `E×1000+250 ns`，浮点乘法得到 `E×1000+256 ns`。一条在该边界后 2 ns 结束、确实相交的 52 ns TASK 与同范围 Host 调用均被 SQL 丢弃。同样再放入一条窗口内 100 ns 记录，`d9950de` 只统计 1 项任务和 1 次 Host 调用，各应为 2。相对坐标修复保留了已选中事件的时长，查询边界仍沿用舍入后的绝对值。 | 用同一精确换算得到 SQLite 整数 ns 的筛选界限和原点，并保留相交口径。用含小数 µs 边界的真实 SQL 样例断言两个 Reader 的纳入与排除。 |
+
+未发现 P0。上轮已关闭的事件身份、分片及点窗口兼容结论保留。已记录的整任务时长与窗口 busy 历史口径仍为非阻断项。
+
+### 实际验证
+
+| 命令 | 结果 |
+|---|---|
+| `git diff --check 62e661a HEAD` | PASS。 |
+| `PYTHONDONTWRITEBYTECODE=1 make check` | PASS。Ruff、mypy（53 个文件）、配置验证通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae04-close-demo.6E6hSV` | PASS，312 passed、17 skipped，合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，69 passed，含指定六组回归。 |
+| 将当前 `tests/test_events.py` 复制到 `git archive 62e661a` 的临时副本，使用 `pytest -k` 运行此次新增的六例 | 旧版 6 failed、17 deselected。新版六例随定向套件通过。断言覆盖真实生产路径中的数值和质量记录，缺少任务类型映射、多 rank 和无窗归因的回归。 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-close-probe.3dQ2qX/probe.py`，另对照 `62e661a`、`e8630ef` 并运行同目录 `gap-class-probe.py` | 使用临时 CSV 和真实 SQLite 读取函数复跑原反例，验证缺时长、归因和 SQLite 查询边界。逐项实际值见验收矩阵及问题清单。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，数据根目录未配置。退出 0 表示缺数据闸门符合预期。真实 Profiling 未执行，NPU 和托管 CI 未运行。 |
+
+## 当前提交的完整问题清单
+
+本节汇总 `d9950de` 在约定的 AE-04 增量范围内全部已确认的未关闭项。复查时生产代码、测试和配置均无未提交改动。**结论为 FAIL，暂不允许合并或进入 AE-05。无 P0，修复验收集中在以下四组 P1。**
+
+| 级别 | 代码位置 | 一次验收所需的结果 |
+|---|---|---|
+| P1-1 · Parser 任务类型映射 | `opt_discovery/parsers/csv_mapping.py:446`、`:482`、`:830` | 有窗和无窗均使用配置的默认值和别名。空类型应为 `kernel`，自定义通信类型的 10,000 ns 应为 10 µs，并匹配对应的通信额外指标。当前仍为 `unknown`、`other / 10,000 µs`。 |
+| P1-2 · Parser 缺时长时的窗口行为 | `opt_discovery/parsers/csv_mapping.py:435`、`:460`、`:513` | 按有效起点先筛窗口和统计轮次，再处理时长。第三次复核样例应得 `outside=1, skipped=1, rounds={1:1,2:1}`，且窗口外算子不进入结果。保留本轮已经通过的千分位数字、零时长和缺起点处理。 |
+| P1-3 · Timeline 归因原点 | `opt_discovery/analyzer/timeline.py:611`、`:649`、`:663`、`:673`、`:689` | 对同一份 SQLite 样例，单 rank 有窗、多 rank 有窗、无窗都得到 Host 覆盖 200 µs、`acl_busy`。独立 MSTX 样例也都覆盖 200 µs。当前后两条路径均把覆盖算为 0。设备、Host 和 MSTX 应使用同一个原点。 |
+| P1-4 · 窗口相交的时间精度 | `opt_discovery/events.py:382`、`:454`；`opt_discovery/primitives.py:69`、`:75` | SQLite 边界复测仍偏移 6 ns，漏掉 1 条 TASK 和 1 条 Host。补测发现 CSV 也有同组误差：epoch `E` 开始、时长 0.20 µs 的事件与 `[E+0.25,E+1]` 无交集，`iter_op_summary_events` 与 `summarize` 却分别返回 1 个事件和 0.20 µs busy，`clip=True` 正确返回空。SQLite 筛选使用精确整数 ns 边界，CSV 相交比较用时间差和时长，并保留真正相交时的整任务时长。 |
+
+非阻断项保留三条。P2 为 Timeline 沿用整段相交任务统计的历史口径，busy 可能超过窗口长度。P2 为 `load_op_intervals`、`load_task_intervals`、`load_host_intervals` 的绝对浮点区间精度限制，实测三者对 epoch 上的 0.1 µs 均返回 0，事件 Reader 的 `duration_us` 均为 0.1 µs。CLI 与 `summarize` 当前未调用这三个包装，建议在兼容接口文档注明精度限制。P3 为 SQLite 内部排序内存与 DB/表级来源定位的说明，见原报告和实施报告。对应代码为 `opt_discovery/analyzer/timeline.py:284`、`:322`、`:343`、`:650` 和 `opt_discovery/events.py:384`、`:456`。
+
+本次在当前提交重跑 `/tmp/ae04-close-probe.3dQ2qX/probe.py`、同目录 `gap-class-probe.py` 和 `/tmp/ae04-review-inventory.ySExJA/clock.py`，核对了上述 CSV、SQLite 和生产 Timeline 输出。全量测试记录沿用同一提交的第三次复核结果，`make verify` 为 312 passed、17 skipped。真实 Profiling 仍为 BLOCKED，NPU 未运行。分片排序、共享实例标准化、事件身份、点窗口兼容、Host 左边界并集以及已通过的短事件样例维持关闭。

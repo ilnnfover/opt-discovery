@@ -43,7 +43,9 @@ from ..events import (
     iter_op_summary_spans,
     iter_task_span_rows,
     iter_task_spans,
+    ns_from_us,
     op_summary_paths,
+    task_origin_ns,
 )
 from ..primitives import NS_PER_US, Interval, Window
 
@@ -463,6 +465,7 @@ def _rank_intervals(
     ``task_table``。
     """
     origin = window.start_us
+    origin_ns = ns_from_us(window.start_us)
     paths = op_summary_paths(db_path)
     if paths:
         intervals: list[Interval] = []
@@ -474,7 +477,9 @@ def _rank_intervals(
         intervals.sort(key=lambda item: item.start_us)
         return intervals, "op_summary", str(paths[0])
     try:
-        spans = list(iter_task_span_rows(db_path, window=window, origin_us=origin))
+        spans = list(
+            iter_task_span_rows(db_path, window=window, origin_us=origin, origin_ns=origin_ns)
+        )
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
     return (
@@ -504,24 +509,25 @@ def _rank_summary(db_path: str | Path, window: Window, span_us: float) -> dict:
 
 def _device_gap_stats(
     db_path: str | Path, window: Window | None, min_gap_us: float
-) -> tuple[float, float, int, list[float], list[tuple[float, float]], float]:
+) -> tuple[
+    float, int, int, list[float], list[tuple[float, float]], float, int
+]:
     """Stream TASK spans: busy union, gap durations, and gaps >= threshold."""
     busy = 0.0
     durations: list[float] = []
     big_gaps: list[tuple[float, float]] = []
     tasks = 0
-    origin = 0.0
-    first = True
+    try:
+        origin_ns = task_origin_ns(db_path)
+    except EventReadError as exc:
+        raise TimelineError(str(exc)) from exc
+    origin = origin_ns / NS_PER_US
     segment_start: float | None = None
     segment_end: float | None = None
     try:
         for start, duration in iter_task_span_rows(
-            db_path, window=window, origin_us=None
+            db_path, window=window, origin_ns=origin_ns
         ):
-            if first:
-                origin = start
-                start = 0.0
-                first = False
             end = start + duration
             tasks += 1
             if segment_start is None:
@@ -543,15 +549,17 @@ def _device_gap_stats(
         busy += segment_end - segment_start
     if tasks == 0:
         raise TimelineError(f"{db_path}: 窗口内没有 device task，无法分析")
-    return busy, tasks, len(durations), durations, big_gaps, origin
+    return busy, tasks, len(durations), durations, big_gaps, origin, origin_ns
 
 
 def _host_stream(
-    db_path: str | Path, window: Window | None, origin_us: float | None = 0.0
+    db_path: str | Path,
+    window: Window | None,
+    origin_ns: int | None = None,
 ):
     """Yield (start_us, duration_us, name) in start order via the shared reader."""
     try:
-        yield from iter_host_spans(db_path, window=window, origin_us=origin_us)
+        yield from iter_host_spans(db_path, window=window, origin_ns=origin_ns)
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
 
@@ -601,8 +609,9 @@ def summarize(
     merge-joined against the recorded gaps, so memory stays bounded.
     """
     per_rank: tuple[dict, ...] = ()
-    #: None = 无窗口时由 Host 读取器以首个 Host 调用为原点
+    #: Device/Host/MSTX 共用的归属原点
     gap_origin: float | None = None
+    gap_origin_ns: int | None = None
     busy_all = 0.0
     asymmetry = 0.0
     duration_inconsistent = False
@@ -646,7 +655,6 @@ def summarize(
             if busy_source != "op_summary":
                 task_fallback_ranks = [Path(db_path).name]
             merged = _merge(intervals)
-            gap_origin = window.start_us
             device_busy = sum(end - start for start, end in merged)
             gap_durations, big_gaps = _gaps_from_merged(
                 merged, window.duration_us, min_gap_us, top_n
@@ -660,10 +668,13 @@ def summarize(
                 gap_count,
                 gap_durations,
                 big_gaps,
-                _device_origin,
+                gap_origin,
+                gap_origin_ns,
             ) = _device_gap_stats(db_path, window, min_gap_us)
 
     if window is not None:
+        gap_origin_ns = ns_from_us(window.start_us)
+        gap_origin = gap_origin_ns / NS_PER_US
         span = window.duration_us
     else:
         span = device_busy + sum(gap_durations)
@@ -686,9 +697,7 @@ def summarize(
     gap_ends = [item[1] for item in big_gaps]
     cursor = 0
 
-    for start, duration, name in _host_stream(
-        db_path, window, origin_us=gap_origin
-    ):
+    for start, duration, name in _host_stream(db_path, window, origin_ns=gap_origin_ns):
         end = start + duration
         host_calls += 1
         bucket = name_counts.setdefault(name, [0, 0.0])

@@ -47,6 +47,8 @@ __all__ = [
     "iter_task_intervals",
     "iter_task_span_rows",
     "iter_task_spans",
+    "ns_from_us",
+    "task_origin_ns",
     "op_summary_paths",
 ]
 
@@ -180,6 +182,7 @@ def normalize_instance_row(
     resolver=_task_type,
     number_parser=float,
     allow_zero_duration: bool = False,
+    task_type_override: TaskType | None = None,
 ) -> NormalizedRow | None:
     """Shared normalization for one instance row (Parser and Timeline both use it).
 
@@ -204,7 +207,7 @@ def normalize_instance_row(
     if duration_value < 0.0 or (duration_value == 0.0 and not allow_zero_duration):
         return None
     raw_type = row[type_idx] if type_idx is not None and type_idx < len(row) else None
-    task_type = resolver(raw_type)
+    task_type = task_type_override or resolver(raw_type)
     duration_us = normalize_duration(
         duration_value, unit_scale=duration_scale, task_type=task_type
     )
@@ -357,6 +360,33 @@ def op_summary_paths(db_path: str | Path) -> list[Path]:
     return sorted(root.glob("op_summary_*.csv"), key=_natural_key)
 
 
+def ns_from_us(value_us: float) -> int:
+    """µs -> integer ns without losing fractional µs at epoch scale.
+
+    ``value * 1000`` is evaluated as one float multiplication, whose ULP at
+    1.79e18 is 256 ns. Splitting the integer and fractional parts keeps
+    sub-µs window boundaries exact (e.g. E+0.25 -> E*1000+250).
+    """
+    whole = int(value_us)
+    return whole * 1000 + int(round((value_us - whole) * 1000))
+
+
+_ns = ns_from_us
+
+
+def task_origin_ns(db_path: str | Path) -> int:
+    """First TASK start in integer ns (used as a common attribution origin)."""
+    path = Path(db_path)
+    connection = sqlite3.connect(str(path))
+    try:
+        row = connection.execute("select startNs from TASK order by startNs limit 1").fetchone()
+        if row is None:
+            raise EventReadError(f"{path}: TASK 表为空")
+        return int(row[0])
+    finally:
+        connection.close()
+
+
 def _has_table(connection: sqlite3.Connection, name: str) -> bool:
     return any(
         row[0] == name
@@ -368,6 +398,7 @@ def _iter_task_rows(
     db_path: str | Path,
     window: Window | None,
     origin_us: float | None = 0.0,
+    origin_ns: int | None = None,
 ) -> Iterator[tuple[float, float]]:
     path = Path(db_path)
     if not path.is_file():
@@ -380,9 +411,15 @@ def _iter_task_rows(
         params: list[float] = []
         if window is not None:
             sql += " where endNs >= ? and startNs <= ?"
-            params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
+            params = [_ns(window.start_us), _ns(window.end_us)]
         sql += " order by startNs"
-        origin_ns = int(origin_us * NS_PER_US) if origin_us is not None else None
+        origin_ns = (
+            origin_ns
+            if origin_ns is not None
+            else (0 if origin_us is None else _ns(origin_us))
+        )
+        if origin_ns is None:
+            origin_ns = 0
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
             if origin_ns is None:
@@ -415,12 +452,13 @@ def iter_task_span_rows(
     *,
     window: Window | None = None,
     origin_us: float | None = 0.0,
+    origin_ns: int | None = None,
 ) -> Iterator[tuple[float, float]]:
     """``(start_us, duration_us)`` TASK view (epoch-safe duration).
 
     ``origin_us`` 把绝对 epoch 时间平移到小坐标；不传时以首个任务为原点。
     """
-    yield from _iter_task_rows(db_path, window, origin_us)
+    yield from _iter_task_rows(db_path, window, origin_us, origin_ns)
 
 
 def iter_task_spans(
@@ -436,6 +474,7 @@ def iter_host_spans(
     *,
     window: Window | None = None,
     origin_us: float | None = 0.0,
+    origin_ns: int | None = None,
 ) -> Iterator[tuple[float, float, str]]:
     """Tuple view ``(start_us, duration_us, name)`` for timeline attribution."""
     path = Path(db_path)
@@ -452,9 +491,15 @@ def iter_host_spans(
         params: list[float] = []
         if window is not None:
             sql += " where a.endNs >= ? and a.startNs <= ?"
-            params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
+            params = [_ns(window.start_us), _ns(window.end_us)]
         sql += " order by a.startNs"
-        origin_ns = int(origin_us * NS_PER_US) if origin_us is not None else None
+        origin_ns = (
+            origin_ns
+            if origin_ns is not None
+            else (0 if origin_us is None else _ns(origin_us))
+        )
+        if origin_ns is None:
+            origin_ns = 0
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
             if origin_ns is None:

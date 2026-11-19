@@ -433,7 +433,7 @@ class MappingCsvParser:
                                 1.0, self.mapping.fields["total_time_us"].unit
                             )
                             if window is not None:
-                                # 保持旧语义：缺起点先记 skipped，不当作窗口外
+                                # 保持旧语义：先按有效起点筛窗口/轮次，再处理时长
                                 timestamp = _row_start(file_columns, row, self.mapping)
                                 if timestamp is None:
                                     meta.skipped_rows += 1
@@ -443,11 +443,33 @@ class MappingCsvParser:
                                         f"{file.name}:{line_no}",
                                     )
                                     continue
+                                span = window_span(
+                                    timestamp, 0.0, window, policy="start"
+                                )
+                                if span is None:
+                                    rows_outside += 1
+                                    continue
+                                timestamp = span[0]
+                                for (
+                                    round_index,
+                                    round_start,
+                                    round_end,
+                                ) in window.round_spans:
+                                    if round_start <= timestamp <= round_end:
+                                        round_counts[round_index] = (
+                                            round_counts.get(round_index, 0) + 1
+                                        )
+                                        break
+                                type_pos = file_columns.fields.get("task_type")
                                 row_metrics = normalize_instance_row(
                                     row,
                                     start_idx=start_pos,
                                     duration_idx=duration_pos,
-                                    type_idx=file_columns.fields.get("task_type"),
+                                    task_type_override=self._resolve_task_type(
+                                        row[type_pos]
+                                        if type_pos is not None and type_pos < len(row)
+                                        else None
+                                    ),
                                     operator_idx=file_columns.fields.get("operator"),
                                     start_scale=start_scale,
                                     duration_scale=duration_scale,
@@ -455,35 +477,17 @@ class MappingCsvParser:
                                     number_parser=_to_float,
                                     allow_zero_duration=True,
                                 )
-                                if row_metrics is not None and row_metrics.start_us != timestamp:
-                                    timestamp = row_metrics.start_us
-                                if row_metrics is not None:
-                                    span = window_span(
-                                        timestamp,
-                                        row_metrics.duration_us,
-                                        window,
-                                        policy="start",
-                                    )
-                                    if span is None:
-                                        rows_outside += 1
-                                        continue
-                                    timestamp = span[0]
-                                    for (
-                                        round_index,
-                                        round_start,
-                                        round_end,
-                                    ) in window.round_spans:
-                                        if round_start <= timestamp <= round_end:
-                                            round_counts[round_index] = (
-                                                round_counts.get(round_index, 0) + 1
-                                            )
-                                            break
                             else:
+                                type_pos = file_columns.fields.get("task_type")
                                 row_metrics = normalize_instance_row(
                                     row,
                                     start_idx=start_pos,
                                     duration_idx=duration_pos,
-                                    type_idx=file_columns.fields.get("task_type"),
+                                    task_type_override=self._resolve_task_type(
+                                        row[type_pos]
+                                        if type_pos is not None and type_pos < len(row)
+                                        else None
+                                    ),
                                     operator_idx=file_columns.fields.get("operator"),
                                     start_scale=start_scale,
                                     duration_scale=duration_scale,

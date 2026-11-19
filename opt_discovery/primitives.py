@@ -66,13 +66,15 @@ def window_span(
     """
     if window is None:
         return start_us, duration_us
-    end_us = start_us + duration_us
     if policy == "start":
         if not window.contains(start_us):
             return None
         return start_us, duration_us
     if policy == "intersect":
-        if end_us < window.start_us or start_us > window.end_us:
+        # 用时间差/时长判断，避免 epoch 上 start+duration 先被舍入
+        if start_us >= window.end_us or duration_us <= 0.0:
+            return None
+        if duration_us <= window.start_us - start_us:
             return None
         return start_us, duration_us
     if policy != "clip":
