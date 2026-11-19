@@ -15,6 +15,7 @@ from opt_discovery.events import (
     HostCall,
     TaskIntervalEvent,
     iter_host_calls,
+    iter_host_spans,
     iter_op_summary_events,
     iter_op_summary_intervals,
     iter_task_intervals,
@@ -700,3 +701,46 @@ def test_ns_boundaries_and_csv_intersection_precision(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert list(iter_op_summary_events(csv_path, window=window)) == []
+
+
+def test_reader_origin_none_uses_first_row(tmp_path: Path) -> None:
+    """P1：origin_us=None 保留“首行原点”语义；默认仍是绝对坐标。"""
+    db = tmp_path / "PROF_000000_test" / "msprof_0.db"
+    db.parent.mkdir(parents=True)
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    for start in (1_000_000, 1_100_000):
+        connection.execute("insert into TASK values (?, ?)", (start, start + 100_000))
+        connection.execute("insert into CANN_API values (1, ?, ?)", (start, start + 100_000))
+    connection.commit()
+    connection.close()
+
+    relative_tasks = list(iter_task_span_rows(db, origin_us=None))
+    assert [start for start, _ in relative_tasks] == pytest.approx([0.0, 100.0])
+    relative_host = list(iter_host_spans(db, origin_us=None))
+    assert [start for start, _, _ in relative_host] == pytest.approx([0.0, 100.0])
+
+    absolute_tasks = list(iter_task_span_rows(db))
+    assert [start for start, _ in absolute_tasks][0] == pytest.approx(1000.0)
+    assert list(iter_task_intervals(db))[0].start_us == pytest.approx(1000.0)
+
+
+def test_missing_task_db_raises_timeline_error_without_creating(tmp_path: Path) -> None:
+    """P2：缺 TASK/文件时保持 TimelineError，不创建空库、不泄露 sqlite 异常。"""
+    from opt_discovery.analyzer.timeline import TimelineError
+    from opt_discovery.events import EventReadError, task_origin_ns
+
+    missing = tmp_path / "not-there.db"
+    with pytest.raises(TimelineError):
+        timeline.summarize(missing, None)
+    assert not missing.exists()
+
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    with pytest.raises(TimelineError):
+        timeline.summarize(empty, None)
+    with pytest.raises(EventReadError):
+        task_origin_ns(empty)

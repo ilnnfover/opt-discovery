@@ -111,7 +111,7 @@ class KernelEvent:
 
 ## 6. 测试与验证
 
-新增 `tests/test_events.py`（27 条）：
+新增 `tests/test_events.py`（29 条）：
 
 - op_summary filter/clip 语义、COMMUNICATION 单位缩放、来源行号、rank、坏行/零时长跳过；
 - 缺时间列报 `EventReadError`；生成器惰性；
@@ -123,8 +123,8 @@ class KernelEvent:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check` | 0 | Ruff / mypy 53 文件 / validate |
-| `python -m pytest`（3.12） | 0 | 316 passed, 17 skipped（333 用例） |
-| `python -m pytest`（3.11） | 0 | 316 passed, 17 skipped |
+| `python -m pytest`（3.12） | 0 | 318 passed, 17 skipped（335 用例） |
+| `python -m pytest`（3.11） | 0 | 318 passed, 17 skipped |
 | `make verify DEMO_OUT=/tmp/ae04-demo2` | 0 | 合成演示完成 |
 | `tests/test_real_data.py`（授权数据） | 0 | 16 passed, 1 skipped |
 | `verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED |
@@ -163,7 +163,7 @@ class KernelEvent:
 
 P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语义，作为已知差异记录；若切换口径需单独结果验收。
 
-验证：`make check` 0；`pytest` **316 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **318 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
 
 ## 10. 增量复核修复（2026-11-19）
 
@@ -176,7 +176,7 @@ P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语�
 
 说明：Timeline 的“整任务时长 / 窗口 busy”历史口径仍未改变（P2-1），仅将内部并集坐标改为窗口相对；对输出字段的语义没有切换。
 
-验证：`make check` 0；`pytest` **316 passed, 17 skipped**（323 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **318 passed, 17 skipped**（323 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
 
 ## 11. 第二轮增量复核修复（2026-11-19）
 
@@ -189,7 +189,7 @@ P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语�
 
 说明：Timeline 的“整任务时长/窗口 busy”历史口径（P2-1）仍未切换，只调整内部相对坐标。
 
-验证：`make check` 0；`pytest` **316 passed, 17 skipped**（329 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **318 passed, 17 skipped**（329 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
 
 ## 12. 第三轮增量复核修复（2026-11-19）
 
@@ -200,4 +200,22 @@ P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语�
 | P1-3 | 多 rank/无窗的 Host/MSTX 归因原点不同 | 有窗统一用窗口起点的整数 ns；无窗用首个 TASK 的实际整数 ns；Device、Host、MSTX 共用该原点；多 rank 分支同样设置 | `test_gap_attribution_uses_common_origin`（单/多/无窗 Host 与独立 MSTX 均覆盖 200µs） |
 | P1-4 | SQLite 窗口边界的 ns 精度、CSV 相交先加 epoch | `ns_from_us` 用整数部分 + 小数部分换算（E+0.25→E×1000+250）；SQLite 查询用该整数边界；CSV `intersect` 用“时长 vs 起点差”判断，并排除右边界起点 | `test_ns_boundaries_and_csv_intersection_precision`（52ns 跨界事件纳入、E 起 0.2µs 事件与 [E+0.25,E+1] 无交集） |
 
-验证：`make check` 0；`pytest` **316 passed, 17 skipped**（333 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+验证：`make check` 0；`pytest` **318 passed, 17 skipped**（333 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。
+
+## 13. `344c2b9` 增量复核修复与自检（2026-11-19）
+
+| 级别 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1 | 公开 Reader 的 `origin_us=None` 被当成零偏移，丢失“首行原点”语义 | `_iter_task_rows` / `iter_host_spans` 在 `origin_us=None` 时延迟到首行再锁定整数 ns 原点；`origin_us=0.0` 仍为绝对坐标，显式 `origin_ns` 优先 | `test_reader_origin_none_uses_first_row`：相对 `[0,100]µs`、默认绝对 `1000µs`、`iter_task_intervals` 绝对 |
+| P2 | 无窗 TASK 原点预读对缺失路径会创建空库并泄露 `sqlite3.OperationalError` | `task_origin_ns` 先检查文件存在，再用 `mode=ro` 只读打开、检查 `TASK` 表/非空，统一抛 `EventReadError`；Timeline 继续包装为 `TimelineError` | `test_missing_task_db_raises_timeline_error_without_creating`：不创建文件、空库/缺表均为 `TimelineError` |
+
+自检结果：
+
+| 检查 | 结果 |
+|---|---|
+| `make check` | 0 |
+| `pytest` | **318 passed, 17 skipped**（335 用例） |
+| `make verify DEMO_OUT=/tmp/ae04-r5-demo` | 0，318 passed / 17 skipped |
+| 真实数据 `tests/test_real_data.py` | 16 passed, 1 skipped |
+| R01/R03/R08/R09/R10/R12 | 17 passed |
+| `git diff --check` | 0 |

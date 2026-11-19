@@ -169,3 +169,30 @@
 非阻断项保留三条。P2 为 Timeline 沿用整段相交任务统计的历史口径，busy 可能超过窗口长度。P2 为 `load_op_intervals`、`load_task_intervals`、`load_host_intervals` 的绝对浮点区间精度限制，实测三者对 epoch 上的 0.1 µs 均返回 0，事件 Reader 的 `duration_us` 均为 0.1 µs。CLI 与 `summarize` 当前未调用这三个包装，建议在兼容接口文档注明精度限制。P3 为 SQLite 内部排序内存与 DB/表级来源定位的说明，见原报告和实施报告。对应代码为 `opt_discovery/analyzer/timeline.py:284`、`:322`、`:343`、`:650` 和 `opt_discovery/events.py:384`、`:456`。
 
 本次在当前提交重跑 `/tmp/ae04-close-probe.3dQ2qX/probe.py`、同目录 `gap-class-probe.py` 和 `/tmp/ae04-review-inventory.ySExJA/clock.py`，核对了上述 CSV、SQLite 和生产 Timeline 输出。全量测试记录沿用同一提交的第三次复核结果，`make verify` 为 312 passed、17 skipped。真实 Profiling 仍为 BLOCKED，NPU 未运行。分片排序、共享实例标准化、事件身份、点窗口兼容、Host 左边界并集以及已通过的短事件样例维持关闭。
+
+## `344c2b9` 增量复核（2026-11-19）
+
+**验收结论为 FAIL。暂缓合并与进入 AE-05。** 本次对照 `d9950de..344c2b9` 与实施报告 §12，复核上轮问题及此次修改直接经过的代码。上轮四组问题均已关闭。此次时钟修复改变了两个公开 Reader 的相对时间参数语义，产生一项 P1。
+
+| 上轮验收项 | 复核结果 | 实际证据 |
+|---|---|---|
+| P1-1 · Parser 任务类型映射 | 关闭 | 有窗、无窗均将空类型解析为 `kernel`。自定义通信别名按 10,000 ns → 10 µs 换算，`communication_time_us` 同为 10 µs。 |
+| P1-2 · 缺时长时的窗口行为 | 关闭 | 样例恢复 `outside=1, skipped=1, rounds={1:1,2:1}`，窗口外算子未进入结果。千分位、零时长与缺起点的既有用例继续通过。 |
+| P1-3 · Timeline 归因原点 | 关闭 | 使用独立主、次 rank SQLite 文件及 `load_mstx` 的实际读取路径。单 rank 有窗、多 rank 有窗及无窗均有 200 µs Host 覆盖并归类 `acl_busy`，独立 MSTX 样例均覆盖 200 µs。 |
+| P1-4 · 窗口相交精度 | 关闭 | SQLite 原反例恢复 2 项 TASK 和 2 次 Host 调用，device/Host busy 各 0.152 µs。CSV 原反例在事件 Reader 和 `summarize` 中均得到 0 项，device busy 为 0。 |
+
+| 级别 | 代码位置 | 实际影响与修复建议 |
+|---|---|---|
+| P1 · 公开 Reader 的首事件相对坐标回归 | `opt_discovery/events.py:416`、`:450`、`:496` | 用 `origin_us=None` 显式请求按首行定位时，`d9950de` 的 TASK 与 Host Reader 均返回起点 `[0.0, 0.1] µs`。`344c2b9` 把 `None` 变成零偏移，返回 epoch 绝对坐标，两个起点之差变为 0.25 µs。此前实现和 TASK Reader 文档均有首行原点语义。应保留 `None` 直到读到首行，再锁定原始整数 ns。Timeline 继续传显式 `origin_ns`，回归同时覆盖默认绝对坐标、首行相对坐标和显式整数原点。 |
+| P2 · 无窗 TASK 原点预读改变缺数据行为 | `opt_discovery/events.py:377`、`:403`；`opt_discovery/analyzer/timeline.py:520` | 同一个缺 TASK 表的 SQLite 文件，上一提交返回 `TimelineError`，当前泄出 `sqlite3.OperationalError`。直接给 `summarize` 传不存在的路径时，当前还会创建空数据库文件。复用共享 Reader 的文件与表存在性检查，预读以只读方式打开，并保留既有错误类型。 |
+
+无 P0。上一节的历史统计口径、旧绝对区间表示和来源说明继续作为非阻断记录。
+
+| 验证 | 结果 |
+|---|---|
+| `git diff --check d9950de HEAD` 和 `PYTHONDONTWRITEBYTECODE=1 make check` | PASS。Ruff、mypy 与配置检查通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae04-344-demo.5v9S4t` | PASS，316 passed、17 skipped，合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_events.py tests/test_timeline.py tests/test_timeline_op_summary.py tests/test_csv_parser.py tests/regression/test_r{01,03,08,09,10,12}*.py` | PASS，73 passed。 |
+| 在 `git archive d9950de` 的临时副本中运行本次新增的四个测试 | 预期失败，4 failed、23 deselected。四个测试在 `344c2b9` 的定向套件中通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 /tmp/ae04-344-probe.s8DriW/check.py`，并从隔离的 `d9950de` 目录运行同一探针 | 独立 CSV 和 SQLite 探针实测上轮四组均关闭。新增相对坐标回归与缺数据路径回归见上表。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | BLOCKED，未配置真实数据根目录。NPU 与托管 CI 未运行。 |

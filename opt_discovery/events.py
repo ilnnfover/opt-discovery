@@ -377,12 +377,23 @@ _ns = ns_from_us
 def task_origin_ns(db_path: str | Path) -> int:
     """First TASK start in integer ns (used as a common attribution origin)."""
     path = Path(db_path)
-    connection = sqlite3.connect(str(path))
+    if not path.is_file():
+        raise EventReadError(f"{path}: 文件不存在")
     try:
-        row = connection.execute("select startNs from TASK order by startNs limit 1").fetchone()
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise EventReadError(f"{path}: 无法打开 sqlite: {exc}") from exc
+    try:
+        if not _has_table(connection, "TASK"):
+            raise EventReadError(f"{path}: 缺少 TASK 表（该 rank 的聚合可能失败）")
+        row = connection.execute(
+            "select startNs from TASK order by startNs limit 1"
+        ).fetchone()
         if row is None:
             raise EventReadError(f"{path}: TASK 表为空")
         return int(row[0])
+    except sqlite3.Error as exc:
+        raise EventReadError(f"{path}: 读取 TASK 失败: {exc}") from exc
     finally:
         connection.close()
 
@@ -413,19 +424,16 @@ def _iter_task_rows(
             sql += " where endNs >= ? and startNs <= ?"
             params = [_ns(window.start_us), _ns(window.end_us)]
         sql += " order by startNs"
-        origin_ns = (
-            origin_ns
-            if origin_ns is not None
-            else (0 if origin_us is None else _ns(origin_us))
+        # origin_us=None：读到首行后再锁定原点（相对坐标）；0.0/显式 ns：绝对坐标
+        resolved_origin = (
+            origin_ns if origin_ns is not None else (None if origin_us is None else _ns(origin_us))
         )
-        if origin_ns is None:
-            origin_ns = 0
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
-            if origin_ns is None:
-                origin_ns = start_ns
+            if resolved_origin is None:
+                resolved_origin = start_ns
             duration_ns = int(row[1]) - start_ns
-            yield (start_ns - origin_ns) / NS_PER_US, duration_ns / NS_PER_US
+            yield (start_ns - resolved_origin) / NS_PER_US, duration_ns / NS_PER_US
     finally:
         connection.close()
 
@@ -493,20 +501,16 @@ def iter_host_spans(
             sql += " where a.endNs >= ? and a.startNs <= ?"
             params = [_ns(window.start_us), _ns(window.end_us)]
         sql += " order by a.startNs"
-        origin_ns = (
-            origin_ns
-            if origin_ns is not None
-            else (0 if origin_us is None else _ns(origin_us))
+        resolved_origin = (
+            origin_ns if origin_ns is not None else (None if origin_us is None else _ns(origin_us))
         )
-        if origin_ns is None:
-            origin_ns = 0
         for row in connection.execute(sql, params):
             start_ns = int(row[0])
-            if origin_ns is None:
-                origin_ns = start_ns
+            if resolved_origin is None:
+                resolved_origin = start_ns
             duration_ns = int(row[1]) - start_ns
             yield (
-                (start_ns - origin_ns) / NS_PER_US,
+                (start_ns - resolved_origin) / NS_PER_US,
                 duration_ns / NS_PER_US,
                 str(row[2] or "unknown"),
             )
