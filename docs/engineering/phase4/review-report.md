@@ -84,3 +84,52 @@
 | 在 `/tmp/ae05-incremental.plDphI/checkout` 执行 `previous.py`、`previous-gate.py` 和 `incremental.py` | 在独立生产路径 fixture 和完整 Git 副本中复跑旧样例、直接运行真检查器并注入 `make check`。具体退出码见上两表。 |
 
 本轮验证限于修复差异，未重跑 `make verify`、真实数据或托管 CI。复核结论以三项 P1 所列的明确正反例为合并门槛。
+
+## `3bbc634` 增量复核（2026-11-19）
+
+**验收结论仍为 FAIL。暂缓合并和进入 AE-06。** 本轮只检查 `d2eb678..3bbc634` 和修复直接影响的分支。上轮三项 P1 的原始反例均通过。OD002 已关闭，OD003 和 OD004 各有一项直接回归。无 P0。
+
+| 上轮事项 | 复核结果 | 实际证据 |
+|---|---|---|
+| OD002 · 单位换算和普通计数 | 关闭 | 在完整副本中，`0.001 * duration_ns` 和 `row['duration_ns'] / 1000` 同一行得到两条 OD002，`make check` 退出 2。`items * 1000` 退出 0。 |
+| OD003 · raw 读取与合法文案 | 原例闭合，修复路径仍阻断 | 报告读取 `op_summary_1.csv` 时 `make check` 退出 2。`csv.writer`、SQLite 来源文案和普通 `signal.connect(callback)` 通过。相邻合法 I/O 回归见下表。 |
+| OD004 · 同文件未验证升级 | 原例闭合，修复路径仍阻断 | 原验证写入通过。向同一个 `feedback.py` 追加直接写 `PROBABLE` 的函数时，`make check` 退出 2。原豁免行的等级上限回归见下表。 |
+| OD001、OD007 · 上轮两个非阻断例 | 关闭 | 定向套件覆盖了 `Metric` 中不比较 `None` 的条件表达式，以及带引号的 YAML 阈值键定位。 |
+
+### 剩余阻断项
+
+| 级别 | 代码位置 | 实际影响及修复建议 |
+|---|---|---|
+| P1 · OD004 的行号豁免取消了证据等级上限 | `tools/arch_lint.py:393`；`configs/quality/arch_lint.yaml:63`；`opt_discovery/experiment/feedback.py:130` | 在副本中只把真实验证分支第 130 行的 `ConfidenceLevel.PROBABLE` 改为 `ConfidenceLevel.CONFIRMED`，保留原行号及所有验证条件。上一提交的检查器退出 1，新提交的 `make check` 退出 0。该单变量验证路径只能升到 `PROBABLE`，行号单独命中使超上限写入免检。豁免同时匹配原写入点和允许的右值，补同一实际行改写为 `CONFIRMED` 的回归。 |
+| P1 · OD003 把合法的错误处理和写文件误判为 raw 读取 | `tools/arch_lint.py:296`、`:307`、`:340`；任务书 `docs/tasks/Opt-Discovery-Agent-Engineering-Task.md:267` | 在 CLI 函数中仅 `from csv import Error`，捕获公共 API 抛出的 `Error` 并转换为用户可见异常，`make check` 退出 2，诊断称直接解析原始数据。在报告中用 `(out / 'op_summary_processed.csv').open('w', encoding='utf-8')` 写派生文件，亦退出 2，诊断称读取原始 Profiler。两个正例在上一提交的检查器均退出 0。将 CSV 判断限定到明确的原始读取，并区分 `open` 的读写模式。保留原始 CSV 直接读取的反例。 |
+
+### 本轮实际验证
+
+| 验证 | 结果 |
+|---|---|
+| `git diff --check d2eb678 HEAD`、`PYTHONDONTWRITEBYTECODE=1 make check` | 退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_arch_lint.py` | 34 passed。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae05-close.kBunBu/scope.py /tmp/ae05-close.kBunBu/current /tmp/ae05-close.kBunBu/previous` | 使用两个隔离的 Git 副本。当前提交实际运行 `make check`，上一提交运行同一 lint CLI，对照结果见上表。 |
+
+按增量范围，本轮未重跑 `make verify`、真实数据或托管 CI。`opt_discovery/` 与 CI 工作流在本次修复 diff 中无改动。
+
+## AE-05 最终验收（2026-11-19）
+
+**验收结论为 PASS。当前工作区的 AE-05 修复达到合并条件，可以进入 AE-06。** 服务器上的 CodeBuddy 使用 `deepseek-v4.1-flash` 在隔离工作树开发修复。本次独立审核基线 `3bbc634` 上的三份开发改动，并在应用到功能分支工作区后复跑检查和合成演示。
+
+| 上轮阻断 | 最终结果 | 独立验收结果 |
+|---|---|---|
+| OD004 · 行号豁免放过证据等级越界 | 已关闭 | 豁免同时匹配现有写入位置和 `ConfidenceLevel.PROBABLE`。将第 130 行改为 `CONFIRMED` 后，检查器退出 1，`make check` 退出 2。改用其他接收者的 `.PROBABLE` 或在同文件新增 `.PROBABLE` 写入均触发 OD004。既有验证升级通过。涉及 `tools/arch_lint.py:120`、`:399` 和 `configs/quality/arch_lint.yaml:64`。 |
+| OD003 · 合法 CSV 错误处理和派生输出误报 | 已关闭 | CLI 仅导入 `csv.Error`、报告使用 `csv.writer` 或来源说明、`open` 和 `Path.open` 显式写入时均通过。默认读取、显式读取、含 `+` 的读写模式及直接读取 `op_summary_1.csv` 仍触发 OD003。SQLite TASK 反例继续被拦截。涉及 `tools/arch_lint.py:133`、`:299`。 |
+| OD002 及上轮已关闭的事项 | 维持关闭 | 隔离副本中两种直接纳秒换算让 `make check` 退出 2，`items * 1000` 退出 0。现有 ARCH 和 OD001–OD007 用例均通过。 |
+
+此次改动仅涉及检查器、豁免配置、Lint 回归测试和本报告。生产运行时与 CI 工作流的差异为空，未发现新的 P0 或 P1。
+
+| 验证 | 结果 |
+|---|---|
+| `git diff --check`、`PYTHONDONTWRITEBYTECODE=1 make check` | PASS。Ruff、架构和领域检查、mypy、配置验证退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae05-final-demo.KjUh01` | PASS，357 passed、17 skipped。四组合成演示完成。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_arch_lint.py` | PASS，39 passed，包含本轮新增的五个测试。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae05-codebuddy.FgCpuO/audit.py "$PWD"` | PASS，14 个独立正反例均匹配预期规则和退出码。 |
+| 在隔离 Git 副本应用开发差异后，以 `scope.py` 注入并运行 `make check` | 证据越级、同文件新增未验证升级、raw CSV 读取和未经授权的纳秒换算退出 2。CLI 合法 CSV 错误处理、派生文件写入、报告合法文案与计数退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_real.py --expect-blocked` | 真实 Profiling 为 BLOCKED。复核环境未配置数据目录，NPU 和托管 CI 未执行。 |
