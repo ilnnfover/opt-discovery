@@ -2,7 +2,7 @@
 PYTHON ?= python3
 DEMO_OUT ?= out/demo-check
 
-.PHONY: help check lint typecheck validate demo test verify verify-real clean-env-check clean
+.PHONY: help check lint arch-lint typecheck validate demo test verify verify-real clean-env-check clean
 
 help:
 	@echo "make check       静态检查 + 类型检查 + CLI validate（无需 NPU/真实数据）"
@@ -12,10 +12,13 @@ help:
 	@echo "make lint / typecheck / validate / demo / test  单独执行"
 
 # 架构/领域检查（AE-05）尚未实现；实现后在此接入，而不是假装已存在。
-check: lint typecheck validate
+check: lint arch-lint typecheck validate
 
 lint:
 	$(PYTHON) -m ruff check .
+
+arch-lint:
+	$(PYTHON) -m tools.arch_lint --config configs/quality/arch_lint.yaml
 
 typecheck:
 	$(PYTHON) -m mypy

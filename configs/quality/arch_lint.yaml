@@ -1,0 +1,58 @@
+# AE-05 architecture / domain lint configuration.
+#
+# Rules are intentionally narrow: they encode agreed boundaries and known
+# domain hazards, not general style preferences. Add an exception only with a
+# reason and keep it file-scoped.
+
+arch_rules:
+  - name: core-schemas
+    roots: ["opt_discovery/schemas"]
+    forbid:
+      - opt_discovery.cli
+      - opt_discovery.report
+      - opt_discovery.discovery
+      - opt_discovery.diagnosis
+      - opt_discovery.analyzer
+      - opt_discovery.collectors
+      - opt_discovery.parsers
+      - opt_discovery.experiment
+      - opt_discovery.source_analysis
+  - name: diagnosis-no-raw-profiler
+    roots: ["opt_discovery/diagnosis"]
+    forbid:
+      - opt_discovery.parsers
+      - opt_discovery.collectors
+      - opt_discovery.events
+  - name: report-read-only
+    roots: ["opt_discovery/report"]
+    forbid:
+      - opt_discovery.diagnosis
+      - opt_discovery.discovery
+      - opt_discovery.parsers
+      - opt_discovery.collectors
+      - opt_discovery.events
+  - name: discovery-no-raw-profiler
+    roots: ["opt_discovery/discovery"]
+    forbid:
+      - opt_discovery.parsers
+      - opt_discovery.collectors
+      - opt_discovery.events
+      - opt_discovery.cli
+      - opt_discovery.report
+
+# OD002: raw unit conversion is only authorized in the adapters below.
+od002_authorized_files:
+  - opt_discovery/events.py
+  - opt_discovery/primitives.py
+  - opt_discovery/analyzer/timeline.py
+  - opt_discovery/parsers/sqlite_op_report.py
+  - opt_discovery/collectors/mstx.py
+  - opt_discovery/schemas/units.py
+  # 展示层毫秒列，不是 profiler 原始单位换算
+  - opt_discovery/report/summary_csv.py
+
+# OD005: broad exceptions may only be swallowed where an explicit cleanup or
+# best-effort path cannot mask the original error.
+od005_allow:
+  - file: opt_discovery/cli.py
+    reason: best-effort early input protection; original error is reported before this handler
