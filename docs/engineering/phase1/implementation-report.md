@@ -3,7 +3,7 @@
 - 任务书：`docs/tasks/Opt-Discovery-Agent-Engineering-Task.md`
 - 实施日期：2026-11-18
 - 本轮范围：AE-00（仓库审计）、AE-01（最小确定性检查矩阵）、AE-02（历史问题回归）
-- 非目标：AE-03 及之后任务
+- 非目标：AE-03 及之后任务（AE-03 已在 `docs/engineering/phase2/implementation-report.md` 实施）
 
 ## 0. 基线 commit 确认
 

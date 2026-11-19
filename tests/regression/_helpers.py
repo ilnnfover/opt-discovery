@@ -60,6 +60,7 @@ def make_workload(
     batch_size: int | None = 1,
     input_length: int | None = 1024,
     output_length: int | None = 1,
+    verified: bool = True,
 ) -> WorkloadSpec:
     """构造可比较的 Workload（同一模型/硬件/输入，只改执行模式）。"""
     return WorkloadSpec(
@@ -72,6 +73,7 @@ def make_workload(
         input=InputSpec(
             batch_size=batch_size, input_length=input_length, output_length=output_length
         ),
+        verified=verified,
     )
 
 

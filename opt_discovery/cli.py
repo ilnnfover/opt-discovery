@@ -26,6 +26,15 @@ from .analyzer.compare import ComparisonReport, compare_tables
 from .analyzer.contract import compare_contracts, load_table_json
 from .analyzer.graph_coverage import summarize_coverage
 from .analyzer.hotspot import hotspot_matrix, matrix_to_text, operator_hotspots
+from .analyzer.rank_quality import (
+    assess_bundle,
+    assess_rank_tables,
+    expected_ranks,
+    load_rank_tables,
+    rank_quality_from_timeline,
+    timeline_coverage_flags,
+    unverified_flags,
+)
 from .analyzer.timeline import annotate_diagnosis as annotate_with_timeline
 from .analyzer.timeline import summarize as summarize_timeline
 from .analyzer.window import Window, select_rounds_window
@@ -39,6 +48,47 @@ from .discovery.generator import opportunities_from_diagnosis
 from .experiment.analyzer import compare_benchmarks, load_run
 from .experiment.calibration import DEFAULT_MIN_SAMPLES, calibrate
 from .experiment.feedback import apply_feedback, load_comparison
+from .experiment.run_manifest import (
+    COMPARISON_DESCRIPTIVE,
+    COMPARISON_FAILED,
+    COMPARISON_INCOMPARABLE,
+    COMPARISON_NOT_REQUESTED,
+    COMPARISON_SUCCESS,
+    STAGE_FAILED,
+    STAGE_NOT_REQUESTED,
+    STAGE_PASSED,
+    STAGE_SKIPPED,
+    STATUS_EXIT,
+    STATUS_FAILED,
+    STATUS_INCOMPARABLE,
+    STATUS_PARTIAL,
+    STATUS_SUCCESS,
+    RunManifest,
+    StageRecord,
+    WorkloadRecord,
+    artifact_allowlist,
+    collect_artifacts,
+    fingerprint_configs,
+    manifest_workload_ids,
+    new_run_id,
+    read_manifest,
+    refresh_manifest_artifacts,
+    resolve_manifest_path,
+    sha256_of,
+    tool_info,
+    verify_manifest,
+    write_manifest,
+    write_manifest_pointer,
+)
+from .experiment.run_manifest import (
+    EXIT_FAILED as MANIFEST_EXIT_FAILED,
+)
+from .experiment.run_manifest import (
+    EXIT_INVALID as MANIFEST_EXIT_INVALID,
+)
+from .experiment.run_manifest import (
+    EXIT_SUCCESS as MANIFEST_EXIT_SUCCESS,
+)
 from .experiment.runner import run_benchmark
 from .experiment.validation import validate_thresholds
 from .parsers.csv_mapping import CsvMapping, MappingCsvParser
@@ -48,6 +98,17 @@ from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
+from .schemas.quality import (
+    DEGRADED,
+    EMPTY_WINDOW,
+    LOW_ROUND_COVERAGE,
+    MISSING_ROUNDS,
+    TIMELINE_SKIPPED,
+    TIMELINE_UNAVAILABLE,
+    QualityFlag,
+)
+from .schemas.quality import attach as attach_quality
+from .schemas.quality import blocking as blocking_quality
 from .schemas.workload import WorkloadSpec
 from .source_analysis.mapping import (
     DEFAULT_REPOS,
@@ -737,24 +798,11 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
 
     parser = MappingCsvParser(CsvMapping.load(args.summary_mapping))
     sqlite_parser = SqliteOpReportParser()
-    tables: dict[int, OperatorTable] = {}
-    sources: dict[int, str] = {}
-    scopes: dict[int, str] = {}
-    for rank in bundle.ranks:
-        if rank.op_summary_files:
-            tables[rank.rank] = parser.parse(
-                rank.op_summary_files, bundle.workload, window=window
-            )
-            sources[rank.rank] = "op_summary(窗口)"
-            scopes[rank.rank] = "window"
-        else:
-            target = rank.op_report_db or rank.directory
-            try:
-                tables[rank.rank] = sqlite_parser.parse(target, bundle.workload)
-                sources[rank.rank] = "sqlite op_report(全量)"
-                scopes[rank.rank] = "full"
-            except Exception as exc:  # noqa: BLE001
-                print(f"  rank{rank.rank}: 无法解析 ({exc})")
+    tables, sources, scopes, problems = load_rank_tables(
+        bundle, parser, sqlite_parser, window
+    )
+    for problem in problems:
+        print(f"  {problem}")
 
     if len(tables) < 2:
         print(
@@ -763,81 +811,121 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
         )
         return 2
 
-    ranks = sorted(tables)
-    base, peer = tables[ranks[0]], tables[ranks[1]]
-    total_base = base.total_operator_time_us() or 0.0
-    total_peer = peer.total_operator_time_us() or 0.0
-    calls_base = sum(r.calls for r in base.records)
-    calls_peer = sum(r.calls for r in peer.records)
-    same_scope = scopes[ranks[0]] == scopes[ranks[1]]
-
-    print(f"[check-ranks] {bundle.workload_id}  ranks={ranks}")
-    for rank_index in ranks:
+    expected = expected_ranks(bundle)
+    assessment = assess_rank_tables(tables, sources, scopes, expected=expected)
+    ranks = assessment.ranks
+    print(
+        f"[check-ranks] {bundle.workload_id}  ranks={list(ranks)}  "
+        f"声明={expected} 可解析={len(tables)}"
+    )
+    for digest in assessment.digests:
         print(
-            f"  rank{rank_index}: {sources[rank_index]:22s} scope={scopes[rank_index]:7s} "
-            f"records={len(tables[rank_index].records):3d} "
-            f"calls={sum(r.calls for r in tables[rank_index].records):9d}"
+            f"  rank{digest.rank}: {digest.source:22s} scope={digest.scope:7s} "
+            f"records={digest.records:3d} calls={digest.calls:9d}"
         )
-
-    base_map = {r.operator: r for r in base.records}
-    rows = []
-    for record in peer.records:
-        reference = base_map.get(record.operator)
-        if reference is None or not reference.total_time_us or not record.total_time_us:
-            continue
-        share_base = reference.total_time_us.value / total_base if total_base else 0.0
-        share_peer = record.total_time_us.value / total_peer if total_peer else 0.0
-        avg_base = reference.total_time_us.value / reference.calls if reference.calls else 0.0
-        avg_peer = record.total_time_us.value / record.calls if record.calls else 0.0
-        rows.append(
-            (
-                record.operator,
-                share_base,
-                share_peer,
-                avg_base,
-                avg_peer,
-                (avg_peer / avg_base) if avg_base else None,
-            )
-        )
-    rows.sort(key=lambda item: -item[1])
 
     print()
-    if same_scope:
-        calls_ratio = calls_peer / calls_base if calls_base else 0.0
-        total_ratio = total_peer / total_base if total_base else 0.0
-        print(f"  口径相同（{scopes[ranks[0]]}）：calls_ratio={calls_ratio:.3f} total_ratio={total_ratio:.3f}")
-        consistent = 0.9 <= calls_ratio <= 1.1 and 0.8 <= total_ratio <= 1.25
+    if assessment.same_scope:
+        calls_ratio = assessment.calls_ratio or 0.0
+        total_ratio = assessment.total_ratio or 0.0
+        print(
+            f"  口径相同（{scopes[ranks[0]]}）："
+            f"calls_ratio={calls_ratio:.3f} total_ratio={total_ratio:.3f}"
+        )
     else:
         print(
             f"  口径不同（{scopes[ranks[0]]} vs {scopes[ranks[1]]}）："
             "calls/total 不可直接比较，只看单次耗时与占比结构"
         )
-        ratios = [item[5] for item in rows[:8] if item[5] is not None]
-        median = sorted(ratios)[len(ratios) // 2] if ratios else None
-        consistent = bool(median is not None and 0.7 <= median <= 1.4)
-        if median is not None:
-            print(f"  前 8 大算子的单次耗时比中位数：{median:.3f}")
+        if assessment.median_avg_ratio is not None:
+            print(f"  前 8 大算子的单次耗时比中位数：{assessment.median_avg_ratio:.3f}")
 
-    print(f"  判定: {'一致（可合并/可代表）' if consistent else '不一致（不可合并）'}")
-    if not consistent:
+    verdict = "一致（可合并/可代表）" if assessment.consistent else "不一致（不可合并）"
+    print(f"  判定: {verdict}")
+    if not assessment.consistent:
         print("  依据：单次耗时整体偏离 1.0 -> 两 rank 采集状态不同（profiling 开销/设备状态）")
+        for reason in assessment.reasons:
+            print(f"    - {reason}")
         print("  建议：用相同配置复采一个小窗口，或先用 Serving 指标交叉验证")
+    else:
+        for reason in assessment.reasons:
+            print(f"    - {reason}")
 
     print()
-    print(f"  {'operator':<26}{'share_base':>11}{'share_peer':>11}{'avg_base(us)':>14}{'avg_peer(us)':>13}{'avg_ratio':>10}")
-    for operator, share_base, share_peer, avg_base, avg_peer, ratio in rows[:8]:
+    print(
+        f"  {'operator':<26}{'share_base':>11}{'share_peer':>11}"
+        f"{'avg_base(us)':>14}{'avg_peer(us)':>13}{'avg_ratio':>10}"
+    )
+    for row in assessment.rows[:8]:
+        ratio = "-" if row.avg_ratio is None else f"{row.avg_ratio:10.3f}"
         print(
-            f"  {operator:<26}{share_base * 100:10.2f}%{share_peer * 100:10.2f}%"
-            f"{avg_base:14.1f}{avg_peer:13.1f}{('-' if ratio is None else f'{ratio:10.3f}')}"
+            f"  {row.operator:<26}{row.share_base * 100:10.2f}%{row.share_peer * 100:10.2f}%"
+            f"{row.avg_base:14.1f}{row.avg_peer:13.1f}{ratio}"
         )
+    if getattr(args, "strict", False) and not assessment.consistent:
+        print("  [strict] rank 不一致 -> 退出码 3", file=sys.stderr)
+        return 3
     return 0
+
+
+# ---------------------------------------------------------------------------
+# check-manifest（产物清单校验）
+# ---------------------------------------------------------------------------
+def cmd_check_manifest(args: argparse.Namespace) -> int:
+    try:
+        problems = verify_manifest(args.path)
+    except Exception as exc:  # noqa: BLE001 - 校验器自身异常不能变成 traceback
+        problems = [f"清单校验失败: {_redact_error(exc, (Path(args.path).parent,))}"]
+    print(f"[check-manifest] {args.path}")
+    if not problems:
+        print("  OK: 清单内产物均存在且哈希一致")
+        return 0
+    for item in problems:
+        print(f"  ! {item}")
+    print("  结论：产物与清单不一致（旧产物/被修改/缺失），不能视为本次运行输出")
+    return 1
 
 
 # ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
+def _downstream_manifest(
+    root: Path, args: argparse.Namespace
+) -> tuple[Path | None, set[str] | None, Path | None, int]:
+    """解析下游要使用的清单；显式指定或无效清单不得回退到目录扫描。"""
+    explicit = getattr(args, "manifest", None)
+    path = Path(explicit) if explicit else root / "run_manifest.json"
+    if explicit or path.is_file():
+        if not path.is_file():
+            print(f"  ! 清单不存在: {path}", file=sys.stderr)
+            return None, None, None, MANIFEST_EXIT_FAILED
+        resolved = resolve_manifest_path(path)
+        artifacts = artifact_allowlist(resolved)
+        if artifacts is None or not resolved.is_file():
+            print(f"  ! 清单无法解析: {path}", file=sys.stderr)
+            return None, None, None, MANIFEST_EXIT_FAILED
+        return resolved, artifacts, resolved.parent, 0
+    if not getattr(args, "allow_legacy", False):
+        print(
+            "  ! 缺少 run_manifest.json；确需扫描旧目录请加 --allow-legacy",
+            file=sys.stderr,
+        )
+        return None, None, None, MANIFEST_EXIT_FAILED
+    print("  ! 未找到清单，按目录扫描（legacy）", file=sys.stderr)
+    return None, None, None, 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
-    target = write_markdown_report(args.dir, args.out or None)
+    root = Path(args.dir)
+    manifest, artifacts, artifact_root, code = _downstream_manifest(root, args)
+    if code:
+        return code
+    target = write_markdown_report(
+        root,
+        args.out or None,
+        artifacts=artifacts,
+        artifact_root=artifact_root,
+    )
     print(f"-> {target}")
     return 0
 
@@ -846,7 +934,26 @@ def cmd_report(args: argparse.Namespace) -> int:
 # summary（两个扁平表）
 # ---------------------------------------------------------------------------
 def cmd_summary(args: argparse.Namespace) -> int:
-    workload_path, operator_path = write_summaries(args.dir)
+    root = Path(args.dir)
+    manifest, artifacts, artifact_root, code = _downstream_manifest(root, args)
+    if code:
+        return code
+    include = manifest_workload_ids(manifest) if manifest is not None else None
+    workload_path, operator_path = write_summaries(
+        root,
+        include=include,
+        artifacts=artifacts,
+        artifact_root=artifact_root,
+    )
+    if manifest is not None:
+        # 重建 CSV 后同步清单哈希，避免 check-manifest 误报
+        refresh_manifest_artifacts(
+            manifest,
+            {
+                "workload_summary.csv": workload_path,
+                "operator_summary.csv": operator_path,
+            },
+        )
     rows = sum(1 for _ in operator_path.open(encoding="utf-8-sig")) - 1
     print(f"-> {workload_path}")
     print(f"-> {operator_path}  ({rows} 行算子)")
@@ -857,12 +964,225 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # compare
 # ---------------------------------------------------------------------------
 def cmd_compare(args: argparse.Namespace) -> int:
-    a = OperatorTable.read_json(args.a)
-    b = OperatorTable.read_json(args.b)
-    report = compare_tables(a, b, top=args.top)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target = report.write_json(out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json")
+    strict = bool(getattr(args, "strict", False))
+    run_id = getattr(args, "run_id", None) or new_run_id("compare")
+    manifest_path = Path(getattr(args, "manifest", None) or (out_dir / "run_manifest.json"))
+    previous_run_id: str | None = None
+    if manifest_path.is_file():
+        try:
+            previous_run_id = read_manifest(manifest_path).get("run_id")
+        except (OSError, ValueError):
+            previous_run_id = None
+
+    artifacts: dict[str, Path] = {}
+    inputs = {
+        "a": {"name": Path(args.a).name},
+        "b": {"name": Path(args.b).name},
+    }
+    input_paths = (Path(args.a), Path(args.b))
+
+    def _safe_manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
+        """清单不得覆盖输入或产物；冲突时退到同目录 run_manifest.json。"""
+        protected = input_paths + extra
+        for candidate in (manifest_path, manifest_path.parent / "run_manifest.json"):
+            if any(_same_file(candidate, path) for path in protected):
+                continue
+            return candidate
+        print(
+            "[compare] 无安全的 run_manifest 路径（与输入/产物重合），拒绝写入",
+            file=sys.stderr,
+        )
+        return None
+
+    def _output_dir_failure(detail: str) -> None:
+        manifest = RunManifest(
+            run_id=run_id,
+            status=STATUS_FAILED,
+            strict=strict,
+            is_synthetic=False,
+            stages=(
+                StageRecord(
+                    "output",
+                    True,
+                    STAGE_FAILED,
+                    "output_dir_error",
+                    details={"error": detail},
+                ),
+            ),
+            artifacts=(),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        target_path = _safe_manifest_target()
+        if target_path is None:
+            return
+        try:
+            target = write_manifest(target_path, manifest)
+            print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            _publish_manifest_pointer(target, out_dir / "run_manifest.json")
+        except OSError as exc:
+            print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        detail = _redact_error(exc, (out_dir, manifest_path.parent))
+        print(f"[compare] 无法创建输出目录: {detail}", file=sys.stderr)
+        _output_dir_failure(detail)
+        return MANIFEST_EXIT_FAILED
+
+    def _input_record(value: str) -> dict:
+        path = Path(value)
+        record: dict = {"name": path.name}
+        if path.is_file():
+            record["sha256"] = sha256_of(path)
+        return record
+
+    inputs = {"a": _input_record(args.a), "b": _input_record(args.b)}
+
+    def _finish(
+        status: str,
+        *,
+        stages: list,
+        report: ComparisonReport | None = None,
+        synthetic: bool = False,
+        comparison_status_override: str | None = None,
+    ) -> int:
+        if comparison_status_override is not None:
+            comparison_status = comparison_status_override
+            quality_codes: tuple[str, ...] = ()
+        elif report is None:
+            comparison_status = COMPARISON_NOT_REQUESTED
+            quality_codes = ()
+        else:
+            comparison_status = (
+                COMPARISON_SUCCESS if report.comparable else COMPARISON_INCOMPARABLE
+            )
+            quality_codes = tuple(sorted({flag.code for flag in report.quality_flags}))
+        artifact_error: str | None = None
+        try:
+            artifact_payload = collect_artifacts(artifacts, manifest_path.parent)
+        except OSError as exc:
+            artifact_error = _redact_error(exc, (out_dir,))
+            artifact_payload = ()
+            status = STATUS_FAILED
+            stages = list(stages) + [
+                StageRecord(
+                    "artifacts",
+                    True,
+                    STAGE_FAILED,
+                    "artifact_missing",
+                    details={"error": artifact_error},
+                )
+            ]
+        manifest = RunManifest(
+            run_id=run_id,
+            status=status,
+            strict=strict,
+            is_synthetic=synthetic,
+            stages=tuple(stages),
+            quality_flags=quality_codes,
+            comparison_status=comparison_status,
+            # 与 analyze 一致：产物路径相对清单父目录，支持清单写在输出目录之外
+            artifacts=artifact_payload,
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        try:
+            target = write_manifest(manifest_path, manifest)
+        except OSError as exc:
+            print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+        _publish_manifest_pointer(target, out_dir / "run_manifest.json")
+        print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
+        if strict:
+            return STATUS_EXIT[status]
+        return 0
+
+    try:
+        a = OperatorTable.read_json(args.a)
+        b = OperatorTable.read_json(args.b)
+    except Exception as exc:  # noqa: BLE001 - 输入错误要可判定，不能抛栈
+        detail = _redact_error(
+            exc, (out_dir, manifest_path.parent, Path(args.a).parent, Path(args.b).parent)
+        )
+        print(f"[compare] 读取输入失败: {detail}", file=sys.stderr)
+        safe = _safe_manifest_target()
+        if safe is None:
+            return MANIFEST_EXIT_FAILED
+        manifest_path = safe
+        _finish(
+            STATUS_FAILED,
+            stages=[
+                StageRecord("load", True, STAGE_FAILED, "load_error", details={"error": detail}),
+                StageRecord("compare", True, STAGE_NOT_REQUESTED),
+            ],
+        )
+        return MANIFEST_EXIT_FAILED
+
+    report_path = out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
+    if any(_same_file(report_path, path) for path in input_paths):
+        detail = "比较报告路径与输入表重合，拒绝覆盖输入"
+        print(f"[compare] {detail}: {report_path}", file=sys.stderr)
+        safe = _safe_manifest_target((report_path,))
+        if safe is not None:
+            manifest_path = safe
+            _finish(
+                STATUS_FAILED,
+                stages=[
+                    StageRecord("load", True, STAGE_PASSED),
+                    StageRecord(
+                        "compare",
+                        True,
+                        STAGE_FAILED,
+                        "report_path_conflict",
+                        details={"error": detail},
+                    ),
+                ],
+            )
+        return MANIFEST_EXIT_FAILED
+    if any(_same_file(manifest_path, path) for path in input_paths + (report_path,)):
+        detail = "run_manifest 路径与比较产物或输入重合，拒绝写入"
+        print(f"[compare] {detail}: {manifest_path}", file=sys.stderr)
+        safe = _safe_manifest_target((report_path,))
+        if safe is not None:
+            manifest_path = safe
+            _finish(
+                STATUS_FAILED,
+                stages=[
+                    StageRecord("load", True, STAGE_PASSED),
+                    StageRecord(
+                        "compare",
+                        True,
+                        STAGE_FAILED,
+                        "manifest_path_conflict",
+                        details={"error": detail},
+                    ),
+                ],
+            )
+        return MANIFEST_EXIT_FAILED
+
+    try:
+        report = compare_tables(a, b, top=args.top)
+        target = report.write_json(report_path)
+        artifacts[f"compare_{a.workload_id}_vs_{b.workload_id}.json"] = target
+    except Exception as exc:  # noqa: BLE001 - 执行/写出失败也要结算清单
+        detail = _redact_error(exc, (out_dir, manifest_path.parent))
+        print(f"[compare] 执行或写出失败: {detail}", file=sys.stderr)
+        _finish(
+            STATUS_FAILED,
+            stages=[
+                StageRecord("load", True, STAGE_PASSED),
+                StageRecord(
+                    "compare", True, STAGE_FAILED, "compare_error", details={"error": detail}
+                ),
+            ],
+            comparison_status_override=COMPARISON_FAILED,
+        )
+        return MANIFEST_EXIT_FAILED
     print(f"[compare] {report.a_id} -> {report.b_id}  comparable={report.comparable}")
     for reason in report.reasons:
         print(f"  ! {reason}")
@@ -870,7 +1190,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print(f"  ~ {warning}")
     for note in report.observations:
         print(f"  - {note}")
-    header = f"{'operator':<26}{'share_a':>10}{'share_b':>10}{'Δshare':>10}{'calls_ratio':>13}{'avg_ratio':>11}"
+    header = (
+        f"{'operator':<26}{'share_a':>10}{'share_b':>10}{'Δshare':>10}"
+        f"{'calls_ratio':>13}{'avg_ratio':>11}"
+    )
     print(header)
     for delta in report.deltas[: args.top]:
         def fmt(value: float | None, scale: float = 1.0) -> str:
@@ -882,59 +1205,560 @@ def cmd_compare(args: argparse.Namespace) -> int:
             f"{fmt(delta.calls_ratio):>13}{fmt(delta.avg_ratio):>11}"
         )
     print(f"-> {target}")
-    return 0
+
+    status = STATUS_SUCCESS if report.comparable else STATUS_INCOMPARABLE
+    stages = [
+        StageRecord("load", True, STAGE_PASSED),
+        StageRecord(
+            "compare",
+            True,
+            STAGE_PASSED if report.comparable else STAGE_FAILED,
+            None if report.comparable else "incomparable",
+            artifacts=(target.name,),
+        ),
+    ]
+    return _finish(
+        status,
+        stages=stages,
+        report=report,
+        synthetic=a.meta.is_synthetic or b.meta.is_synthetic,
+    )
 
 
 # ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
 def cmd_analyze(args: argparse.Namespace) -> int:
-    bundles = discover_all(args.workloads_dir, args.exports_root)
+    out = Path(args.out)
+    strict = bool(getattr(args, "strict", False))
+    skip_timeline = bool(getattr(args, "skip_timeline", False))
+    run_id = getattr(args, "run_id", None) or new_run_id("analyze")
+    manifest_path = Path(getattr(args, "manifest", None) or (out / "run_manifest.json"))
+    previous_run_id: str | None = None
+    if manifest_path.is_file():
+        try:
+            previous_run_id = read_manifest(manifest_path).get("run_id")
+        except (OSError, ValueError):
+            previous_run_id = None
+
+    artifacts: dict[str, Path] = {}
+    workload_records: list[WorkloadRecord] = []
+    quality_codes: set[str] = set()
+    blocking_codes: set[str] = set()
+    selected_ids: list[str] = []
+
+    missing_exports: list[str] = []
+    missing_logs: list[str] = []
+    window_failures: list[str] = []
+    parse_failures: list[str] = []
+    diagnosis_failures: list[str] = []
+    timeline_failures: list[str] = []
+    output_failures: list[str] = []
+    comm_failures: list[str] = []
+    comm_attempts = 0
+    comm_runs = 0
+    comparison_failed = False
+    comparison_results: list[dict] = []
+    timeline_runs = 0
+    is_synthetic = False
+    comparison_status = COMPARISON_NOT_REQUESTED
+    source_map_failed = False
+
+    workloads_dir = Path(args.workloads_dir)
+    exports_root = Path(args.exports_root)
+    config_paths = [Path(args.summary_mapping), Path(args.rules)]
+    if getattr(args, "thresholds", None):
+        config_paths.append(Path(args.thresholds))
+    if getattr(args, "device_profile", None):
+        config_paths.append(Path(args.device_profile))
+    config_paths.extend(sorted(workloads_dir.glob("*.yaml")))
+
+    inputs: dict = {
+        "exports_root": "<data-root>",
+        "export_dirs": [],
+        "workloads_dir": workloads_dir.name,
+        "configs": [],
+    }
+    duplicate_ids: list[str] = []
+    protected_inputs: set[Path] = set()
+
+    def _protect(path: Path) -> None:
+        try:
+            protected_inputs.add(Path(path).resolve())
+        except OSError:
+            pass
+
+    for config_path in config_paths:
+        _protect(config_path)
+
+    def _under(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _collides(path: Path, extra: tuple[Path, ...] = ()) -> bool:
+        # 采集根目录/工作目录下的任何文件都是输入（即使还没 discover）
+        if _under(path, exports_root) or _under(path, workloads_dir):
+            return True
+        candidates = list(protected_inputs) + list(artifacts.values()) + list(extra)
+        return any(_same_file(path, item) for item in candidates)
+
+    def _guard_output(path: Path) -> None:
+        """产物写入前移除旧符号链接，并拒绝覆盖输入（含硬链接/符号链接）。"""
+        if path.is_symlink():
+            path.unlink()
+        if _collides(path):
+            raise OSError(f"输出路径与输入重合: {path.name}")
+
+    def _protect_export_inputs(workloads) -> None:
+        """导出尚未 discover 时，按 YAML 的 export_dir 保护原始采集文件。"""
+        for workload in workloads:
+            export_dir = workload.labels.get("export_dir")
+            if not export_dir:
+                continue
+            base = exports_root / export_dir
+            if not base.is_dir():
+                continue
+            for pattern in (
+                "workload.log",
+                "**/op_summary*.csv",
+                "**/op_report*.csv",
+                "**/*.db",
+            ):
+                for path in base.glob(pattern):
+                    _protect(path)
+
+    def _manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
+        for candidate in (manifest_path, out / "run_manifest.json"):
+            if _collides(candidate, extra):
+                continue
+            return candidate
+        return None
+
+    def _output_dir_failure(detail: str) -> None:
+        """输出目录不可用时也要结算本轮失败（清掉旧 success 清单）。"""
+        manifest = RunManifest(
+            run_id=run_id,
+            status=STATUS_FAILED,
+            strict=strict,
+            is_synthetic=False,
+            stages=(
+                StageRecord(
+                    "output",
+                    True,
+                    STAGE_FAILED,
+                    "output_dir_error",
+                    details={"error": detail},
+                ),
+            ),
+            artifacts=(),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        target_path = _manifest_target()
+        if target_path is None:
+            print(
+                "[analyze] 无安全的 run_manifest 路径（与输入重合），放弃写入",
+                file=sys.stderr,
+            )
+            return
+        try:
+            target = write_manifest(target_path, manifest)
+            print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            _publish_manifest_pointer(target, out / "run_manifest.json")
+        except OSError as exc:
+            print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
+
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        detail = _redact_error(exc, (out, manifest_path.parent))
+        print(f"[analyze] 无法创建输出目录: {detail}", file=sys.stderr)
+        try:
+            _protect_export_inputs(
+                [
+                    WorkloadSpec.from_yaml(path)
+                    for path in sorted(workloads_dir.glob("*.yaml"))
+                ]
+            )
+        except Exception:  # noqa: BLE001 - 保护尽力而为，不能掩盖原始错误
+            pass
+        _output_dir_failure(detail)
+        return MANIFEST_EXIT_FAILED
+
+    def _record(path: Path, label: str) -> None:
+        if path.is_file():
+            artifacts[label] = path
+
+    def _error(exc: BaseException) -> str:
+        return _redact_error(exc, (exports_root, workloads_dir, out))
+
+    def _save(
+        status: str,
+        *,
+        has_tables: bool,
+        discover_ok: bool = True,
+        failure_stage: str | None = None,
+    ) -> int:
+        stages = _analyze_stages(
+            args,
+            discover_ok=discover_ok,
+            has_tables=has_tables,
+            missing_exports=missing_exports,
+            missing_logs=missing_logs,
+            window_failures=window_failures,
+            parse_failures=parse_failures,
+            diagnosis_failures=diagnosis_failures,
+            output_failures=output_failures,
+            timeline_failures=timeline_failures,
+            timeline_runs=timeline_runs,
+            comparison_status=comparison_status,
+            comparison_failed=comparison_failed,
+            comparison_results=comparison_results,
+            source_map_failed=source_map_failed,
+            duplicate_ids=duplicate_ids,
+            comm_failures=comm_failures,
+            comm_attempts=comm_attempts,
+            comm_runs=comm_runs,
+            failure_stage=failure_stage,
+        )
+        if _collides(manifest_path):
+            print(
+                "[analyze] run_manifest 路径与输入或产物重合，拒绝覆盖",
+                file=sys.stderr,
+            )
+            fallback = _manifest_target(extra=(manifest_path,))
+            if fallback is None:
+                print("[analyze] 无安全的 run_manifest 路径", file=sys.stderr)
+                return MANIFEST_EXIT_FAILED
+            failed = RunManifest(
+                run_id=run_id,
+                status=STATUS_FAILED,
+                strict=strict,
+                is_synthetic=is_synthetic,
+                stages=(
+                    StageRecord(
+                        "manifest",
+                        True,
+                        STAGE_FAILED,
+                        "manifest_path_conflict",
+                        details={"requested": manifest_path.name},
+                    ),
+                ),
+                workloads=tuple(workload_records),
+                quality_flags=tuple(sorted(quality_codes)),
+                comparison_status=comparison_status,
+                artifacts=(),
+                inputs=inputs,
+                tool=tool_info(),
+                previous_run_id=previous_run_id,
+            )
+            try:
+                target = write_manifest(fallback, failed)
+                print(f"[manifest] status=failed run_id={run_id} -> {target}")
+                _publish_manifest_pointer(target, out / "run_manifest.json")
+            except OSError as exc:
+                print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+        target_path = manifest_path
+
+        try:
+            artifact_payload = collect_artifacts(artifacts, manifest_path.parent)
+        except OSError as exc:
+            detail = _redact_error(exc, (out,))
+            print(f"[analyze] 产物登记失败: {detail}", file=sys.stderr)
+            failed = RunManifest(
+                run_id=run_id,
+                status=STATUS_FAILED,
+                strict=strict,
+                is_synthetic=is_synthetic,
+                stages=(
+                    StageRecord(
+                        "artifacts",
+                        True,
+                        STAGE_FAILED,
+                        "artifact_missing",
+                        details={"error": detail},
+                    ),
+                ),
+                workloads=tuple(workload_records),
+                quality_flags=tuple(sorted(quality_codes)),
+                comparison_status=comparison_status,
+                artifacts=(),
+                inputs=inputs,
+                tool=tool_info(),
+                previous_run_id=previous_run_id,
+            )
+            fallback = _manifest_target(extra=(manifest_path,))
+            if fallback is None:
+                print("[analyze] 无安全的 run_manifest 路径", file=sys.stderr)
+                return MANIFEST_EXIT_FAILED
+            try:
+                target = write_manifest(fallback, failed)
+                print(f"[manifest] status=failed run_id={run_id} -> {target}")
+                _publish_manifest_pointer(target, out / "run_manifest.json")
+            except OSError as write_exc:
+                print(f"[analyze] 写 run_manifest 失败: {write_exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+
+        manifest = RunManifest(
+            run_id=run_id,
+            status=status,
+            strict=strict,
+            is_synthetic=is_synthetic,
+            stages=tuple(stages),
+            workloads=tuple(workload_records),
+            quality_flags=tuple(sorted(quality_codes)),
+            comparison_status=comparison_status,
+            artifacts=artifact_payload,
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        try:
+            target = write_manifest(target_path, manifest)
+        except OSError as exc:
+            print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+        _publish_manifest_pointer(target, out / "run_manifest.json")
+        print(f"[manifest] status={status} strict={strict} run_id={run_id} -> {target}")
+        if strict:
+            return STATUS_EXIT[status]
+        return MANIFEST_EXIT_SUCCESS if has_tables else MANIFEST_EXIT_FAILED
+
+    # 1) 按 workload YAML 枚举“应存在”的导出，缺目录不能静默消失
+    try:
+        expected_workloads = [
+            WorkloadSpec.from_yaml(path) for path in sorted(workloads_dir.glob("*.yaml"))
+        ]
+    except Exception as exc:  # noqa: BLE001 - 配置错误要落 failed 清单
+        print(f"[analyze] workload 配置加载失败: {exc}", file=sys.stderr)
+        _save(STATUS_FAILED, has_tables=False, discover_ok=False)
+        return MANIFEST_EXIT_FAILED
+
+    ids = [workload.workload_id for workload in expected_workloads]
+    duplicate_ids.extend(sorted({wid for wid in ids if ids.count(wid) > 1}))
+    if duplicate_ids:
+        _protect_export_inputs(expected_workloads)
+        print(
+            f"[analyze] workload_id 重复: {', '.join(duplicate_ids)}（产物会互相覆盖）",
+            file=sys.stderr,
+        )
+        _save(
+            STATUS_FAILED,
+            has_tables=False,
+            discover_ok=False,
+            failure_stage="discover",
+        )
+        return MANIFEST_EXIT_FAILED
+
+    try:
+        bundles = discover_all(workloads_dir, exports_root)
+    except Exception as exc:  # noqa: BLE001 - 发现失败也要写本轮 failed 清单
+        _protect_export_inputs(expected_workloads)
+        print(f"[analyze] 导出发现失败: {_error(exc)}", file=sys.stderr)
+        _save(
+            STATUS_FAILED,
+            has_tables=False,
+            discover_ok=False,
+            failure_stage="discover",
+        )
+        return MANIFEST_EXIT_FAILED
+    by_id = {bundle.workload_id: bundle for bundle in bundles}
+    for workload in expected_workloads:
+        if workload.labels.get("export_dir") and workload.workload_id not in by_id:
+            missing_exports.append(workload.workload_id)
+            workload_records.append(
+                WorkloadRecord(workload.workload_id, "failed", reason_code="missing_export")
+            )
     if not bundles:
         print(
             "没有找到可用导出：请确认 workload YAML 中的 labels.export_dir 指向 "
             f"{args.exports_root} 下的目录",
             file=sys.stderr,
         )
-        return 2
+        _save(STATUS_FAILED, has_tables=False, discover_ok=False)
+        return MANIFEST_EXIT_INVALID
 
-    rounds = _parse_rounds(args.rounds)
-    mapping = CsvMapping.load(args.summary_mapping)
-    parser = MappingCsvParser(mapping)
-    ruleset = load_ruleset(args.rules, args.thresholds)
-    device_profile = _load_device_profile(ruleset, getattr(args, "device_profile", None))
-    engine = DiagnosisEngine(ruleset, device_profile=device_profile)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
+    inputs["export_dirs"] = sorted(bundle.export_dir.name for bundle in bundles)
+    for bundle in bundles:
+        if bundle.run_log is not None:
+            _protect(Path(bundle.run_log.path))
+        for rank_export in bundle.ranks:
+            for csv_path in rank_export.op_summary_files:
+                _protect(csv_path)
+            if rank_export.op_report_db:
+                _protect(rank_export.op_report_db)
+            for db_path in rank_export.directory.glob("msprof_*.db"):
+                _protect(db_path)
+
+    # 2) 配置加载：失败时也要写本轮 failed 清单，不能保留旧 success 状态
+    try:
+        rounds = _parse_rounds(args.rounds)
+        mapping = CsvMapping.load(args.summary_mapping)
+        parser = MappingCsvParser(mapping)
+        ruleset = load_ruleset(args.rules, args.thresholds)
+        device_profile = _load_device_profile(
+            ruleset, getattr(args, "device_profile", None)
+        )
+        engine = DiagnosisEngine(ruleset, device_profile=device_profile)
+        inputs["configs"] = fingerprint_configs(config_paths)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[analyze] 配置加载失败: {_error(exc)}", file=sys.stderr)
+        _save(STATUS_FAILED, has_tables=False, failure_stage="config")
+        return MANIFEST_EXIT_FAILED
 
     tables: dict[str, OperatorTable] = {}
     all_opportunities: dict[str, list] = {}
-    print(f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds}，rank={args.rank}")
+    print(
+        f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds}，rank={args.rank}，"
+        f"strict={strict}，run_id={run_id}"
+    )
     for bundle in bundles:
         workload_id = bundle.workload_id
         if bundle.run_log is None:
-            print(f"  - {workload_id}: 无 workload.log，跳过（无法按轮次切窗）")
+            print(f"  - {workload_id}: 缺 workload.log（无法按轮次切窗）")
+            missing_logs.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(workload_id, "failed", reason_code="missing_run_log")
+            )
             continue
         try:
             window = select_rounds_window(bundle.run_log, rounds)
             rank = bundle.rank(args.rank)
         except Exception as exc:  # noqa: BLE001 - 逐 Workload 报告，不中断整批
-            print(f"  - {workload_id}: 跳过 ({exc})")
+            print(f"  - {workload_id}: 窗口/rank 失败（{_error(exc)}）")
+            window_failures.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id,
+                    "failed",
+                    reason_code="window_or_rank",
+                    details={"error": _error(exc)},
+                )
+            )
             continue
 
-        table = parser.parse(rank.op_summary_files, bundle.workload, window=window)
+        try:
+            table = parser.parse(rank.op_summary_files, bundle.workload, window=window)
+        except Exception as exc:  # noqa: BLE001 - 解析失败要记录，不能静默跳过
+            print(f"  - {workload_id}: 解析失败（{_error(exc)}）", file=sys.stderr)
+            parse_failures.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id,
+                    "failed",
+                    reason_code="parse_error",
+                    details={"error": _error(exc)},
+                )
+            )
+            continue
         tables[workload_id] = table
-        report = engine.diagnose_table(table)
+        quality_flags: list = []
 
-        # TP>1 时 busy/idle 必须合并所有 rank 的库：单读一个 rank 会得出相反结论
+        # A3：空窗口 / 缺轮次 / 低覆盖是可选数据质量问题，必须随表落盘。
+        window_quality = table.meta.extra.get("window_quality") or {}
+        window_flags: list = []
+        if table.meta.row_count == 0 or not table.records:
+            window_flags.append(
+                QualityFlag(
+                    code=EMPTY_WINDOW,
+                    severity="blocking",
+                    message="窗口内没有任何算子记录：不能作为比较输入",
+                    source="parser",
+                    details={"rounds": list(window.rounds)},
+                )
+            )
+        for round_index in window_quality.get("missing_rounds") or ():
+            window_flags.append(
+                QualityFlag(
+                    code=MISSING_ROUNDS,
+                    severity="blocking",
+                    message=f"round {round_index} 无任务行：calls/累计时间偏低，不可直接比较",
+                    source="parser",
+                    details={"round": round_index, "rounds": list(window.rounds)},
+                )
+            )
+        for round_index in window_quality.get("low_rounds") or ():
+            window_flags.append(
+                QualityFlag(
+                    code=LOW_ROUND_COVERAGE,
+                    severity="blocking",
+                    message=f"round {round_index} 行数不足同组中位数一半：疑似数据截断",
+                    source="parser",
+                    details={"round": round_index},
+                )
+            )
+        if window_flags:
+            attach_quality(table.meta, window_flags)
+            quality_flags.extend(window_flags)
+
+        # R05：rank 合并质量必须先于诊断/对比完成，并随表落盘供 compare 消费。
+        try:
+            assessment, rank_flags, _ = assess_bundle(
+                bundle, parser, SqliteOpReportParser(), window
+            )
+            if assessment is not None:
+                table.meta.extra["rank_quality"] = assessment.to_dict()
+            attach_quality(table.meta, rank_flags)
+            quality_flags.extend(rank_flags)
+        except Exception as exc:  # noqa: BLE001 - 评估失败要显式阻断，不能静默放过
+            fallback = unverified_flags(f"评估异常：{_error(exc)}")
+            attach_quality(table.meta, fallback)
+            quality_flags.extend(fallback)
+
         db_files: list[Path] = []
+        db_ranks = 0
         for item in bundle.ranks:
-            db_files.extend(sorted(item.directory.glob("msprof_*.db")))
+            found = sorted(item.directory.glob("msprof_*.db"))
+            if found:
+                db_ranks += 1
+            db_files.extend(found)
+
+        # R10 + timeline 覆盖：只有“必须执行 timeline”时，缺 DB 才算质量异常
+        if skip_timeline:
+            skipped_flag = QualityFlag(
+                code=TIMELINE_SKIPPED,
+                severity=DEGRADED,
+                message="显式跳过 timeline：busy/idle 与通信重叠结论不可用，算子级对比仍可进行",
+                source="cli",
+            )
+            attach_quality(table.meta, (skipped_flag,))
+            quality_flags.append(skipped_flag)
+        else:
+            coverage_flags = timeline_coverage_flags(db_ranks, expected_ranks(bundle))
+            if coverage_flags:
+                attach_quality(table.meta, coverage_flags)
+                quality_flags.extend(coverage_flags)
+                timeline_failures.append(f"{workload_id}:partial_db({db_ranks})")
+
+        try:
+            report = engine.diagnose_table(table)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  - {workload_id}: 诊断失败（{_error(exc)}）", file=sys.stderr)
+            diagnosis_failures.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id,
+                    "failed",
+                    reason_code="diagnosis_error",
+                    details={"error": _error(exc)},
+                )
+            )
+            continue
+
         if db_files:
+            comm_attempts += 1
             try:
                 volume = summarize_comm(db_files[0])
                 table.meta.extra["comm_volume"] = volume.to_dict()
+                _guard_output(out / workload_id / "comm.json")
                 volume.write_json(out / workload_id / "comm.json")
+                _record(out / workload_id / "comm.json", f"{workload_id}/comm.json")
+                comm_runs += 1
                 if volume.available:
                     print(
                         f"    comm: {volume.bytes_total / 1024**2:.1f} MiB "
@@ -942,50 +1766,121 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                         f"({volume.dedup_ratio:.1f}x dedup)"
                     )
             except Exception as exc:  # noqa: BLE001
-                print(f"    ! comm 失败: {exc}")
+                print(f"    ! comm 失败: {_error(exc)}")
+                comm_failures.append(f"{workload_id}:{_error(exc)}")
 
-        if not args.skip_timeline:
-            if db_files:
+        workload_timeline_failed = False
+        if not skip_timeline:
+            if not db_files:
+                workload_timeline_failed = True
+                timeline_failures.append(f"{workload_id}:missing_db")
+                missing_flag = QualityFlag(
+                    code=TIMELINE_UNAVAILABLE,
+                    severity="blocking",
+                    message="必需 timeline 未执行（缺 msprof_*.db）：时间线相关结论不可用",
+                    source="timeline",
+                )
+                attach_quality(table.meta, (missing_flag,))
+                quality_flags.append(missing_flag)
+                print("    ! timeline: 缺 msprof_*.db（必需步骤未完成）")
+            else:
                 try:
                     mstx = load_mstx(db_files[0], window)
                     timeline = summarize_timeline(
                         db_files[0], window, mstx=mstx, extra_db_paths=db_files[1:]
                     )
-                    report.notes = report.notes + tuple(annotate_with_timeline(report, timeline))
+                    report.notes = report.notes + tuple(
+                        annotate_with_timeline(report, timeline)
+                    )
+                    _guard_output(out / workload_id / "timeline.json")
                     timeline.write_json(out / workload_id / "timeline.json")
+                    _record(
+                        out / workload_id / "timeline.json", f"{workload_id}/timeline.json"
+                    )
+                    timeline_runs += 1
+                    # R10：时长截断是阻断型质量问题，不能只写在 notes 里。
+                    timeline_flags = rank_quality_from_timeline(timeline)
+                    if timeline_flags:
+                        attach_quality(table.meta, timeline_flags)
+                        quality_flags.extend(timeline_flags)
                     print(
                         f"    timeline: idle={timeline.device_idle_ratio * 100:.1f}% "
                         f"acl_cover={timeline.acl_coverage_of_analyzed_idle * 100:.1f}% "
                         f"submit={timeline.submit_per_task:.2f}/task"
                     )
                 except Exception as exc:  # noqa: BLE001 - 单 workload 失败不影响整批
-                    print(f"    ! timeline 失败: {exc}")
+                    print(f"    ! timeline 失败: {_error(exc)}")
+                    workload_timeline_failed = True
+                    timeline_failures.append(f"{workload_id}:{_error(exc)}")
+                    failed_flag = QualityFlag(
+                        code=TIMELINE_UNAVAILABLE,
+                        severity="blocking",
+                        message=f"必需 timeline 执行失败（{_error(exc)}）：时间线相关结论不可用",
+                        source="timeline",
+                        details={"error": _error(exc)},
+                    )
+                    attach_quality(table.meta, (failed_flag,))
+                    quality_flags.append(failed_flag)
 
-        # comm_volume / window 质量等都挂在 meta.extra 上，必须在写盘前完成
-        table.write_json(out / workload_id / "operator_table.json")
-        coverage = summarize_coverage(table)
-        coverage.write_json(out / workload_id / "graph_coverage.json")
+        try:
+            _guard_output(out / workload_id / "operator_table.json")
+            table.write_json(out / workload_id / "operator_table.json")
+            _record(
+                out / workload_id / "operator_table.json",
+                f"{workload_id}/operator_table.json",
+            )
+            coverage = summarize_coverage(table)
+            _guard_output(out / workload_id / "graph_coverage.json")
+            coverage.write_json(out / workload_id / "graph_coverage.json")
+            _record(
+                out / workload_id / "graph_coverage.json",
+                f"{workload_id}/graph_coverage.json",
+            )
+            _guard_output(out / workload_id / "diagnosis.json")
+            report.write_json(out / workload_id / "diagnosis.json")
+            _record(out / workload_id / "diagnosis.json", f"{workload_id}/diagnosis.json")
+            generated = opportunities_from_diagnosis(report)
+            all_opportunities[workload_id] = generated
+            _guard_output(out / workload_id / "opportunities.json")
+            write_opportunities(generated, out / workload_id / "opportunities.json")
+            _record(
+                out / workload_id / "opportunities.json",
+                f"{workload_id}/opportunities.json",
+            )
+        except Exception as exc:  # noqa: BLE001 - 写失败要结算到清单
+            print(f"  - {workload_id}: 产物写出失败（{_error(exc)}）", file=sys.stderr)
+            output_failures.append(workload_id)
+            workload_records.append(
+                WorkloadRecord(
+                    workload_id,
+                    "failed",
+                    reason_code="artifact_write_error",
+                    details={"error": _error(exc)},
+                )
+            )
+            continue
+
+        quality = table.meta.extra.get("window_quality") or {}
+        total = table.total_operator_time_us() or 0.0
+        blocked = [flag.code for flag in blocking_quality(quality_flags)]
+        if blocked:
+            print(f"    ! quality: {', '.join(blocked)}（比较结论将被拒绝）")
         if coverage.total_calls:
             print(
                 f"    graph-coverage: 图内任务 {coverage.task_ratio * 100:.1f}% "
                 f"/ 按时间 {coverage.time_ratio * 100:.1f}%"
             )
-        report.write_json(out / workload_id / "diagnosis.json")
-        generated = opportunities_from_diagnosis(report)
-        all_opportunities[workload_id] = generated
-        write_opportunities(generated, out / workload_id / "opportunities.json")
-
-        quality = table.meta.extra.get("window_quality") or {}
-        total = table.total_operator_time_us() or 0.0
         print(
             f"\n  [{workload_id}] {bundle.workload.execution.label}  "
-            f"rows={table.meta.row_count} kept={table.meta.row_count - table.meta.extra.get('rows_outside_window', 0)}"
+            f"rows={table.meta.row_count} "
+            f"kept={table.meta.row_count - table.meta.extra.get('rows_outside_window', 0)}"
             f" skipped={table.meta.skipped_rows} records={len(table.records)} "
             f"total={total / 1e6:.3f}s"
         )
         print(
             f"    window: {window.rounds} {window.duration_us / 1e6:.3f}s  "
-            f"busy={quality.get('busy_ratio', 0):.3f} max_gap={quality.get('max_gap_us', 0) / 1000:.1f}ms "
+            f"busy={quality.get('busy_ratio', 0):.3f} "
+            f"max_gap={quality.get('max_gap_us', 0) / 1000:.1f}ms "
             f"degraded={quality.get('degraded')}"
         )
         for hotspot in operator_hotspots(table, top=3):
@@ -999,36 +1894,88 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         for reason in quality.get("reasons") or ():
             print(f"    ! window: {reason}")
 
+        codes = tuple(sorted({flag.code for flag in quality_flags}))
+        quality_codes.update(codes)
+        workload_blocking = [flag.code for flag in blocking_quality(quality_flags)]
+        blocking_codes.update(workload_blocking)
+        is_synthetic = is_synthetic or table.meta.is_synthetic
+        selected_ids.append(workload_id)
+        workload_records.append(
+            WorkloadRecord(
+                workload_id=workload_id,
+                # 必需步骤失败或存在阻断型标记才算 partial；degraded 提示不改变状态
+                status=(
+                    "partial"
+                    if (workload_timeline_failed or workload_blocking)
+                    else "success"
+                ),
+                artifacts=tuple(
+                    f"{workload_id}/{name}"
+                    for name in (
+                        "operator_table.json",
+                        "diagnosis.json",
+                        "opportunities.json",
+                    )
+                ),
+                quality_flags=codes,
+                details={
+                    "rows": table.meta.row_count,
+                    "records": len(table.records),
+                    "timeline_failed": workload_timeline_failed,
+                },
+            )
+        )
+
     if not tables:
         print("没有成功解析的 Workload", file=sys.stderr)
-        return 1
+        _save(STATUS_FAILED, has_tables=False)
+        return MANIFEST_EXIT_FAILED
 
     if args.source_map:
-        operators = {record.operator for table in tables.values() for record in table.records}
-        repos = [item for item in args.repos.split(",") if item] or list(DEFAULT_REPOS)
-        payload = build_source_map(
-            operators,
-            repos,
-            include_cpp=not args.no_source_cpp,
-            binding_path=args.binding,
-            use_bindings=not args.no_bindings,
-        )
-        write_json_file(out / "source_map.json", payload)
-        attached_total = 0
-        for workload_id, generated in all_opportunities.items():
-            attached = attach_to_opportunities(generated, payload)
-            attached_total += attached
-            if attached:
-                write_opportunities(generated, out / workload_id / "opportunities.json")
-        print(f"\n[source-map] {summarize_sources(payload)}")
-        print(f"  回填 source_refs 的机会数：{attached_total}")
+        try:
+            operators = {
+                record.operator for table in tables.values() for record in table.records
+            }
+            repos = [item for item in args.repos.split(",") if item] or list(DEFAULT_REPOS)
+            payload = build_source_map(
+                operators,
+                repos,
+                include_cpp=not args.no_source_cpp,
+                binding_path=args.binding,
+                use_bindings=not args.no_bindings,
+            )
+            _guard_output(out / "source_map.json")
+            write_json_file(out / "source_map.json", payload)
+            _record(out / "source_map.json", "source_map.json")
+            attached_total = 0
+            for workload_id, generated in all_opportunities.items():
+                attached = attach_to_opportunities(generated, payload)
+                attached_total += attached
+                if attached:
+                    _guard_output(out / workload_id / "opportunities.json")
+                    write_opportunities(generated, out / workload_id / "opportunities.json")
+                    _record(
+                        out / workload_id / "opportunities.json",
+                        f"{workload_id}/opportunities.json",
+                    )
+            print(f"\n[source-map] {summarize_sources(payload)}")
+            print(f"  回填 source_refs 的机会数：{attached_total}")
+        except Exception as exc:  # noqa: BLE001 - source-map 是可选步骤
+            source_map_failed = True
+            print(f"  ! source-map 失败（可选步骤）: {_error(exc)}", file=sys.stderr)
 
-    matrix = hotspot_matrix(tables, top=args.top)
-    (out / "hotspots.json").write_text(
-        json.dumps(matrix, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    print("\n[hotspot matrix] 算子累计时间占比")
-    print(matrix_to_text(matrix, top=args.top))
+    try:
+        matrix = hotspot_matrix(tables, top=args.top)
+        _guard_output(out / "hotspots.json")
+        (out / "hotspots.json").write_text(
+            json.dumps(matrix, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        _record(out / "hotspots.json", "hotspots.json")
+        print("\n[hotspot matrix] 算子累计时间占比")
+        print(matrix_to_text(matrix, top=args.top))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! hotspot 输出失败: {_error(exc)}", file=sys.stderr)
+        output_failures.append("hotspots")
 
     print("\n[comparisons]")
     pairs = _comparison_pairs(bundles)
@@ -1036,26 +1983,298 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         table_a, table_b = tables.get(key_a), tables.get(key_b)
         if not table_a or not table_b:
             continue
-        comparison = compare_tables(table_a, table_b, top=args.top)
-        target = comparison.write_json(out / f"compare_{key_a}_vs_{key_b}.json")
+        try:
+            comparison = compare_tables(table_a, table_b, top=args.top)
+            compare_path = out / f"compare_{key_a}_vs_{key_b}.json"
+            _guard_output(compare_path)
+            target = comparison.write_json(compare_path)
+            _record(target, target.name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! compare 失败（{key_a} vs {key_b}）: {_error(exc)}", file=sys.stderr)
+            comparison_results.append(
+                {"a": key_a, "b": key_b, "status": "failed", "same_phase": True}
+            )
+            continue
+        same_phase = table_a.workload.execution.phase is table_b.workload.execution.phase
+        if not same_phase:
+            pair_status = "descriptive"
+        elif comparison.comparable:
+            pair_status = "passed"
+        else:
+            pair_status = "incomparable"
+        comparison_results.append(
+            {"a": key_a, "b": key_b, "status": pair_status, "same_phase": same_phase}
+        )
         print(
             f"  - {key_a} -> {key_b}: comparable={comparison.comparable} "
             f"total_ratio={_fmt_ratio(comparison)} "
             f"Δtop={comparison.deltas[0].operator if comparison.deltas else '-'}"
         )
+        for reason in comparison.reasons:
+            print(f"      ! {reason}")
         for warning in comparison.warnings:
             print(f"      ~ {warning}")
         for note in comparison.observations[:3]:
             print(f"      - {note}")
         print(f"      -> {target}")
-    workload_csv, operator_csv = write_summaries(out)
-    print(f"\n[summary] {workload_csv.name} / {operator_csv.name}")
+
+    try:
+        _guard_output(out / "workload_summary.csv")
+        _guard_output(out / "operator_summary.csv")
+        workload_csv, operator_csv = write_summaries(
+            out, include=set(selected_ids), artifacts=set(artifacts)
+        )
+        _record(workload_csv, workload_csv.name)
+        _record(operator_csv, operator_csv.name)
+        print(f"\n[summary] {workload_csv.name} / {operator_csv.name}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ! summary 输出失败: {_error(exc)}", file=sys.stderr)
+        output_failures.append("summary")
+
+    strict_results = [item for item in comparison_results if item["same_phase"]]
+    if any(item["status"] == "failed" for item in strict_results):
+        comparison_status = COMPARISON_FAILED
+    elif any(item["status"] == "incomparable" for item in strict_results):
+        comparison_status = COMPARISON_INCOMPARABLE
+    elif strict_results:
+        comparison_status = COMPARISON_SUCCESS
+    elif comparison_results:
+        comparison_status = COMPARISON_DESCRIPTIVE
+    else:
+        comparison_status = COMPARISON_NOT_REQUESTED
+    comparison_failed = comparison_status == COMPARISON_FAILED
+
+    if (
+        missing_exports
+        or missing_logs
+        or window_failures
+        or parse_failures
+        or diagnosis_failures
+        or timeline_failures
+        or output_failures
+        or comparison_failed
+        or blocking_codes
+    ):
+        status = STATUS_PARTIAL
+    elif comparison_status == COMPARISON_INCOMPARABLE:
+        status = STATUS_INCOMPARABLE
+    else:
+        status = STATUS_SUCCESS
+
+    exit_code = _save(status, has_tables=True)
     print(f"完成。产物目录: {out.resolve()}")
-    return 0
+    return exit_code
+
+
+def _analyze_stages(
+    args: argparse.Namespace,
+    *,
+    discover_ok: bool,
+    has_tables: bool,
+    missing_exports: list[str],
+    missing_logs: list[str],
+    window_failures: list[str],
+    parse_failures: list[str],
+    diagnosis_failures: list[str],
+    output_failures: list[str],
+    timeline_failures: list[str],
+    timeline_runs: int,
+    comparison_status: str,
+    comparison_failed: bool,
+    comparison_results: list[dict] | None = None,
+    source_map_failed: bool,
+    duplicate_ids: list[str] | None = None,
+    comm_failures: list[str] | None = None,
+    comm_attempts: int = 0,
+    comm_runs: int = 0,
+    failure_stage: str | None = None,
+) -> list[StageRecord]:
+    """把本轮 run 状态映射为阶段清单（AE-03 契约的可审计部分）。"""
+    skip_timeline = bool(getattr(args, "skip_timeline", False))
+    early = failure_stage in ("discover", "parse", "config") or not discover_ok
+    parse_executed = failure_stage not in ("discover", "parse", "config") and discover_ok
+    later_executed = failure_stage is None and discover_ok
+    parse_failed = bool(missing_logs or window_failures or parse_failures)
+    duplicate_ids = duplicate_ids or []
+    discover_failed = not discover_ok or bool(missing_exports) or bool(duplicate_ids)
+    compare_failed = comparison_failed or comparison_status in (
+        COMPARISON_INCOMPARABLE,
+        COMPARISON_FAILED,
+    )
+    return [
+        StageRecord(
+            "discover",
+            True,
+            STAGE_FAILED if discover_failed else STAGE_PASSED,
+            (
+                "duplicate_workload_id"
+                if duplicate_ids
+                else (
+                    "discover_error"
+                    if failure_stage == "discover" and not discover_ok
+                    else ("no_export" if not discover_ok else "missing_export")
+                )
+            )
+            if discover_failed
+            else None,
+            details={
+                "missing": list(missing_exports),
+                "duplicates": list(duplicate_ids),
+            },
+        ),
+        StageRecord(
+            "config",
+            True,
+            (
+                STAGE_FAILED
+                if failure_stage == "config"
+                else (STAGE_NOT_REQUESTED if not discover_ok else STAGE_PASSED)
+            ),
+            "config_error" if failure_stage == "config" else None,
+        ),
+        StageRecord(
+            "parse",
+            True,
+            STAGE_NOT_REQUESTED
+            if not parse_executed
+            else (STAGE_FAILED if parse_failed else STAGE_PASSED),
+            "missing_or_failed_workload" if parse_failed else None,
+            details={
+                "missing_log": list(missing_logs),
+                "window_failed": list(window_failures),
+                "parse_failed": list(parse_failures),
+            },
+        ),
+        StageRecord(
+            "timeline",
+            not skip_timeline,
+            STAGE_NOT_REQUESTED
+            if (skip_timeline or not parse_executed)
+            else (
+                STAGE_FAILED
+                if timeline_failures
+                else (STAGE_PASSED if timeline_runs else STAGE_SKIPPED)
+            ),
+            (
+                None
+                if skip_timeline
+                or not parse_executed
+                or (timeline_runs and not timeline_failures)
+                else ("timeline_failed" if timeline_failures else "no_workload")
+            ),
+            details={"failed": list(timeline_failures), "runs": timeline_runs},
+        ),
+        StageRecord(
+            "comm",
+            False,
+            (
+                STAGE_NOT_REQUESTED
+                if not later_executed
+                else (
+                    STAGE_FAILED
+                    if comm_failures
+                    else (STAGE_PASSED if comm_runs else STAGE_SKIPPED)
+                )
+            ),
+            (
+                "comm_failed"
+                if comm_failures
+                else (None if comm_attempts or not later_executed else "no_db")
+            ),
+            details={
+                "failed": list(comm_failures or ()),
+                "attempts": comm_attempts,
+                "runs": comm_runs,
+            },
+        ),
+        StageRecord(
+            "diagnosis",
+            True,
+            (
+                STAGE_NOT_REQUESTED
+                if early
+                else (STAGE_PASSED if (has_tables and not diagnosis_failures) else STAGE_FAILED)
+            ),
+            None if not diagnosis_failures else "diagnosis_failed",
+            details={"failed": list(diagnosis_failures)},
+        ),
+        StageRecord(
+            "opportunities",
+            True,
+            (
+                STAGE_NOT_REQUESTED
+                if early
+                else (
+                    STAGE_PASSED
+                    if (has_tables and not diagnosis_failures and not output_failures)
+                    else STAGE_FAILED
+                )
+            ),
+            "artifact_write_failed" if output_failures else None,
+            details={"failed": list(output_failures)},
+        ),
+        StageRecord(
+            "source_map",
+            False,
+            STAGE_NOT_REQUESTED
+            if (not later_executed or not getattr(args, "source_map", False))
+            else (STAGE_FAILED if source_map_failed else STAGE_PASSED),
+            "source_map_failed" if source_map_failed else None,
+        ),
+        StageRecord(
+            "compare",
+            False,
+            STAGE_NOT_REQUESTED
+            if (
+                not later_executed
+                or (comparison_status == COMPARISON_NOT_REQUESTED and not comparison_failed)
+            )
+            else (STAGE_FAILED if compare_failed else STAGE_PASSED),
+            (
+                "compare_failed"
+                if comparison_failed
+                else (
+                    "incomparable"
+                    if comparison_status == COMPARISON_INCOMPARABLE
+                    else None
+                )
+            ),
+            details={"pairs": list(comparison_results or ())},
+        ),
+    ]
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    """判断两个路径是否指向同一文件（识别硬链接/符号链接）。"""
+    try:
+        if left.exists() and right.exists():
+            return os.path.samefile(left, right)
+    except OSError:
+        pass
+    return left.resolve() == right.resolve()
+
+
+def _redact_error(exc: BaseException, roots: tuple[Path, ...]) -> str:
+    """错误详情进入清单/日志前去掉绝对路径，保留异常类型与原因。"""
+    text = f"{type(exc).__name__}: {exc}"
+    for root in roots:
+        if str(root):
+            text = text.replace(str(root), "<path>")
+    return text
+
+
+def _publish_manifest_pointer(target: Path, default_path: Path) -> None:
+    """自定义清单写完后，在默认位置留下指针，避免下游读旧默认清单。"""
+    try:
+        if target.resolve() != default_path.resolve():
+            write_manifest_pointer(default_path, target)
+    except OSError as exc:
+        print(f"  ! 写清单指针失败: {exc}", file=sys.stderr)
 
 
 def _fmt_ratio(report: ComparisonReport) -> str:
-    if not report.total_a_us or not report.total_b_us:
+    # 不可比时不得给出可直接引用的速度比（即使两侧都有累计时间）
+    if not report.comparable or not report.total_a_us or not report.total_b_us:
         return "-"
     return f"{report.total_b_us / report.total_a_us:.3f}"
 
@@ -1200,6 +2419,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ranks.add_argument("--workload", required=True)
     p_ranks.add_argument("--summary-mapping", default=str(SUMMARY_MAPPING))
     p_ranks.add_argument("--rounds", default="1-4")
+    p_ranks.add_argument(
+        "--strict", action="store_true", help="rank 不一致时以退出码 3 结束（默认仍为 0）"
+    )
     p_ranks.set_defaults(func=cmd_check_ranks)
 
     p_cc = sub.add_parser("check-collection", help="审计统一补采是否满足参数契约")
@@ -1287,10 +2509,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_report = sub.add_parser("report", help="把 analyze 产物渲染成 report.md")
     p_report.add_argument("--dir", default="out/steady")
     p_report.add_argument("--out", default=None)
+    p_report.add_argument("--manifest", default=None, help="指定本轮 run_manifest.json")
+    p_report.add_argument(
+        "--allow-legacy", action="store_true", help="没有清单时允许扫描旧目录"
+    )
     p_report.set_defaults(func=cmd_report)
+
+    p_manifest = sub.add_parser("check-manifest", help="校验 run_manifest.json 的产物哈希")
+    p_manifest.add_argument("--path", required=True)
+    p_manifest.set_defaults(func=cmd_check_manifest)
 
     p_summary = sub.add_parser("summary", help="导出 workload_summary.csv / operator_summary.csv")
     p_summary.add_argument("--dir", default="out/steady")
+    p_summary.add_argument("--manifest", default=None, help="指定本轮 run_manifest.json")
+    p_summary.add_argument(
+        "--allow-legacy", action="store_true", help="没有清单时允许扫描旧目录"
+    )
     p_summary.set_defaults(func=cmd_summary)
 
     p_compare = sub.add_parser("compare", help="对比两个已解析的 OperatorTable")
@@ -1298,6 +2532,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_compare.add_argument("--b", required=True, help="对照 operator_table.json")
     p_compare.add_argument("--top", type=int, default=15)
     p_compare.add_argument("--out-dir", default="out/compare")
+    p_compare.add_argument("--run-id", default=None, help="运行标识（默认自动生成）")
+    p_compare.add_argument(
+        "--manifest", default=None, help="run_manifest.json 路径（默认 <out-dir>/run_manifest.json）"
+    )
+    p_compare.add_argument(
+        "--strict",
+        action="store_true",
+        help="不可比或质量闸门未通过时以退出码 4 结束（默认仍为 0）",
+    )
     p_compare.set_defaults(func=cmd_compare)
 
     p_analyze = sub.add_parser("analyze", help="对全部 Workload 端到端分析（稳态窗口）")
@@ -1311,6 +2554,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--rank", type=int, default=0)
     p_analyze.add_argument("--top", type=int, default=12)
     p_analyze.add_argument("--out", default="out/steady")
+    p_analyze.add_argument("--run-id", default=None, help="运行标识（默认自动生成）")
+    p_analyze.add_argument(
+        "--manifest",
+        default=None,
+        help="run_manifest.json 路径（默认 <out>/run_manifest.json）",
+    )
+    p_analyze.add_argument(
+        "--strict",
+        action="store_true",
+        help="按运行状态返回退出码：partial=3 / incomparable=4 / failed=1（默认 0）",
+    )
     p_analyze.add_argument("--skip-timeline", action="store_true", help="跳过 TASK/CANN_API 空洞归因")
     p_analyze.add_argument("--source-map", action="store_true", help="索引源码并回填 source_refs")
     p_analyze.add_argument("--repos", default=",".join(DEFAULT_REPOS))

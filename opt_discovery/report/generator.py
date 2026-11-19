@@ -19,6 +19,7 @@ keeps every caveat the pipeline produced.  Anything missing is written as
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,20 +41,46 @@ def _num(value: float | None, digits: int = 2, suffix: str = "") -> str:
     return "-" if value is None else f"{value:.{digits}f}{suffix}"
 
 
-def build_report(out_dir: str | Path, *, title: str = "Optimization Opportunity Report") -> str:
+def build_report(
+    out_dir: str | Path,
+    *,
+    title: str = "Optimization Opportunity Report",
+    artifacts: set[str] | None = None,
+    artifact_root: Path | None = None,
+) -> str:
+    """``artifacts``：本轮 run_manifest 登记的相对路径集合；None 表示兼容旧目录。"""
     root = Path(out_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"{root}: 目录不存在")
 
-    workloads = sorted(p for p in root.iterdir() if p.is_dir())
+    def _registered(target: Path) -> bool:
+        if artifacts is None:
+            return True
+        base = artifact_root or root
+        relative = os.path.relpath(target.resolve(), base.resolve()).replace(os.sep, "/")
+        return relative in artifacts
+
+    def _load_rel(relative: str) -> dict[str, Any] | None:
+        target = root / relative
+        return _load(target) if _registered(target) else None
+
+    workloads = sorted(
+        p
+        for p in root.iterdir()
+        if p.is_dir() and _registered(p / "operator_table.json")
+    )
     tables = {w.name: _load(w / "operator_table.json") for w in workloads}
-    diagnoses = {w.name: _load(w / "diagnosis.json") for w in workloads}
-    timelines = {w.name: _load(w / "timeline.json") for w in workloads}
-    comms = {w.name: _load(w / "comm.json") for w in workloads}
-    coverages = {w.name: _load(w / "graph_coverage.json") for w in workloads}
-    opportunities = {w.name: _load(w / "opportunities.json") for w in workloads}
-    hotspots = _load(root / "hotspots.json")
-    comparisons = [data for path in sorted(root.glob("compare_*.json")) if (data := _load(path))]
+    diagnoses = {w.name: _load_rel(f"{w.name}/diagnosis.json") for w in workloads}
+    timelines = {w.name: _load_rel(f"{w.name}/timeline.json") for w in workloads}
+    comms = {w.name: _load_rel(f"{w.name}/comm.json") for w in workloads}
+    coverages = {w.name: _load_rel(f"{w.name}/graph_coverage.json") for w in workloads}
+    opportunities = {w.name: _load_rel(f"{w.name}/opportunities.json") for w in workloads}
+    hotspots = _load_rel("hotspots.json")
+    comparisons = [
+        data
+        for path in sorted(root.glob("compare_*.json"))
+        if _registered(path) and (data := _load(path))
+    ]
 
     lines: list[str] = []
     add = lines.append
@@ -296,10 +323,15 @@ def build_report(out_dir: str | Path, *, title: str = "Optimization Opportunity 
 
 
 def write_report(
-    out_dir: str | Path, target: str | Path | None = None, *, title: str = "Optimization Opportunity Report"
+    out_dir: str | Path,
+    target: str | Path | None = None,
+    *,
+    title: str = "Optimization Opportunity Report",
+    artifacts: set[str] | None = None,
+    artifact_root: Path | None = None,
 ) -> Path:
     root = Path(out_dir)
-    text = build_report(root, title=title)
+    text = build_report(root, title=title, artifacts=artifacts, artifact_root=artifact_root)
     path = Path(target) if target else root / "report.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")

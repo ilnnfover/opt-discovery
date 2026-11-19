@@ -399,7 +399,7 @@ configs/
 ├── workloads/        4 组 Workload 描述
 └── thresholds/       设备档案（device_profile.json）+ 标定覆盖文件（measured / declared）
 scripts/              MSTX 打点补丁、带打点的复采模板、复采验证流程
-tests/                230 个用例（213 个 CPU 用例，含 2 个 strict xfail 缺口 + 17 个真实数据集成用例）
+tests/                306 个用例（289 个 CPU 用例 + 17 个真实数据集成用例）
 tests/regression/     AE-02 历史问题回归（R01–R12，CPU-only、fixture 脱敏）
 ```
 
@@ -422,7 +422,7 @@ make clean-env-check PYTHON=python3.10     # 最低支持版本
 底层命令仍可单独执行：
 
 ```bash
-python -m pytest -q                      # 211 passed, 17 skipped, 2 xfailed（缺真实导出时）
+python -m pytest -q                      # 289 passed, 17 skipped（缺真实导出时）
 python -m ruff check .                   # 静态检查（E4/E7/E9/F/I/B）
 python -m mypy                           # 类型检查（opt_discovery，python_version=3.10）
 python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自检
@@ -434,6 +434,41 @@ python -m opt_discovery.cli demo         # 合成数据跑通全链路（不代�
 skip 时退出码为 3，未收集到用例或失败为 1，绝不把跳过显示为 PASS。CI 用
 `--expect-blocked` 断言「缺数据时必须 BLOCKED」（内部状态判定，与 pytest 退出码 2 解耦）。
 回归矩阵（历史问题 → 测试节点 → 独立预期）见 `docs/engineering/regression-matrix.md`。
+
+### 自动化运行契约（`--strict` + `run_manifest.json`）
+
+普通模式保持原有行为；自动化/CI 请加 `--strict`，按运行状态返回退出码：
+
+| 状态 | 含义 | strict 退出码 |
+|---|---|---|
+| `success` | 所有必需步骤通过、对比可比 | 0 |
+| `failed` | 缺输入或必需步骤失败 | 1（缺输入入口为 2） |
+| `partial` | 必需步骤未完成，但有部分可用产物 | 3 |
+| `incomparable` | 质量闸门/采集契约未通过，不得出结论 | 4 |
+
+```bash
+python -m opt_discovery.cli analyze ... --strict      # 默认写 <out>/run_manifest.json
+python -m opt_discovery.cli compare ... --strict      # 不可比 -> 4；普通模式仍为 0
+python -m opt_discovery.cli check-ranks ... --strict  # rank 不一致 -> 3；普通模式仍为 0
+python -m opt_discovery.cli check-manifest --path <out>/run_manifest.json
+```
+
+`run_manifest.json` 记录：独立 `run_id`、总体状态、每个阶段（`passed/failed/skipped/not_requested`、
+是否必需、`reason_code`）、逐 Workload 状态与质量标记、`comparison_status`、产物相对路径 + sha256、
+输入逻辑标签与配置指纹、工具版本。**不写绝对路径/秘密**；旧输出目录里未被本次清单列出的文件，
+不会被当作本次产物（`check-manifest` 可校验哈希，发现被修改/缺失的产物）。
+
+质量闸门：rank 不可合并（`rank_merge_inconsistent`）、rank 合并未验证（`rank_merge_unverified`）、
+时长截断（`rank_duration_inconsistent`）为阻断型标记，随 `ParseMeta.extra["quality_flags"]` 落盘；
+`compare` 读取后直接判 `comparable=False`、不输出 deltas/`total_ratio`，并在 `reasons` 中说明原因；
+比较入口同时应用采集契约（与 `check-runs` 同一实现，警告会进入比较报告的 `warnings`），
+轮次/阶段/硬件不一致时同样不可比。`check-runs` 只检查采集契约；质量标记闸门在 `compare`。
+同一输出目录不支持并发运行（无文件锁）；需要并行请使用独立 `--out`/`--out-dir` 与 `--manifest`。
+`summary`/`report` 默认要求 `run_manifest.json`：可用 `--manifest` 指定外置清单，
+确需扫描无清单的旧目录时必须显式加 `--allow-legacy`；损坏/缺失的清单不会被静默忽略。
+已知阻断码由 code 决定最低严重性（`severity=degraded` 也会被拒）；标记字段无法解析按
+`quality_flag_invalid` 阻断，不会静默忽略。timeline 失败/缺失会转成 blocking 标记随表落盘，
+独立 `compare` 读取后同样拒绝。
 
 加一个 Workload：在 `configs/workloads/<model>/` 放 YAML，填 `labels.export_dir`，
 填完采集条件后置 `verified: true`（未核对的组会被判"不可比"）。

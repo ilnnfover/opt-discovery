@@ -19,6 +19,7 @@ def _workload(workload_id: str, *, mode: str = "eager", length: int = 1) -> Work
             "hardware": {"device": "Ascend 910B", "device_count": 2},
             "execution": {"phase": "decode", "mode": mode},
             "input": {"batch_size": 1, "input_length": length},
+            "verified": True,
         }
     )
 

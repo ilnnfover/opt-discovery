@@ -19,8 +19,19 @@ from pathlib import Path
 from typing import Any
 
 from ..schemas.operator import OperatorTable
+from ..schemas.quality import (
+    BLOCKING,
+    EMPTY_TABLE,
+    SYNTHETIC_MISMATCH,
+    VERIFIED_FALSE,
+    QualityFlag,
+    blocking,
+    degraded,
+    invalid_flag,
+    parse_meta_flags,
+)
 from ..schemas.workload import WorkloadSpec
-from .contract import GRAPH_ONLY_PARAMS
+from .contract import GRAPH_ONLY_PARAMS, compare_contracts
 
 __all__ = ["OperatorDelta", "ComparisonReport", "compare_tables"]
 
@@ -69,6 +80,8 @@ class ComparisonReport:
     deltas: list[OperatorDelta] = field(default_factory=list)
     observations: tuple[str, ...] = ()
     generated_at: str = ""
+    #: 两侧表携带的质量标记（blocking 时 comparable 必为 False）
+    quality_flags: tuple[QualityFlag, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.generated_at:
@@ -86,12 +99,14 @@ class ComparisonReport:
             "window": self.window,
             "total_a_us": self.total_a_us,
             "total_b_us": self.total_b_us,
+            # 不可比时不得提供可直接引用的比值（保留两侧原始量）
             "total_ratio": (
                 self.total_b_us / self.total_a_us
-                if self.total_a_us and self.total_b_us is not None
+                if self.comparable and self.total_a_us and self.total_b_us is not None
                 else None
             ),
             "observations": list(self.observations),
+            "quality_flags": [flag.to_dict() for flag in self.quality_flags],
             "deltas": [d.to_dict() for d in self.deltas],
             "generated_at": self.generated_at,
         }
@@ -134,6 +149,15 @@ def _summarize(table: OperatorTable) -> dict[str, dict[str, float | None]]:
     return summary
 
 
+def _contract_payload(table: OperatorTable) -> dict:
+    """契约只读 workload/meta 与算子计数，不序列化全部记录。"""
+    return {
+        "workload": table.workload.to_dict(),
+        "meta": {"extra": dict(table.meta.extra or {})},
+        "operator_counts": {record.operator: record.calls for record in table.records},
+    }
+
+
 def _window_of(table: OperatorTable) -> dict | None:
     return (table.meta.extra or {}).get("window")
 
@@ -165,7 +189,68 @@ def compare_tables(
 ) -> ComparisonReport:
     """Compare ``b`` against ``a`` (``delta_share = share_b - share_a``)."""
     comparable, reasons = a.workload.comparable_with(b.workload)
+    reasons = list(reasons)
     warnings: list[str] = []
+
+    # 质量闸门：rank 不可合并 / 时长截断等阻断型标记必须先于任何差异计算。
+    flags_a, problems_a = parse_meta_flags(a.meta)
+    flags_b, problems_b = parse_meta_flags(b.meta)
+    quality_flags = flags_a + flags_b
+    meta_flags: list[QualityFlag] = []
+    if bool(a.meta.is_synthetic) != bool(b.meta.is_synthetic):
+        meta_flags.append(
+            QualityFlag(
+                code=SYNTHETIC_MISMATCH,
+                severity=BLOCKING,
+                message="合成数据与实测数据混用：只能做描述性对照，不能输出速度差或因果结论",
+                source="meta",
+                details={"a_synthetic": a.meta.is_synthetic, "b_synthetic": b.meta.is_synthetic},
+            )
+        )
+    if not a.workload.verified or not b.workload.verified:
+        meta_flags.append(
+            QualityFlag(
+                code=VERIFIED_FALSE,
+                severity=BLOCKING,
+                message="采集条件未核对（verified=false）：不可作为可信观测直接比较",
+                source="workload",
+                details={"a_verified": a.workload.verified, "b_verified": b.workload.verified},
+            )
+        )
+    if not a.records or not b.records:
+        meta_flags.append(
+            QualityFlag(
+                code=EMPTY_TABLE,
+                severity=BLOCKING,
+                message="至少一侧没有任何算子记录：不能作为比较输入",
+                source="table",
+                details={"a_records": len(a.records), "b_records": len(b.records)},
+            )
+        )
+    quality_flags = quality_flags + tuple(meta_flags)
+    for label, problems in ((a.workload_id, problems_a), (b.workload_id, problems_b)):
+        invalid = invalid_flag(problems, source=label)
+        if invalid is not None:
+            quality_flags = quality_flags + (invalid,)
+    blocking_flags = blocking(quality_flags)
+    if blocking_flags:
+        comparable = False
+        reasons.extend(
+            f"质量闸门未通过（{flag.code}）：{flag.message}" for flag in blocking_flags
+        )
+    for flag in degraded(quality_flags):
+        warnings.append(f"质量提示（{flag.code}）：{flag.message}")
+
+    # 采集契约 gate：与独立 check-runs 使用同一实现，比较入口不再绕过。
+    contract = compare_contracts(_contract_payload(a), _contract_payload(b))
+    if contract.verdict == "incomparable":
+        comparable = False
+        reasons.extend(
+            f"采集契约不通过（{item.name}）：{item.a} vs {item.b}（{item.note}）"
+            for item in contract.failures
+        )
+    for item in contract.warnings:
+        warnings.append(f"采集契约提示（{item.name}）：{item.note}")
 
     if a.workload.execution.phase is not b.workload.execution.phase:
         warnings.append(
@@ -235,13 +320,20 @@ def compare_tables(
         comparable=comparable,
         reasons=tuple(reasons),
         warnings=tuple(warnings),
+        quality_flags=quality_flags,
         same_window=same_window,
         window=window_a if same_window else None,
         total_a_us=a.total_operator_time_us(),
         total_b_us=b.total_operator_time_us(),
     )
     if not comparable:
-        report.observations = ("不可比：先统一采集条件再对比，否则差异无法归因",)
+        if blocking_flags:
+            report.observations = (
+                "不可比：数据质量闸门未通过（" + ", ".join(f.code for f in blocking_flags) + "），"
+                "不得据此输出速度差或因果结论",
+            )
+        else:
+            report.observations = ("不可比：先统一采集条件再对比，否则差异无法归因",)
         return report
 
     left, right = _summarize(a), _summarize(b)

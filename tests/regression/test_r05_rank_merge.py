@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from _helpers import (
     WORKLOADS,
@@ -50,6 +51,22 @@ def test_check_ranks_reports_inconsistency(tmp_path: Path, capsys) -> None:
     assert "不一致（不可合并）" in out
     assert "单次耗时整体偏离" in out
     assert "一致（可合并/可代表）" not in out
+
+
+def test_check_ranks_strict_returns_nonzero_for_inconsistent_ranks(
+    tmp_path: Path, capsys
+) -> None:
+    """--strict：rank 不一致必须非零退出（默认模式保持 0 兼容既有脚本）。"""
+    export = _two_ranks(tmp_path / "export", rank1_scale=4.0)
+
+    code = main(
+        ["check-ranks", "--export", str(export), "--workload", str(WORKLOAD_YAML), "--strict"]
+    )
+    out = capsys.readouterr()
+
+    assert code == 3
+    assert "不一致（不可合并）" in out.out
+    assert "[strict]" in out.err
 
 
 def test_missing_rank_is_not_silently_merged(tmp_path: Path, capsys) -> None:
@@ -109,3 +126,29 @@ def test_sqlite_table_carries_missing_capability_flags(tmp_path: Path) -> None:
     record = next(r for r in table.records if r.operator == "MatMul")
     assert record.total_time_us.value == pytest.approx(200.0)  # ns -> us
     assert record.metric("aicore_time_us") is None
+
+
+def test_check_ranks_uses_declared_rank_count(tmp_path: Path, capsys) -> None:
+    """A5：采集契约声明 4 个 rank 但只交付 2 个时，check-ranks --strict 必须非零。"""
+    export = _two_ranks(tmp_path / "export", rank1_scale=1.0)
+    raw = yaml.safe_load(WORKLOAD_YAML.read_text(encoding="utf-8"))
+    raw["hardware"]["device_count"] = 4
+    workload = tmp_path / "decode_eager.yaml"
+    workload.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    code = main(
+        [
+            "check-ranks",
+            "--export",
+            str(export),
+            "--workload",
+            str(workload),
+            "--strict",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 3
+    assert "声明=4" in out
+    assert "不一致（不可合并）" in out
+    assert "采集契约声明 4 个 rank" in out

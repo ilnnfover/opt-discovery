@@ -98,6 +98,20 @@ def _workload(table: dict) -> dict:
     return table.get("workload") or {}
 
 
+def _records(table: dict) -> list[dict]:
+    """契约只需要 operator 集合与 calls 总和；没有完整 records 时读摘要。"""
+    records = table.get("records")
+    if isinstance(records, list):
+        return records
+    counts = table.get("operator_counts")
+    if isinstance(counts, dict):
+        return [
+            {"operator": str(operator), "calls": int(calls or 0)}
+            for operator, calls in counts.items()
+        ]
+    return []
+
+
 _KNOWN_INPUT_KEYS = {"batch_size", "input_length", "output_length", "num_requests", "extra"}
 
 
@@ -214,8 +228,8 @@ def compare_contracts(a: dict[str, Any], b: dict[str, Any]) -> ContractReport:
     )
 
     # 7. 算子集合与实现路径
-    ops_a = {record["operator"] for record in a.get("records", [])}
-    ops_b = {record["operator"] for record in b.get("records", [])}
+    ops_a = {record["operator"] for record in _records(a)}
+    ops_b = {record["operator"] for record in _records(b)}
     only_a, only_b = ops_a - ops_b, ops_b - ops_a
     shape_counts_a = _shape_counts(a)
     shape_counts_b = _shape_counts(b)
@@ -252,8 +266,8 @@ def compare_contracts(a: dict[str, Any], b: dict[str, Any]) -> ContractReport:
         checks.append(_check("comm.bytes", bytes_a, bytes_b, INFO, "至少一侧缺少通信量数据"))
 
     # 9. 记录数（工作量）
-    calls_a = sum(int(record.get("calls") or 0) for record in a.get("records", []))
-    calls_b = sum(int(record.get("calls") or 0) for record in b.get("records", []))
+    calls_a = sum(int(record.get("calls") or 0) for record in _records(a))
+    calls_b = sum(int(record.get("calls") or 0) for record in _records(b))
     if calls_a and calls_b:
         ratio = calls_b / calls_a
         status = PASS if 0.8 <= ratio <= 1.25 else WARN
@@ -287,7 +301,7 @@ def compare_contracts(a: dict[str, Any], b: dict[str, Any]) -> ContractReport:
 
 def _shape_counts(table: dict) -> dict[str, str]:
     counts: dict[str, str] = {}
-    for record in table.get("records", []):
+    for record in _records(table):
         value = (record.get("attributes") or {}).get("shape_count")
         if value is not None:
             counts[record["operator"]] = str(value)
