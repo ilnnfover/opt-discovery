@@ -16,6 +16,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -206,13 +207,28 @@ def collect_artifacts(entries: Mapping[str, Path], root: Path) -> tuple[dict[str
 
 
 def write_manifest(path: str | Path, manifest: RunManifest) -> Path:
+    """原子写清单：同目录唯一临时文件 + os.replace。
+
+    不能使用固定 ``<target>.tmp``：如果用户把某个输入命名为该路径，会被截断。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(manifest.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+    payload = json.dumps(manifest.to_dict(), indent=2, ensure_ascii=False)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
     )
-    tmp.replace(target)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return target
 
 
@@ -223,44 +239,122 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
 def verify_manifest(path: str | Path) -> list[str]:
     """校验清单结构与产物哈希；返回问题列表（空表示通过）。
 
-    结构不合法（空 JSON、版本/状态缺失、artifacts 不是列表）同样返回问题，
+    结构不合法（空 JSON、数组、缺字段、字段类型错误）同样返回问题，
     不能因为“没有可校验的产物”就当作通过。
     """
     manifest_path = Path(path)
-    payload = read_manifest(manifest_path)
-    root = manifest_path.parent
-    problems: list[str] = []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return [f"无法读取清单: {exc}"]
 
     if not isinstance(payload, dict):
         return [f"清单不是 JSON 对象: {type(payload).__name__}"]
+
+    problems: list[str] = []
     if str(payload.get("schema_version")) != SCHEMA_VERSION:
-        problems.append(f"schema_version 不是 {SCHEMA_VERSION}: {payload.get('schema_version')!r}")
+        problems.append(
+            f"schema_version 不是 {SCHEMA_VERSION}: {payload.get('schema_version')!r}"
+        )
     if payload.get("status") not in STATUSES:
         problems.append(f"status 不合法: {payload.get('status')!r}")
-    if not payload.get("run_id"):
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
         problems.append("缺少 run_id")
+    if "is_synthetic" in payload and not isinstance(payload["is_synthetic"], bool):
+        problems.append("is_synthetic 不是布尔值")
+    if "strict" in payload and not isinstance(payload["strict"], bool):
+        problems.append("strict 不是布尔值")
+    if payload.get("comparison_status") not in {
+        COMPARISON_NOT_REQUESTED,
+        COMPARISON_SUCCESS,
+        COMPARISON_INCOMPARABLE,
+        COMPARISON_FAILED,
+    }:
+        problems.append(
+            f"comparison_status 不合法: {payload.get('comparison_status')!r}"
+        )
+
+    stages = payload.get("stages")
+    if not isinstance(stages, list):
+        problems.append("stages 不是列表")
+    else:
+        for index, item in enumerate(stages):
+            if not isinstance(item, dict):
+                problems.append(f"stages[{index}] 不是对象")
+                continue
+            if not isinstance(item.get("name"), str) or not item.get("name"):
+                problems.append(f"stages[{index}] 缺少 name")
+            if not isinstance(item.get("required"), bool):
+                problems.append(f"stages[{index}] required 不是布尔值")
+            if item.get("status") not in STAGE_STATUSES:
+                problems.append(f"stages[{index}] status 不合法: {item.get('status')!r}")
+
+    workloads = payload.get("workloads")
+    if workloads is not None:
+        if not isinstance(workloads, list):
+            problems.append("workloads 不是列表")
+        else:
+            for index, item in enumerate(workloads):
+                if not isinstance(item, dict):
+                    problems.append(f"workloads[{index}] 不是对象")
+                    continue
+                if not isinstance(item.get("workload_id"), str) or not item.get(
+                    "workload_id"
+                ):
+                    problems.append(f"workloads[{index}] 缺少 workload_id")
+                if not isinstance(item.get("status"), str):
+                    problems.append(f"workloads[{index}] 缺少 status")
+
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, list):
         problems.append("artifacts 不是列表")
         return problems
-    for item in payload.get("artifacts") or ():
+
+    for item in artifacts:
         if not isinstance(item, dict):
             problems.append(f"artifact 项不是对象: {type(item).__name__}")
             continue
         relative = item.get("path")
-        if not relative:
-            problems.append("artifact 缺少 path")
+        if not isinstance(relative, str) or not relative:
+            problems.append("artifact 缺少 path（或不是字符串）")
+            continue
+        if Path(relative).is_absolute():
+            problems.append(f"artifact path 不能是绝对路径: {relative}")
             continue
         expected = item.get("sha256")
         if not isinstance(expected, str) or not expected:
             problems.append(f"artifact 缺少 sha256: {relative}")
             continue
-        target = root / relative
+        if "bytes" in item and not isinstance(item["bytes"], int):
+            problems.append(f"artifact bytes 不是整数: {relative}")
+            continue
+        target = manifest_path.parent / relative
         if not target.is_file():
             problems.append(f"缺少产物: {relative}")
             continue
-        if sha256_of(target) != expected:
+        try:
+            actual = sha256_of(target)
+        except OSError as exc:
+            problems.append(f"无法读取产物 {relative}: {exc}")
+            continue
+        if actual != expected:
             problems.append(f"产物被修改: {relative}")
+
+    # success 必须真的有产物，且所有必需阶段为 passed
+    if payload.get("status") == STATUS_SUCCESS:
+        if not artifacts:
+            problems.append("success 清单没有任何产物")
+        if isinstance(stages, list):
+            for item in stages:
+                if (
+                    isinstance(item, dict)
+                    and item.get("required") is True
+                    and item.get("status") != STAGE_PASSED
+                ):
+                    problems.append(
+                        f"success 清单包含未通过的必需阶段: {item.get('name')}"
+                    )
     return problems
 
 

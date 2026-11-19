@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**249 passed, 17 skipped**（266 用例，无 xfail）。
+全量：**255 passed, 17 skipped**（272 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 249 passed, 17 skipped（266 用例） |
+| `python -m pytest` | 0 | 255 passed, 17 skipped（272 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 249 passed, 17 skipped |
+| 3.11 全量 | 0 | 255 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -263,7 +263,7 @@ if blocking_flags:
 | P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
 | P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **249 passed, 17 skipped**（266 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。
 
 ## 13. 合并前复验修复（2026-11-19）
 
@@ -281,4 +281,27 @@ if blocking_flags:
 
 现在规则统一为：**清单不得与输入或本轮产物重合**；有冲突时优先退到同目录 `run_manifest.json`，无法安全落盘则不写并返回非零，绝不覆盖输入。
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **249 passed, 17 skipped**（266 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。
+
+## 14. 合并前问题总表 · 批次 1（A1/A2/B1/B4）
+
+按「输入与清单安全」一组处理，不改变质量语义（A3/A4/A5/A6 留批次 2/3）。
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| A1 | 固定 `<target>.tmp` 会截断同名输入；`resolve()` 不识别硬链接/符号链接；产物符号链接可覆盖输入 | `write_manifest` 改为同目录 `tempfile.mkstemp` + `os.replace` + `fsync`；新增 `_same_file()`（`os.path.samefile` + resolve 兜底）统一判重；analyze 建立 `protected_inputs`（workload YAML、映射、规则、阈值、设备档案、`workload.log`、op_summary、op_report、`msprof_*.db`），写入前 `_guard_output()` 先移除旧符号链接再判重；清单冲突经 `_manifest_target()` 选安全路径 | `test_manifest_tmp_name_does_not_clobber_input`、`test_report_hardlink_to_input_is_rejected`、`test_analyze_manifest_cannot_overwrite_config_yaml`、`test_symlinked_artifact_does_not_clobber_input` |
+| A2 | 拒绝路径直接 `return 1`，旧 success 清单仍有效 | 报告路径冲突也写本轮 failed 清单（新 run_id，`report_path_conflict`）；清单冲突写 `manifest_path_conflict` | `test_report_hardlink_to_input_is_rejected`（断言 run_id 变化） |
+| B1 | 缺 `stages`/数字 `path`/顶层数组可通过或抛 traceback | `verify_manifest` 校验顶层类型、schema_version、status、run_id、stages（name/required/status）、workloads、artifacts（path 字符串且非绝对、sha256 必填、bytes 类型）；success 要求有产物且必需阶段 passed；读取/哈希异常转为问题项 | `test_check_manifest_rejects_bad_shapes`、`test_empty_manifest_is_rejected` |
+| B4 | 重复 `workload_id` 互相覆盖并自比 | 发现前检测重复，失败并记 `duplicate_workload_id`（含 duplicates 列表） | `test_duplicate_workload_ids_are_rejected` |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| A1 临时文件截断输入 | 只把清单改为原子 `replace`，临时名固定为 `<target>.tmp` | 没有考虑“临时文件名本身可能是用户输入”，也没做独占创建 |
+| A1 链接身份 | 全部使用 `Path.resolve()` 判重 | `resolve()` 只解析路径，不识别硬链接；符号链接产物在写入时仍跟随到目标 |
+| A2 拒绝不结算 | 冲突分支先 `print` 再 `return 1` | 认为“拒绝即安全”，忽略了旧 success 清单会被下游读取 |
+| B1 校验边界 | 只校验 `artifacts` 项与部分顶层字段 | 没有要求 `stages` 存在/类型正确，也没有 success 的完成态约束 |
+| B4 重复 ID | 假定每个 YAML 的 `workload_id` 唯一 | `discover_all` 用字典按 ID 合并，重复时静默覆盖 |
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **255 passed, 17 skipped**（272 用例）。

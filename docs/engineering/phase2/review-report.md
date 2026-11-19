@@ -1,6 +1,6 @@
 # AE-03 独立验收 Review
 
-> 最新结论见文末「合并前复验」。`2589cc7` 的验收结果为 **FAIL**，PR #2 暂缓合并。
+> 最新结论见文末「AE-03 合并前问题总表」。`e6c0770` 的验收结果为 **FAIL**，PR #2 暂缓合并。
 
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
@@ -157,3 +157,65 @@ PR #2 的验收条件是关闭上述两项 P1，并以独立 CLI 复验确认输
 | P1 | `opt_discovery/cli.py:1225`、`:1236` | 将 analyze 的 `--manifest` 指向本轮某个 workload 子目录的 `operator_table.json`。算子表得以保留，命令退出 0，回退清单记 success，但校验退出 1。产物相对路径按原清单父目录计算，实际清单写在输出根目录。 | 写入前拒绝冲突，或以最终清单所在目录生成产物路径，保证 success 时清单可校验。增加嵌套产物冲突用例。 |
 
 `make check` 退出 0。`make verify DEMO_OUT=/tmp/ae03-merge-demo.Z6dQtT` 退出 0，246 passed、17 skipped，合成演示通过。`python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 得 91 passed。另在临时目录通过实际 CLI 子进程复验，命令为 `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-merge-probe.LpHFRT.py`，并用有效输入表再次确认两类失败路径会覆盖原文件。真实 Profiling 回归在本次全量测试中跳过，NPU 未运行。
+
+## 输入文件保护复验（2026-11-19）
+
+**原两项 P1 已关闭。AE-03 的合并验收仍为 FAIL，PR #2 暂缓合并。** 本次仅审查 `2589cc7..e6c0770399bbca267c79c029a47e42831b28b23a`，对照实施报告 §13。本地 HEAD 与跟踪引用一致。以下复现均使用临时文件。
+
+- **compare 失败时的直接路径冲突通过复验。** `--manifest` 和有效的 `--a` 同路径，分别触发对照表缺失和输出目录创建失败。两次均退出 1，原表字节不变，备用清单为 failed，校验退出 0。
+- **analyze 清单与嵌套产物冲突通过复验。** 指向 workload 的 operator_table.json 时退出 1，算子表保留，输出目录的备用清单为 failed，校验退出 0。
+
+| 级别 | 位置 | 复现、影响和修复建议 |
+|---|---|---|
+| P1 | `opt_discovery/experiment/run_manifest.py:208`、`opt_discovery/cli.py:910` | 用有效算子表作为 `--a`，文件名为 `compare-run.json.tmp`，并把清单指定为同目录的 `compare-run.json`。compare 退出 0、发布 success，原输入表消失。清单写入会截断固定的 `.tmp` 文件，再把它移动到目标路径，最终路径冲突检查无法保护该输入。应使用同目录独占创建的唯一临时文件原子替换，并验证有效输入字节保持不变。 |
+| P1 | `opt_discovery/cli.py:1152`、`:1272`、`:1289` | `analyze --manifest <workloads-dir>/prefill_eager.yaml` 会正常读取临时 workload YAML，最后用 success 清单覆盖该 YAML，并退出 0。analyze 的检查只覆盖本轮产物。应在写入前保护已知输入路径，失败结算也应走同一校验，回归测试应断言 YAML 原始字节保留。 |
+
+这两处问题均在实施报告所述的「清单不得与输入或本轮产物重合」范围内。它们来自既有的清单写入和 analyze 路径，当前修复未覆盖。
+
+`make check` 通过。`make verify DEMO_OUT=/tmp/ae03-recheck-demo.LyMXUq` 退出 0，249 passed、17 skipped，合成演示通过。`python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 得 94 passed。使用 `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-input-safety.wCRttt.py` 执行独立 CLI 复验，检查输入字节和清单状态。真实 Profiling 回归在本次全量测试中跳过，NPU 未运行。
+
+## AE-03 合并前问题总表（2026-11-19）
+
+**结论为 FAIL，暂缓合并 PR #2。** 下表汇总了 `e6c0770399bbca267c79c029a47e42831b28b23a` 的未关闭问题。以 AE-03 基线 `e7d8aae`、原始任务书和实施报告 §9～13 为依据，检查本阶段改动和直接下游入口 `analyze`、`compare`、`check-runs`、`check-ranks`、`check-manifest`、`report`、`summary`。部分问题先于最新修复存在，在当前验收范围以当前行为计。本轮未发现 P0，真实 NPU 与文件系统并发场景未实测。
+
+### P1 合并阻断项
+
+| 编号 | 位置 | 实测结果和影响 | 成组修复建议 |
+|---|---|---|---|
+| A1 输入可被输出覆盖或移除 | `opt_discovery/experiment/run_manifest.py:208`、`opt_discovery/cli.py:910`、`:1030`、`:1152`、`:1233`、`:1531`，`opt_discovery/analyzer/compare.py:110` | 四种临时文件实测均退出 0。① `compare-run.json.tmp` 是有效输入，清单目标是 `compare-run.json`，固定临时文件截断并移动输入，导致原输入消失。② `analyze --manifest` 指向实际读取的 workload YAML，该配置被成功清单覆盖。③ 现有比较报告路径是算子输入的硬链接，路径不同所以通过 `resolve()` 检查，报告写入截断输入。④ 复用目录时 `graph_coverage.json` 若为指向 workload YAML 的符号链接，analyze 覆盖 YAML，随后清单校验仍通过。 | 把输入保护、产物写入和清单发布作为一个契约。对已选择的输入及目标预检，包括实际配置、日志、CSV、DB、默认/自定义/备用清单和全部产物。考虑解析后的路径、现有文件身份和链接。原子写入使用同目录独占创建的唯一临时文件。失败和成功分支都测字节保留。 |
+| A2 路径拒绝后旧成功清单仍有效 | `opt_discovery/cli.py:1030` | 先在正常输出目录完成 compare 并生成可校验的外置清单。下一次沿用该清单，将有效输入表放到本次预定比较报告路径。compare 拒绝写报告并退出 1，旧清单原样保留、校验仍为 0。 | 冲突拒绝也走统一失败结算，在安全目标可写时发布本轮 failed 和新 run_id。与 A1 一起验证失败发布无副作用。 |
+| A3 空窗口与缺轮次发布为成功 | `opt_discovery/parsers/csv_mapping.py:447`、`:481`，`opt_discovery/cli.py:1384`、`:1710`，`opt_discovery/analyzer/compare.py:183` | 实际解析只有 CSV 表头的单 rank 导出，strict analyze 返回 0，记录数为 0。仅移除选定第 2 轮的任务行，生产解析器生成 `missing_rounds=[2]`，strict analyze 仍返回 0，比较可比并输出 `total_ratio=1.8`。独立 compare 的一侧 records 为空时也返回 0 并生成 deltas。 | 定义空窗口、缺轮次、低覆盖各自的质量状态。生产者落盘所需证据，两个比较入口据此限制绝对时间、调用量及比值。空数据可以出审计，但不能作为成功比较输入。 |
+| A4 比较元数据未验证或不合法仍能出结论 | `opt_discovery/schemas/quality.py:114`，`opt_discovery/analyzer/compare.py:187`、`:230`，`opt_discovery/schemas/workload.py:255`，`README.md:470` | 对有效落盘表分别设置 `quality_flags={}`、`verified=false`、`A.is_synthetic=true / B.is_synthetic=false`。三次 strict compare 均退出 0、有 deltas 和比值，后一情形甚至没有合成数据警告。空对象被 `or ()` 当成缺字段，`verified=false` 与 README 承诺不符。混用合成与实测时只对一个方向提示，提示也不限制结论。 | 区分缺字段、空列表与格式错误。让 verified 状态与文档契约一致。两种混合来源方向用同一规则，限制真实定量结论。显式定义旧表无新标记的兼容策略。 |
+| A5 rank 完整性和比较口径可被放宽 | `opt_discovery/cli.py:787`、`:847`，`opt_discovery/analyzer/rank_quality.py:178`、`:199`、`:313` | 工作负载声明 4 rank、实际交付 2 个，`check-ranks --strict` 返回 0 并宣告可合并，analyze 却返回 3。直接调用生产 rank 评估，两份窗口表的 calls 和 total 相差 4 倍、单次耗时一致，正常判不可合并。加入一份来源为 full、单次耗时一致的第三表后，整体变为 consistent、只带 degraded 提示。全局 scope 让原来同口径的两个 peer 走了弱校验。 | 在 check-ranks/analyze 共享 rank 完整性判定，按 pair 区分相同和不同 scope。验证预期数量、身份、重复、额外和缺失 rank，以及一份 SQLite 回填时其他窗口 rank 仍受原约束。 |
+| A6 下游 summary/report 复用旧产物 | `opt_discovery/cli.py:871`、`:880`，`opt_discovery/report/summary_csv.py:162`，`opt_discovery/report/generator.py:48` | 首轮用实际 SQLite 生成 4 MiB/1 任务，次轮移除 DB 并显式跳过 timeline。次轮 analyze 的 CSV 正确留空，随后独立 summary 又写回 4.0 MiB 并返回 0，当前清单的 CSV 哈希被破坏。独立 report 同样将旧通信量显示为本轮结果，且还会扫描旧 timeline 和旧 compare。 | 所有默认下游读入口共用当前运行清单的产物集合。重建 CSV 应选择独立目标或同步更新产物清单。定义旧目录无清单时的兼容行为。 |
+
+### P2 应一并处置的契约缺口
+
+| 编号 | 位置 | 证据和处置建议 |
+|---|---|---|
+| B1 清单验证边界不完整 | `opt_discovery/experiment/run_manifest.py:223`、`:250`，`opt_discovery/cli.py:897`、`:1125` | **实测** 有版本、ID、success 以及空 artifacts，但没有 stages 等字段的最简对象通过；artifact.path 为数字时校验抛 traceback；已有清单是 JSON 数组时 compare 在读 `.get()` 处中断。对各字段做类型和必需性校验，对 success 再检查对应命令必需的产物。明确 check-manifest 的退出 0 只表示完整性时，应让自动化另读 status。 |
+| B2 清单阶段状态和失败原因不一致 | `opt_discovery/cli.py:977`、`:1063`、`:1326`、`:1753`、`:1835` | **实测** 无导出且要求 source-map 时，发现失败而 source_map 被记 passed；compare 报告写入失败时 compare stage 为 failed、顶层却是 not_requested；缺映射虽总体 failed，但没有对应阶段错误码。**代码审查** 多对比较部分失败时仍可能保留另一对的 success。用阶段实际进入/结果派生状态，比较保留每对结果。 |
+| B3 可选步骤失败只在终端出现 | `opt_discovery/cli.py:1454`、`:1466` | **实测** comm 表缺字段使通信计算失败，strict analyze 仍成功，终端提示错误，清单没有该步骤的状态或理由。可选步骤可以不影响退出码，仍需记录 unavailable/failed，避免消费者把缺数据当作未请求或零值。 |
+| B4 重复 workload ID 会覆盖和自比 | `opt_discovery/cli.py:1298`、`:1397`、`:1531`、`:1880` | **实测** 目录含两份相同 workload ID 的 YAML 时 strict 成功，清单有两个同 ID 条目，产物只剩一个目录并生成这个 ID 与自身的比较。同 ID 不同来源时也共用键与写入路径。应在写出前验证 ID 唯一，或明确支持并赋予各输入独立 ID。 |
+| B5 同一比较契约在两个入口获得的证据不同 | `opt_discovery/analyzer/compare.py:204`，`opt_discovery/analyzer/contract.py:216`、`:254`，`opt_discovery/cli.py:499` | **生产函数实测** 完整表的合同检查出现 `operator_set`、`work.count` warnings。compare 仅传 workload 和 meta，合同检查读到 0 条 records，比较报告丢失相应证据和警告。check-runs 只查采集契约，不读取 compare 附加的阻断标记。应共享契约所需的摘要及警告结果，文档注明哪些闸门由哪个入口执行。 |
+| B6 默认跨阶段配对的 strict 语义待定 | `opt_discovery/cli.py:1723`、`:1880`，`opt_discovery/analyzer/contract.py:120` | **实测** 四组完整样例的两对同阶段比较可比，两对自动生成的跨阶段比较不可比，导致整体 strict 返回 4。跨阶段拒绝绝对量本身符合契约。需明确此类自动配对是描述性还是 strict 必需，补默认四组组合验收测试。 |
+| B7 指纹与清单结算还有未保护区间 | `opt_discovery/cli.py:961`、`:994`、`:1215`、`:1283`，`opt_discovery/experiment/run_manifest.py:198`、`:292` | **代码审查** 输入哈希位于 compare 读表异常处理之外，配置和产物哈希也在写清单异常处理之外。文件在检查和读取间消失或不可读时可能绕过失败清单；产物消失时 `collect_artifacts` 可静默跳过。哈希与实际消费是独立读取，先后修改时不一定对应。应覆盖实际读取、记录和发布，明确可选/必需文件的结算。 |
+| B8 同目录同时运行及中断的代际隔离 | `opt_discovery/cli.py:1531`、`:1677`、`:1700`，`opt_discovery/experiment/run_manifest.py:208` | **代码审查、未并发实测** 两个运行用相同产物路径并覆写，独立 run_id 只在清单，无法隔离产物。固定临时清单路径也会冲突。进程在产物写出后、清单发布前中断可能形成混合产物。定义同目标并发是拒绝、串行或独立运行目录，再用锁或分目录发布守住该约定。 |
+
+### 一次性修复与复验范围
+
+| 工作组 | 复验场景 |
+|---|---|
+| 输出写入和失败发布（A1、A2、B1、B2、B7、B8） | 对真实 CLI 同时覆盖普通/外置/备用清单、绝对/相对路径、输入与报告、配置及 CSV/DB 与产物、已有临时同名文件、符号链接/硬链接、不可写/创建失败/读失败/写失败、没有安全清单目标、已有成功清单、清单形状错误和同目录重复运行。断言判定、run_id、输入字节和全部必需产物哈希。 |
+| 统一采集质量与比较范围（A3、A4、A5、B5、B6） | 用实际导出形态和独立 JSON 重读覆盖零行、缺轮次、低覆盖、未验证与畸形标记、合成/真实双向、完整/缺失/混合口径 rank、timeline 跳过/失败以及默认四组配对。断言失败条件与禁出的派生指标，并保留有效正例。 |
+| 下游结果与运行标识（A6、B3、B4） | 首轮有数据、次轮部分失败或缺可选产物，随后独立 summary/report。断言无旧行/旧结论、清单校验保持一致、可选失败明确可查，重复 ID 不发布无歧义的 success。 |
+
+此前已关闭的原反例保留回归即可，包括 R05/R10 从实际导出到独立 compare、已知阻断码降级、必需 timeline 的已测失败路径、轮次契约、分析内禁止旧 comm、清单与比较报告/嵌套产物的直接冲突、自定义清单路径和缺哈希。当前合并结论取决于 A1～A6，B 项明确供同一批修复和验收使用。后续复核以此表为边界，检查此批修复和它们直接改变的路径。
+
+### 本次验证记录
+
+- `PYTHONDONTWRITEBYTECODE=1 make check` 退出 0。Ruff、mypy 和配置验证通过。
+- `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae03-inventory-demo.897ju6` 退出 0。249 passed、17 skipped，合成演示通过。
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 退出 0，94 passed。
+- 独立 CLI 探针在临时目录执行，脚本为 `/tmp/ae03-inventory.6nleUg.py`、`/tmp/ae03-inventory-more.swi40d.py`、`/tmp/ae03-inventory-boundaries.qEMLGs.py`。固定临时路径与覆盖 YAML 复用上一轮 `/tmp/ae03-input-safety.wCRttt.py` 的实测。同口径 rank 与采集合同证据使用生产函数的独立 Python 探针。
+- 本轮真实 Profiling 测试跳过。NPU、托管 CI、其他解释器和并发写入未在本轮验证。

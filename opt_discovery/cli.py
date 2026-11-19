@@ -854,7 +854,10 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
 # check-manifest（产物清单校验）
 # ---------------------------------------------------------------------------
 def cmd_check_manifest(args: argparse.Namespace) -> int:
-    problems = verify_manifest(args.path)
+    try:
+        problems = verify_manifest(args.path)
+    except Exception as exc:  # noqa: BLE001 - 校验器自身异常不能变成 traceback
+        problems = [f"清单校验失败: {_redact_error(exc, (Path(args.path).parent,))}"]
     print(f"[check-manifest] {args.path}")
     if not problems:
         print("  OK: 清单内产物均存在且哈希一致")
@@ -905,16 +908,15 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "a": {"name": Path(args.a).name},
         "b": {"name": Path(args.b).name},
     }
-    input_reserved = {Path(args.a).resolve(), Path(args.b).resolve()}
+    input_paths = (Path(args.a), Path(args.b))
 
     def _safe_manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
         """清单不得覆盖输入或产物；冲突时退到同目录 run_manifest.json。"""
-        reserved = set(input_reserved) | {path.resolve() for path in extra}
-        if manifest_path.resolve() not in reserved:
-            return manifest_path
-        fallback = manifest_path.parent / "run_manifest.json"
-        if fallback.resolve() not in reserved:
-            return fallback
+        protected = input_paths + extra
+        for candidate in (manifest_path, manifest_path.parent / "run_manifest.json"):
+            if any(_same_file(candidate, path) for path in protected):
+                continue
+            return candidate
         print(
             "[compare] 无安全的 run_manifest 路径（与输入/产物重合），拒绝写入",
             file=sys.stderr,
@@ -1028,11 +1030,27 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return MANIFEST_EXIT_FAILED
 
     report_path = out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
-    if report_path.resolve() in input_reserved:
+    if any(_same_file(report_path, path) for path in input_paths):
         detail = "比较报告路径与输入表重合，拒绝覆盖输入"
         print(f"[compare] {detail}: {report_path}", file=sys.stderr)
+        safe = _safe_manifest_target((report_path,))
+        if safe is not None:
+            manifest_path = safe
+            _finish(
+                STATUS_FAILED,
+                stages=[
+                    StageRecord("load", True, STAGE_PASSED),
+                    StageRecord(
+                        "compare",
+                        True,
+                        STAGE_FAILED,
+                        "report_path_conflict",
+                        details={"error": detail},
+                    ),
+                ],
+            )
         return MANIFEST_EXIT_FAILED
-    if manifest_path.resolve() in input_reserved | {report_path.resolve()}:
+    if any(_same_file(manifest_path, path) for path in input_paths + (report_path,)):
         detail = "run_manifest 路径与比较产物或输入重合，拒绝写入"
         print(f"[compare] {detail}: {manifest_path}", file=sys.stderr)
         safe = _safe_manifest_target((report_path,))
@@ -1162,6 +1180,35 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         "workloads_dir": workloads_dir.name,
         "configs": [],
     }
+    duplicate_ids: list[str] = []
+    protected_inputs: set[Path] = set()
+
+    def _protect(path: Path) -> None:
+        try:
+            protected_inputs.add(Path(path).resolve())
+        except OSError:
+            pass
+
+    for config_path in config_paths:
+        _protect(config_path)
+
+    def _collides(path: Path, extra: tuple[Path, ...] = ()) -> bool:
+        candidates = list(protected_inputs) + list(artifacts.values()) + list(extra)
+        return any(_same_file(path, item) for item in candidates)
+
+    def _guard_output(path: Path) -> None:
+        """产物写入前移除旧符号链接，并拒绝覆盖输入（含硬链接/符号链接）。"""
+        if path.is_symlink():
+            path.unlink()
+        if _collides(path):
+            raise OSError(f"输出路径与输入重合: {path.name}")
+
+    def _manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
+        for candidate in (manifest_path, out / "run_manifest.json"):
+            if _collides(candidate, extra):
+                continue
+            return candidate
+        return None
 
     def _output_dir_failure(detail: str) -> None:
         """输出目录不可用时也要结算本轮失败（清掉旧 success 清单）。"""
@@ -1184,8 +1231,15 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             tool=tool_info(),
             previous_run_id=previous_run_id,
         )
+        target_path = _manifest_target()
+        if target_path is None:
+            print(
+                "[analyze] 无安全的 run_manifest 路径（与输入重合），放弃写入",
+                file=sys.stderr,
+            )
+            return
         try:
-            target = write_manifest(manifest_path, manifest)
+            target = write_manifest(target_path, manifest)
             print(f"[manifest] status=failed run_id={run_id} -> {target}")
         except OSError as exc:
             print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
@@ -1228,17 +1282,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             comparison_status=comparison_status,
             comparison_failed=comparison_failed,
             source_map_failed=source_map_failed,
+            duplicate_ids=duplicate_ids,
             failure_stage=failure_stage,
         )
-        if any(path.resolve() == manifest_path.resolve() for path in artifacts.values()):
-            fallback = out / "run_manifest.json"
+        if _collides(manifest_path):
             print(
-                "[analyze] run_manifest 路径与产物重合，拒绝覆盖产物",
+                "[analyze] run_manifest 路径与输入或产物重合，拒绝覆盖",
                 file=sys.stderr,
             )
-            if fallback.resolve() == manifest_path.resolve() or any(
-                path.resolve() == fallback.resolve() for path in artifacts.values()
-            ):
+            fallback = _manifest_target(extra=(manifest_path,))
+            if fallback is None:
                 print("[analyze] 无安全的 run_manifest 路径", file=sys.stderr)
                 return MANIFEST_EXIT_FAILED
             failed = RunManifest(
@@ -1305,6 +1358,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         _save(STATUS_FAILED, has_tables=False, discover_ok=False)
         return MANIFEST_EXIT_FAILED
 
+    ids = [workload.workload_id for workload in expected_workloads]
+    duplicate_ids.extend(sorted({wid for wid in ids if ids.count(wid) > 1}))
+    if duplicate_ids:
+        print(
+            f"[analyze] workload_id 重复: {', '.join(duplicate_ids)}（产物会互相覆盖）",
+            file=sys.stderr,
+        )
+        _save(
+            STATUS_FAILED,
+            has_tables=False,
+            discover_ok=False,
+            failure_stage="discover",
+        )
+        return MANIFEST_EXIT_FAILED
+
     try:
         bundles = discover_all(workloads_dir, exports_root)
     except Exception as exc:  # noqa: BLE001 - 发现失败也要写本轮 failed 清单
@@ -1333,6 +1401,16 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return MANIFEST_EXIT_INVALID
 
     inputs["export_dirs"] = sorted(bundle.export_dir.name for bundle in bundles)
+    for bundle in bundles:
+        if bundle.run_log is not None:
+            _protect(Path(bundle.run_log.path))
+        for rank_export in bundle.ranks:
+            for csv_path in rank_export.op_summary_files:
+                _protect(csv_path)
+            if rank_export.op_report_db:
+                _protect(rank_export.op_report_db)
+            for db_path in rank_export.directory.glob("msprof_*.db"):
+                _protect(db_path)
 
     # 2) 配置加载：失败时也要写本轮 failed 清单，不能保留旧 success 状态
     try:
@@ -1455,6 +1533,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             try:
                 volume = summarize_comm(db_files[0])
                 table.meta.extra["comm_volume"] = volume.to_dict()
+                _guard_output(out / workload_id / "comm.json")
                 volume.write_json(out / workload_id / "comm.json")
                 _record(out / workload_id / "comm.json", f"{workload_id}/comm.json")
                 if volume.available:
@@ -1489,6 +1568,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     report.notes = report.notes + tuple(
                         annotate_with_timeline(report, timeline)
                     )
+                    _guard_output(out / workload_id / "timeline.json")
                     timeline.write_json(out / workload_id / "timeline.json")
                     _record(
                         out / workload_id / "timeline.json", f"{workload_id}/timeline.json"
@@ -1519,21 +1599,25 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     quality_flags.append(failed_flag)
 
         try:
+            _guard_output(out / workload_id / "operator_table.json")
             table.write_json(out / workload_id / "operator_table.json")
             _record(
                 out / workload_id / "operator_table.json",
                 f"{workload_id}/operator_table.json",
             )
             coverage = summarize_coverage(table)
+            _guard_output(out / workload_id / "graph_coverage.json")
             coverage.write_json(out / workload_id / "graph_coverage.json")
             _record(
                 out / workload_id / "graph_coverage.json",
                 f"{workload_id}/graph_coverage.json",
             )
+            _guard_output(out / workload_id / "diagnosis.json")
             report.write_json(out / workload_id / "diagnosis.json")
             _record(out / workload_id / "diagnosis.json", f"{workload_id}/diagnosis.json")
             generated = opportunities_from_diagnosis(report)
             all_opportunities[workload_id] = generated
+            _guard_output(out / workload_id / "opportunities.json")
             write_opportunities(generated, out / workload_id / "opportunities.json")
             _record(
                 out / workload_id / "opportunities.json",
@@ -1636,6 +1720,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 binding_path=args.binding,
                 use_bindings=not args.no_bindings,
             )
+            _guard_output(out / "source_map.json")
             write_json_file(out / "source_map.json", payload)
             _record(out / "source_map.json", "source_map.json")
             attached_total = 0
@@ -1643,6 +1728,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 attached = attach_to_opportunities(generated, payload)
                 attached_total += attached
                 if attached:
+                    _guard_output(out / workload_id / "opportunities.json")
                     write_opportunities(generated, out / workload_id / "opportunities.json")
                     _record(
                         out / workload_id / "opportunities.json",
@@ -1656,6 +1742,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     try:
         matrix = hotspot_matrix(tables, top=args.top)
+        _guard_output(out / "hotspots.json")
         (out / "hotspots.json").write_text(
             json.dumps(matrix, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -1674,7 +1761,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             continue
         try:
             comparison = compare_tables(table_a, table_b, top=args.top)
-            target = comparison.write_json(out / f"compare_{key_a}_vs_{key_b}.json")
+            compare_path = out / f"compare_{key_a}_vs_{key_b}.json"
+            _guard_output(compare_path)
+            target = comparison.write_json(compare_path)
             _record(target, target.name)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! compare 失败（{key_a} vs {key_b}）: {_error(exc)}", file=sys.stderr)
@@ -1698,6 +1787,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"      -> {target}")
 
     try:
+        _guard_output(out / "workload_summary.csv")
+        _guard_output(out / "operator_summary.csv")
         workload_csv, operator_csv = write_summaries(
             out, include=set(selected_ids), artifacts=set(artifacts)
         )
@@ -1746,6 +1837,7 @@ def _analyze_stages(
     comparison_status: str,
     comparison_failed: bool,
     source_map_failed: bool,
+    duplicate_ids: list[str] | None = None,
     failure_stage: str | None = None,
 ) -> list[StageRecord]:
     """把本轮 run 状态映射为阶段清单（AE-03 契约的可审计部分）。"""
@@ -1754,7 +1846,8 @@ def _analyze_stages(
     parse_executed = failure_stage not in ("discover", "parse") and discover_ok
     later_executed = failure_stage is None
     parse_failed = bool(missing_logs or window_failures or parse_failures)
-    discover_failed = not discover_ok or bool(missing_exports)
+    duplicate_ids = duplicate_ids or []
+    discover_failed = not discover_ok or bool(missing_exports) or bool(duplicate_ids)
     compare_failed = comparison_failed or comparison_status in (
         COMPARISON_INCOMPARABLE,
         COMPARISON_FAILED,
@@ -1765,13 +1858,20 @@ def _analyze_stages(
             True,
             STAGE_FAILED if discover_failed else STAGE_PASSED,
             (
-                "discover_error"
-                if failure_stage == "discover"
-                else ("no_export" if not discover_ok else "missing_export")
+                "duplicate_workload_id"
+                if duplicate_ids
+                else (
+                    "discover_error"
+                    if failure_stage == "discover" and not discover_ok
+                    else ("no_export" if not discover_ok else "missing_export")
+                )
             )
             if discover_failed
             else None,
-            details={"missing": list(missing_exports)},
+            details={
+                "missing": list(missing_exports),
+                "duplicates": list(duplicate_ids),
+            },
         ),
         StageRecord(
             "parse",
@@ -1859,6 +1959,16 @@ def _analyze_stages(
             ),
         ),
     ]
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    """判断两个路径是否指向同一文件（识别硬链接/符号链接）。"""
+    try:
+        if left.exists() and right.exists():
+            return os.path.samefile(left, right)
+    except OSError:
+        pass
+    return left.resolve() == right.resolve()
 
 
 def _redact_error(exc: BaseException, roots: tuple[Path, ...]) -> str:

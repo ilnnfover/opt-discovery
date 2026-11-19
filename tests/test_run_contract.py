@@ -894,3 +894,185 @@ def test_analyze_manifest_cannot_overwrite_workload_table(tmp_path: Path) -> Non
     stages = {item["name"]: item for item in manifest["stages"]}
     assert stages["manifest"]["reason_code"] == "manifest_path_conflict"
     assert main(["check-manifest", "--path", str(fallback)]) == 0
+
+
+def test_manifest_tmp_name_does_not_clobber_input(tmp_path: Path) -> None:
+    """A1：输入恰好叫 compare-run.json.tmp 时，清单写入不得截断它。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    tricky_input = workdir / "compare-run.json.tmp"
+    tricky_input.write_bytes(table.read_bytes())
+    before = tricky_input.read_bytes()
+    manifest_path = workdir / "compare-run.json"
+
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(tricky_input),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(tmp_path / "cmp"),
+            "--manifest",
+            str(manifest_path),
+            "--strict",
+        ]
+    )
+    assert code == 0
+    assert tricky_input.read_bytes() == before
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] == "success"
+    assert main(["check-manifest", "--path", str(manifest_path)]) == 0
+
+
+def test_report_hardlink_to_input_is_rejected(tmp_path: Path) -> None:
+    """A1：比较报告路径是输入表的硬链接时，拒绝覆盖并发布 failed 清单。"""
+    import os
+
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+    before = table.read_bytes()
+
+    cmp_dir = tmp_path / "cmp"
+    assert (
+        main(
+            [
+                "compare",
+                "--a",
+                str(table),
+                "--b",
+                str(table),
+                "--out-dir",
+                str(cmp_dir),
+                "--strict",
+            ]
+        )
+        == 0
+    )
+    first = json.loads((cmp_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    report = cmp_dir / (
+        "compare_qwen35-35b-a3b-prefill-eager_vs_qwen35-35b-a3b-prefill-eager.json"
+    )
+    report.unlink()
+    os.link(table, report)
+
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(cmp_dir),
+            "--strict",
+        ]
+    )
+    assert code == 1
+    assert table.read_bytes() == before
+
+    manifest = json.loads((cmp_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] != first["run_id"]  # 拒绝也结算新 failed 清单
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["compare"]["reason_code"] == "report_path_conflict"
+
+
+def test_analyze_manifest_cannot_overwrite_config_yaml(tmp_path: Path) -> None:
+    """A1：analyze 的 --manifest 指向实际读取的 workload YAML 时不得覆盖。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    yaml_path = workloads / "prefill_eager.yaml"
+    before = yaml_path.read_bytes()
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict", "--manifest", str(yaml_path)))
+    assert code == 1
+    assert yaml_path.read_bytes() == before
+
+    fallback = out / "run_manifest.json"
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["manifest"]["reason_code"] == "manifest_path_conflict"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0
+
+
+def test_symlinked_artifact_does_not_clobber_input(tmp_path: Path) -> None:
+    """A1：旧产物是指向输入 YAML 的符号链接时，写入前先移除链接。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    yaml_path = workloads / "prefill_eager.yaml"
+    before = yaml_path.read_bytes()
+
+    out = tmp_path / "out"
+    workload_out = out / "qwen35-35b-a3b-prefill-eager"
+    workload_out.mkdir(parents=True)
+    (workload_out / "graph_coverage.json").symlink_to(yaml_path)
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 0
+    assert yaml_path.read_bytes() == before
+    assert not (workload_out / "graph_coverage.json").is_symlink()
+
+
+def test_duplicate_workload_ids_are_rejected(tmp_path: Path) -> None:
+    """B4：两个 YAML 使用相同 workload_id 时不得发布成功。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = tmp_path / "workloads"
+    workloads.mkdir()
+    raw = yaml.safe_load((WORKLOAD_DIR / "prefill_eager.yaml").read_text(encoding="utf-8"))
+    raw["hardware"]["device_count"] = 1
+    for name in ("first", "second"):
+        (workloads / f"{name}.yaml").write_text(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 1
+
+    manifest = _manifest(out)
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["discover"]["reason_code"] == "duplicate_workload_id"
+    assert stages["discover"]["details"]["duplicates"] == [raw["workload_id"]]
+
+
+def test_check_manifest_rejects_bad_shapes(tmp_path: Path, capsys) -> None:
+    """B1：缺 stages、数字 path、顶层数组都不能通过，也不能抛 traceback。"""
+    cases = {
+        "missing_stages.json": {
+            "schema_version": "1.0",
+            "run_id": "x",
+            "status": "success",
+            "artifacts": [],
+        },
+        "numeric_path.json": {
+            "schema_version": "1.0",
+            "run_id": "x",
+            "status": "failed",
+            "stages": [],
+            "artifacts": [{"path": 123, "sha256": "x"}],
+        },
+        "array.json": [],
+    }
+    for name, payload in cases.items():
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert main(["check-manifest", "--path", str(path)]) == 1
+    assert "Traceback" not in capsys.readouterr().err
