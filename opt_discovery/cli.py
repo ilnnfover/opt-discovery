@@ -905,6 +905,21 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "a": {"name": Path(args.a).name},
         "b": {"name": Path(args.b).name},
     }
+    input_reserved = {Path(args.a).resolve(), Path(args.b).resolve()}
+
+    def _safe_manifest_target(extra: tuple[Path, ...] = ()) -> Path | None:
+        """清单不得覆盖输入或产物；冲突时退到同目录 run_manifest.json。"""
+        reserved = set(input_reserved) | {path.resolve() for path in extra}
+        if manifest_path.resolve() not in reserved:
+            return manifest_path
+        fallback = manifest_path.parent / "run_manifest.json"
+        if fallback.resolve() not in reserved:
+            return fallback
+        print(
+            "[compare] 无安全的 run_manifest 路径（与输入/产物重合），拒绝写入",
+            file=sys.stderr,
+        )
+        return None
 
     def _output_dir_failure(detail: str) -> None:
         manifest = RunManifest(
@@ -926,8 +941,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
             tool=tool_info(),
             previous_run_id=previous_run_id,
         )
+        target_path = _safe_manifest_target()
+        if target_path is None:
+            return
         try:
-            target = write_manifest(manifest_path, manifest)
+            target = write_manifest(target_path, manifest)
             print(f"[manifest] status=failed run_id={run_id} -> {target}")
         except OSError as exc:
             print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
@@ -996,6 +1014,10 @@ def cmd_compare(args: argparse.Namespace) -> int:
             exc, (out_dir, manifest_path.parent, Path(args.a).parent, Path(args.b).parent)
         )
         print(f"[compare] 读取输入失败: {detail}", file=sys.stderr)
+        safe = _safe_manifest_target()
+        if safe is None:
+            return MANIFEST_EXIT_FAILED
+        manifest_path = safe
         _finish(
             STATUS_FAILED,
             stages=[
@@ -1006,17 +1028,16 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return MANIFEST_EXIT_FAILED
 
     report_path = out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
-    reserved = {
-        report_path.resolve(),
-        Path(args.a).resolve(),
-        Path(args.b).resolve(),
-    }
-    if manifest_path.resolve() in reserved:
+    if report_path.resolve() in input_reserved:
+        detail = "比较报告路径与输入表重合，拒绝覆盖输入"
+        print(f"[compare] {detail}: {report_path}", file=sys.stderr)
+        return MANIFEST_EXIT_FAILED
+    if manifest_path.resolve() in input_reserved | {report_path.resolve()}:
         detail = "run_manifest 路径与比较产物或输入重合，拒绝写入"
         print(f"[compare] {detail}: {manifest_path}", file=sys.stderr)
-        fallback = out_dir / "run_manifest.json"
-        if fallback.resolve() not in reserved:
-            manifest_path = fallback
+        safe = _safe_manifest_target((report_path,))
+        if safe is not None:
+            manifest_path = safe
             _finish(
                 STATUS_FAILED,
                 stages=[
@@ -1209,20 +1230,46 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             source_map_failed=source_map_failed,
             failure_stage=failure_stage,
         )
-        target_path = manifest_path
-        if any(path.resolve() == target_path.resolve() for path in artifacts.values()):
+        if any(path.resolve() == manifest_path.resolve() for path in artifacts.values()):
             fallback = out / "run_manifest.json"
-            if fallback.resolve() == target_path.resolve():
-                print(
-                    "[analyze] run_manifest 路径与产物重合，无法安全写入",
-                    file=sys.stderr,
-                )
-                return MANIFEST_EXIT_FAILED
             print(
-                f"[analyze] run_manifest 与产物重合，改写到 {fallback}",
+                "[analyze] run_manifest 路径与产物重合，拒绝覆盖产物",
                 file=sys.stderr,
             )
-            target_path = fallback
+            if fallback.resolve() == manifest_path.resolve() or any(
+                path.resolve() == fallback.resolve() for path in artifacts.values()
+            ):
+                print("[analyze] 无安全的 run_manifest 路径", file=sys.stderr)
+                return MANIFEST_EXIT_FAILED
+            failed = RunManifest(
+                run_id=run_id,
+                status=STATUS_FAILED,
+                strict=strict,
+                is_synthetic=is_synthetic,
+                stages=(
+                    StageRecord(
+                        "manifest",
+                        True,
+                        STAGE_FAILED,
+                        "manifest_path_conflict",
+                        details={"requested": manifest_path.name},
+                    ),
+                ),
+                workloads=tuple(workload_records),
+                quality_flags=tuple(sorted(quality_codes)),
+                comparison_status=comparison_status,
+                artifacts=(),
+                inputs=inputs,
+                tool=tool_info(),
+                previous_run_id=previous_run_id,
+            )
+            try:
+                target = write_manifest(fallback, failed)
+                print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            except OSError as exc:
+                print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+        target_path = manifest_path
 
         manifest = RunManifest(
             run_id=run_id,

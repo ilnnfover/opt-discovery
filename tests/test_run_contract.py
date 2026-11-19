@@ -800,3 +800,97 @@ def test_compare_manifest_cannot_overwrite_report(tmp_path: Path, capsys) -> Non
     stages = {item["name"]: item for item in manifest["stages"]}
     assert stages["compare"]["reason_code"] == "manifest_path_conflict"
     assert main(["check-manifest", "--path", str(fallback)]) == 0
+
+
+def test_compare_load_failure_never_overwrites_input(tmp_path: Path, capsys) -> None:
+    """合并前复验 P1：--manifest 指向输入表时，失败路径不得覆盖输入。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+    before = table.read_bytes()
+
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(tmp_path / "missing.json"),
+            "--out-dir",
+            str(tmp_path / "cmp"),
+            "--manifest",
+            str(table),
+            "--strict",
+        ]
+    )
+    assert code == 1
+    assert table.read_bytes() == before  # 输入字节未被覆盖
+
+    fallback = table.parent / "run_manifest.json"
+    assert fallback.is_file()
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0
+    capsys.readouterr()
+
+
+def test_compare_output_failure_never_overwrites_input(tmp_path: Path) -> None:
+    """合并前复验 P1：--out-dir 是普通文件时，也不得覆盖 --a。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+    before = table.read_bytes()
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(blocker),
+            "--manifest",
+            str(table),
+            "--strict",
+        ]
+    )
+    assert code == 1
+    assert table.read_bytes() == before
+
+    fallback = table.parent / "run_manifest.json"
+    assert fallback.is_file()
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["stages"][0]["reason_code"] == "output_dir_error"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0
+
+
+def test_analyze_manifest_cannot_overwrite_workload_table(tmp_path: Path) -> None:
+    """合并前复验 P1：analyze 清单指向 workload 表时必须拒绝且不发布 success。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    code = main(_args(exports, workloads, out, "--strict", "--manifest", str(table)))
+    assert code == 1
+    # 算子表保持是算子表（未被 failed 清单覆盖）
+    payload = json.loads(table.read_text(encoding="utf-8"))
+    assert "records" in payload and "workload" in payload
+
+    fallback = out / "run_manifest.json"
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["manifest"]["reason_code"] == "manifest_path_conflict"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0

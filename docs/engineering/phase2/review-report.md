@@ -1,6 +1,6 @@
 # AE-03 独立验收 Review
 
-> 最新结论见文末「最终增量复核」。`7a78498` 的验收结果为 **FAIL**，PR #2 暂缓合并。
+> 最新结论见文末「合并前复验」。`2589cc7` 的验收结果为 **FAIL**，PR #2 暂缓合并。
 
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
@@ -140,3 +140,20 @@ AE-04 正式验收或合并前，应先修复 P1 项并将已复现的场景纳�
 | `PYTHONDONTWRITEBYTECODE=1 env -u OPT_DISCOVERY_DATA_ROOT python3 scripts/verify_real.py --expect-blocked` | 缺数据闸门通过，真实回归为 BLOCKED。NPU、托管 CI 与其他 Python 版本未在本轮运行。本机为 Python 3.12.13。 |
 
 PR #2 的验收条件是关闭上述两项 P1，并以独立 CLI 复验确认输出目录初始化失败会结算可写清单，以及路径冲突无法发布 success。
+
+## 合并前复验（2026-11-19）
+
+**结论为 FAIL。PR #2 暂缓合并，AE-04 可先准备，正式启动应以通过验收的 AE-03 为基线。** 本次只复核 `7a78498..2589cc71bd361ebb7addc32ddde5455043c9f93b`，对照实施报告 §12。本地 HEAD 与跟踪引用一致。
+
+| 上轮问题 | 复验结果 |
+|---|---|
+| 无法创建输出目录时旧成功清单保留 | 原反例通过。输出路径为已有普通文件且外置清单可写时，analyze 和 compare 均退出 1、发布新 run_id 和 failed 清单。与输入路径冲突时仍可覆盖输入，见下表。 |
+| compare 清单覆盖比较报告 | 原反例通过。比较报告与清单同路径时退出 1，冲突路径未写入，安全位置的清单记为 failed。analyze 采用回退路径时仍会生成无法通过校验的 success 清单，见下表。 |
+| 显式跳过 timeline 时逐 workload 误记 partial | 关闭。用两个完整 TP=2 CSV 工作负载、均无 DB 的场景复验。显式跳过时退出 0，总体与各 workload 均为 success，timeline 标为 not_requested。 |
+
+| 级别 | 位置 | 复现及影响 | 修复建议 |
+|---|---|---|---|
+| P1 | `opt_discovery/cli.py:909`、`:940`、`:998`、`:1014` | 用有效算子表作 `--a`，并将 `--manifest` 指向同一文件。若 `--b` 不存在，或 `--out-dir` 是普通文件，compare 均退出 1，却把有效表覆盖为 failed 清单。冲突保护在读表和创建输出目录之后才执行。读表失败的旁路仍在，输出目录失败时覆盖输入是此次新增结算路径带来的回退。 | 在所有失败路径写清单之前检查输入路径冲突，选择经过校验的备用路径或保留输入并返回错误。测试需断言两类失败下原始输入字节不变。 |
+| P1 | `opt_discovery/cli.py:1225`、`:1236` | 将 analyze 的 `--manifest` 指向本轮某个 workload 子目录的 `operator_table.json`。算子表得以保留，命令退出 0，回退清单记 success，但校验退出 1。产物相对路径按原清单父目录计算，实际清单写在输出根目录。 | 写入前拒绝冲突，或以最终清单所在目录生成产物路径，保证 success 时清单可校验。增加嵌套产物冲突用例。 |
+
+`make check` 退出 0。`make verify DEMO_OUT=/tmp/ae03-merge-demo.Z6dQtT` 退出 0，246 passed、17 skipped，合成演示通过。`python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` 得 91 passed。另在临时目录通过实际 CLI 子进程复验，命令为 `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-merge-probe.LpHFRT.py`，并用有效输入表再次确认两类失败路径会覆盖原文件。真实 Profiling 回归在本次全量测试中跳过，NPU 未运行。

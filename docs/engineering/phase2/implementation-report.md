@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**246 passed, 17 skipped**（263 用例，无 xfail）。
+全量：**249 passed, 17 skipped**（266 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 246 passed, 17 skipped（263 用例） |
+| `python -m pytest` | 0 | 249 passed, 17 skipped（266 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 246 passed, 17 skipped |
+| 3.11 全量 | 0 | 249 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -263,4 +263,22 @@ if blocking_flags:
 | P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
 | P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **246 passed, 17 skipped**（263 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **249 passed, 17 skipped**（266 用例）。
+
+## 13. 合并前复验修复（2026-11-19）
+
+| 级别 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1 | compare 的 `--manifest` 与输入表重合时，**失败路径**（`--b` 不存在、`--out-dir` 是普通文件）仍把输入表覆盖为 failed 清单 | 入口先建立 `input_reserved`，所有写清单的路径（输出目录失败、读表失败、成功路径）统一经 `_safe_manifest_target()`：与输入/产物冲突则退到同目录 `run_manifest.json`，否则拒绝写入；读表失败前不再直接 `_finish` | `test_compare_load_failure_never_overwrites_input`、`test_compare_output_failure_never_overwrites_input`（断言输入字节不变） |
+| P1 | analyze 的 `--manifest` 指向 workload 的 `operator_table.json` 时，回退清单写到输出根但产物路径仍按原子目录计算，命令返回 0 且 `check-manifest` 失败 | 检测到清单与产物重合即**拒绝**，把 failed 清单（`manifest_path_conflict`）写到 `out/run_manifest.json` 并返回 1；不再发布 success | `test_analyze_manifest_cannot_overwrite_workload_table` |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| 失败路径覆盖输入 | 冲突校验放在读表成功、`mkdir` 成功之后 | `_output_dir_failure` 与 `load_error` 分支在冲突校验之前写清单；没有“输入保留集”这一入口级约束 |
+| analyze 回退清单不可校验 | 冲突时把清单改写到 `out/run_manifest.json`，仍按原清单父目录收集产物并返回 success | 只改了写入位置，没有同步 artifact 根，也没有把冲突判为失败 |
+
+现在规则统一为：**清单不得与输入或本轮产物重合**；有冲突时优先退到同目录 `run_manifest.json`，无法安全落盘则不写并返回非零，绝不覆盖输入。
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **249 passed, 17 skipped**（266 用例）。
