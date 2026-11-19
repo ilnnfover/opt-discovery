@@ -111,7 +111,7 @@ class KernelEvent:
 
 ## 6. 测试与验证
 
-新增 `tests/test_events.py`（8 条）：
+新增 `tests/test_events.py`（13 条）：
 
 - op_summary filter/clip 语义、COMMUNICATION 单位缩放、来源行号、rank、坏行/零时长跳过；
 - 缺时间列报 `EventReadError`；生成器惰性；
@@ -123,8 +123,8 @@ class KernelEvent:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check` | 0 | Ruff / mypy 53 文件 / validate |
-| `python -m pytest`（3.12） | 0 | 297 passed, 17 skipped（314 用例） |
-| `python -m pytest`（3.11） | 0 | 297 passed, 17 skipped |
+| `python -m pytest`（3.12） | 0 | 302 passed, 17 skipped（319 用例） |
+| `python -m pytest`（3.11） | 0 | 302 passed, 17 skipped |
 | `make verify DEMO_OUT=/tmp/ae04-demo2` | 0 | 合成演示完成 |
 | `tests/test_real_data.py`（授权数据） | 0 | 16 passed, 1 skipped |
 | `verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED |
@@ -146,3 +146,21 @@ class KernelEvent:
 - 未运行四组真实导出的完整 `analyze`；真实数据只用既有 `test_real_data.py` 验证解析/时间线语义。NPU 未运行。
 - 同一输出目录并发仍不支持（AE-03 已知限制），本阶段未改变。
 - 未新增 import-linter；`parsers -> analyzer` 只用本模块的 AST 测试守住 csv_mapping，全量依赖 lint 属 AE-05。
+
+## 9. 复审问题修复（2026-11-19）
+
+依据 `docs/engineering/phase3/review-report.md`：
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1-1 | Parser 与 Timeline 各自解释实例行 | `normalize_duration`（单位 + COMMUNICATION ns）与 `window_span(policy=...)` 移入 `primitives`；Parser 实例行改用共享入口（起点筛选 `policy="start"`），Timeline 用 Reader（`intersect`/`clip`）；映射扩展与聚合仍留在 Parser | `test_primitives_are_shared_without_parser_to_analyzer_import`；全量 CSV 回归 |
+| P1-2 | Timeline 只读取一个 op_summary 分片 | 新增 `op_summary_paths()`（自然序：slice_1/2/10），`_rank_intervals` 读取全部切片后再由 Timeline 排序合并；`find_op_summary` 保留兼容 | `test_timeline_reads_all_op_summary_slices`（4 任务 / 40µs） |
+| P1-3 | epoch 上短事件时长归零 | CSV 未裁剪路径保留原始时长（不先加 epoch 再减）；裁剪用左右扣减；SQLite 先整数 ns 求差再除 1000 | `test_epoch_short_durations_survive_all_readers`（CSV 0.1µs、COMM 100ns、TASK/Host 100ns） |
+| P1-4 | rank/stream 身份丢失 | `KernelEvent.rank: int \| None`，默认 `None`，由调用方显式传入；解析可选 `Stream ID`；无 `OP Type` 的行不产出 KernelEvent（区间视图仍保留） | `test_op_reader_preserves_stream_id_and_unknown_rank`、`test_rows_without_operator_are_not_kernel_events` |
+| P2-2 | 无窗口 TASK 路径仍本地 SQL | `_device_gap_stats` 改用 `iter_task_spans`（SQL 仍负责窗口过滤），删除重复的 ns→µs 与行解析 | 全量 `test_timeline` 与真实数据回归 |
+| P2-3 | 点窗口包装抛 `WindowError` | `load_task_intervals` / `load_host_intervals` 对 `end <= start` 保持“覆盖该点”的旧过滤语义，不构造非法 Window | `test_point_window_wrappers_keep_historical_filter` |
+| P3 | 性能/来源描述 | Report 明确 Python 流式 ≠ SQLite 内部排序；TASK/Host 的 `SourceReference` 定位到 DB/表级，不伪造逐行号 | 文档 |
+
+P2-1（Timeline 保留“整任务时长/窗口 busy”旧口径）未改变语义，作为已知差异记录；若切换口径需单独结果验收。
+
+验证：`make check` 0；`pytest` **302 passed, 17 skipped**（319 用例）；`make verify` 0；真实数据 16 passed / 1 skipped。

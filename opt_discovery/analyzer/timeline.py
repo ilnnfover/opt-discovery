@@ -41,6 +41,7 @@ from ..events import (
     iter_host_spans,
     iter_op_summary_intervals,
     iter_task_spans,
+    op_summary_paths,
 )
 from ..primitives import NS_PER_US, Interval, Window
 
@@ -282,6 +283,15 @@ def load_task_intervals(
     db_path: str | Path, start_us: float | None = None, end_us: float | None = None
 ) -> list[Interval]:
     """TASK 表回退路径（ns -> us）；委托共享 :func:`iter_task_intervals`。"""
+    if start_us is not None and end_us is not None and end_us <= start_us:
+        # 历史行为：点窗口按“覆盖该点”过滤，而不是构造非法 Window
+        try:
+            spans = list(iter_task_spans(db_path))
+        except EventReadError as exc:
+            raise TimelineError(str(exc)) from exc
+        return [
+            span for span in spans if span.end_us >= start_us and span.start_us <= end_us
+        ]
     window = (
         Window(start_us, end_us, rounds=())
         if start_us is not None and end_us is not None
@@ -320,7 +330,7 @@ def load_op_intervals(
         intervals = [
             interval
             for interval in iter_op_summary_intervals(op_summary_path)
-            if interval.end_us >= lower and interval.start_us <= upper
+            if interval.start_us <= upper and interval.duration_us >= lower - interval.start_us
         ]
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
@@ -332,18 +342,27 @@ def load_host_intervals(
     db_path: str | Path, start_us: float | None = None, end_us: float | None = None
 ) -> list[tuple[Interval, str]]:
     """CANN_API Host 调用；委托共享 :func:`iter_host_calls`。"""
+    point = start_us is not None and end_us is not None and end_us <= start_us
     window = (
         Window(start_us, end_us, rounds=())
-        if start_us is not None and end_us is not None
+        if start_us is not None and end_us is not None and not point
         else None
     )
     try:
-        return [
-            (Interval(start_us, end_us), name)
-            for start_us, end_us, name in iter_host_spans(db_path, window=window)
+        rows = [
+            (Interval(span_start, span_start + duration_us), name)
+            for span_start, duration_us, name in iter_host_spans(db_path, window=window)
         ]
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
+    if point:
+        assert start_us is not None and end_us is not None
+        rows = [
+            (span, name)
+            for span, name in rows
+            if span.end_us >= start_us and span.start_us <= end_us
+        ]
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -441,9 +460,12 @@ def _rank_intervals(
     Returns ``(intervals, source, op_csv_path)``，source 为 ``op_summary`` 或
     ``task_table``。
     """
-    op_csv = find_op_summary(db_path)
-    if op_csv is not None:
-        return load_op_intervals(op_csv, window.start_us, window.end_us), "op_summary", str(op_csv)
+    paths = op_summary_paths(db_path)
+    if paths:
+        intervals: list[Interval] = []
+        for path in paths:
+            intervals.extend(iter_op_summary_intervals(path, window=window))
+        return intervals, "op_summary", str(paths[0])
     return (
         load_task_intervals(db_path, window.start_us, window.end_us),
         "task_table",
@@ -472,29 +494,17 @@ def _rank_summary(db_path: str | Path, window: Window, span_us: float) -> dict:
 def _device_gap_stats(
     db_path: str | Path, window: Window | None, min_gap_us: float
 ) -> tuple[float, float, int, list[float], list[tuple[float, float]]]:
-    """Stream TASK rows: busy union, gap durations, and gaps >= threshold."""
-    connection = _connect(db_path)
-    if not _has_table(connection, "TASK"):
-        raise TimelineError(
-            f"{db_path}: 缺少 TASK 表（该 rank 的聚合可能失败，见 README 的 sqlite 回填说明）"
-        )
-    sql = "select startNs, endNs from TASK"
-    params: list[float] = []
-    if window is not None:
-        sql += " where endNs >= ? and startNs <= ?"
-        params = [window.start_us * _NS_PER_US, window.end_us * _NS_PER_US]
-    sql += " order by startNs"
-
+    """Stream TASK spans: busy union, gap durations, and gaps >= threshold."""
     busy = 0.0
     durations: list[float] = []
     big_gaps: list[tuple[float, float]] = []
     tasks = 0
     segment_start: float | None = None
     segment_end: float | None = None
-    with connection:
-        for start_ns, end_ns in connection.execute(sql, params):
-            start = start_ns / _NS_PER_US
-            end = end_ns / _NS_PER_US
+    try:
+        for span in iter_task_spans(db_path, window=window):
+            start = span.start_us
+            end = span.end_us
             tasks += 1
             if segment_start is None:
                 segment_start, segment_end = start, end
@@ -509,6 +519,8 @@ def _device_gap_stats(
                 if gap >= min_gap_us:
                     big_gaps.append((segment_end, start))
                 segment_start, segment_end = start, end
+    except EventReadError as exc:
+        raise TimelineError(str(exc)) from exc
     if segment_start is not None and segment_end is not None:
         busy += segment_end - segment_start
     if tasks == 0:
@@ -519,7 +531,8 @@ def _device_gap_stats(
 def _host_stream(db_path: str | Path, window: Window | None):
     """Yield (start_us, end_us, name) in start order via the shared reader."""
     try:
-        yield from iter_host_spans(db_path, window=window)
+        for start_us, duration_us, name in iter_host_spans(db_path, window=window):
+            yield start_us, start_us + duration_us, name
     except EventReadError as exc:
         raise TimelineError(str(exc)) from exc
 

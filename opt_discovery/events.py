@@ -9,10 +9,10 @@ and analyzers:
   operator identity and is therefore a different type;
 * :class:`HostCall` — ACL/CANN host-side calls (``CANN_API``).
 
-All timestamps are epoch microseconds.  The only unit conversions live here
-(``ns -> us`` for sqlite, and the COMMUNICATION ``Task Duration`` ns quirk).
-Readers are lazy generators: callers that need sorting or interval merging
-materialize the list explicitly, as the timeline analysis already did.
+All timestamps are epoch microseconds.  The only unit conversions live in
+``primitives.normalize_duration`` / ``window_span`` (``ns -> us`` for sqlite and
+the COMMUNICATION ``Task Duration`` ns quirk).  Readers are lazy generators;
+callers that need sorting or interval merging materialize the list explicitly.
 """
 
 from __future__ import annotations
@@ -23,7 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from .primitives import COMMUNICATION_DURATION_SCALE, NS_PER_US, Interval, Window
+from .primitives import (
+    NS_PER_US,
+    Interval,
+    Window,
+    normalize_duration,
+    window_span,
+)
 from .schemas.operator import TaskType
 
 __all__ = [
@@ -38,12 +44,14 @@ __all__ = [
     "iter_op_summary_intervals",
     "iter_task_intervals",
     "iter_task_spans",
+    "op_summary_paths",
 ]
 
 OP_SUMMARY_START = "Task Start Time(us)"
 OP_SUMMARY_DURATION = "Task Duration(us)"
 OP_SUMMARY_TYPE = "Task Type"
 OP_SUMMARY_OPERATOR = "OP Type"
+OP_SUMMARY_STREAM = "Stream ID"
 
 _KERNEL_TYPES = frozenset({"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"})
 
@@ -65,7 +73,7 @@ class SourceReference:
 @dataclass(frozen=True)
 class KernelEvent:
     operator: str
-    rank: int
+    rank: int | None
     start_us: float
     duration_us: float
     task_type: TaskType
@@ -84,7 +92,7 @@ class KernelEvent:
 class TaskIntervalEvent:
     """TASK-table fallback: per-task interval without operator identity."""
 
-    rank: int
+    rank: int | None
     start_us: float
     duration_us: float
     source: SourceReference
@@ -127,27 +135,9 @@ def _task_type(raw: str | None) -> TaskType:
     return TaskType.OTHER
 
 
-def _window_span(
-    start_us: float, end_us: float, window: Window | None, clip: bool
-) -> tuple[float, float] | None:
-    """Return the event span to emit, or ``None`` when it is outside.
-
-    ``clip=False`` keeps events that *intersect* the window with their full
-    duration (the historical timeline semantics).  ``clip=True`` clamps the
-    interval to the window and drops events that only touch the boundary.
-    """
-    if window is None:
-        return start_us, end_us
-    if clip:
-        start = max(start_us, window.start_us)
-        end = min(end_us, window.end_us)
-        return (start, end) if end > start else None
-    if end_us < window.start_us or start_us > window.end_us:
-        return None
-    return start_us, end_us
-
-
-def _indices(header: list[str], path: Path) -> tuple[int, int, int | None, int | None]:
+def _indices(
+    header: list[str], path: Path
+) -> tuple[int, int, int | None, int | None, int | None]:
     try:
         start_idx = header.index(OP_SUMMARY_START)
         duration_idx = header.index(OP_SUMMARY_DURATION)
@@ -157,14 +147,27 @@ def _indices(header: list[str], path: Path) -> tuple[int, int, int | None, int |
         ) from exc
     type_idx = header.index(OP_SUMMARY_TYPE) if OP_SUMMARY_TYPE in header else None
     operator_idx = header.index(OP_SUMMARY_OPERATOR) if OP_SUMMARY_OPERATOR in header else None
-    return start_idx, duration_idx, type_idx, operator_idx
+    stream_idx = header.index(OP_SUMMARY_STREAM) if OP_SUMMARY_STREAM in header else None
+    return start_idx, duration_idx, type_idx, operator_idx, stream_idx
+
+
+def _optional_int(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
 
 def _iter_op_rows(
     path: str | Path,
     window: Window | None,
     clip: bool,
-) -> Iterator[tuple[float, float, TaskType, str, int]]:
+) -> Iterator[tuple[float, float, TaskType, str | None, int | None, int]]:
     source_path = Path(path)
     if not source_path.is_file():
         raise EventReadError(f"{source_path}: 文件不存在")
@@ -173,30 +176,44 @@ def _iter_op_rows(
         header = next(reader, None)
         if header is None:
             return
-        start_idx, duration_idx, type_idx, operator_idx = _indices(header, source_path)
+        start_idx, duration_idx, type_idx, operator_idx, stream_idx = _indices(
+            header, source_path
+        )
         width = max(start_idx, duration_idx)
+        policy = "clip" if clip else "intersect"
         for row_number, row in enumerate(reader, start=2):
             if len(row) <= width:
                 continue
             try:
                 start_us = float(row[start_idx])
-                duration_us = float(row[duration_idx])
+                duration_value = float(row[duration_idx])
             except ValueError:
                 continue
-            if duration_us <= 0.0:
+            if duration_value <= 0.0:
                 continue
             raw_type = row[type_idx] if type_idx is not None and type_idx < len(row) else None
             task_type = _task_type(raw_type)
-            if task_type is TaskType.COMMUNICATION:
-                duration_us *= COMMUNICATION_DURATION_SCALE
-            span = _window_span(start_us, start_us + duration_us, window, clip)
+            # 先缩放时长再决定窗口，避免在 epoch 上“先加后减”丢精度
+            duration_us = normalize_duration(duration_value, task_type=task_type)
+            span = window_span(start_us, duration_us, window, policy=policy)
             if span is None:
                 continue
             operator = (
-                (row[operator_idx] if operator_idx is not None and operator_idx < len(row) else "")
-                or "unknown"
+                row[operator_idx] if operator_idx is not None and operator_idx < len(row) else ""
             )
-            yield span[0], span[1] - span[0], task_type, operator, row_number
+            stream_id = (
+                _optional_int(row[stream_idx])
+                if stream_idx is not None and stream_idx < len(row)
+                else None
+            )
+            yield (
+                span[0],
+                span[1],
+                task_type,
+                operator.strip() or None,
+                stream_id,
+                row_number,
+            )
 
 
 def iter_op_summary_events(
@@ -204,18 +221,19 @@ def iter_op_summary_events(
     *,
     window: Window | None = None,
     clip: bool = False,
-    rank: int = 0,
+    rank: int | None = None,
 ) -> Iterator[KernelEvent]:
     """Stream per-instance kernel events from an ``op_summary`` CSV.
 
-    Row order follows the file (msprof natural order); callers that need a
-    sorted timeline must sort explicitly.  Bad rows, empty rows and zero/negative
-    durations are skipped, matching the previous timeline reader.
+    Rows without ``OP Type`` have no operator identity; they are only exposed by
+    :func:`iter_op_summary_intervals`, not as :class:`KernelEvent`.
     """
     source_path = Path(path)
-    for start_us, duration_us, task_type, operator, row_number in _iter_op_rows(
+    for start_us, duration_us, task_type, operator, stream_id, row_number in _iter_op_rows(
         path, window, clip
     ):
+        if operator is None:
+            continue
         yield KernelEvent(
             operator=operator,
             rank=rank,
@@ -223,6 +241,7 @@ def iter_op_summary_events(
             duration_us=duration_us,
             task_type=task_type,
             source=SourceReference(kind="op_summary", path=str(source_path), row=row_number),
+            stream_id=stream_id,
         )
 
 
@@ -232,9 +251,33 @@ def iter_op_summary_intervals(
     window: Window | None = None,
     clip: bool = False,
 ) -> Iterator[Interval]:
-    """Interval-only view for consumers that do not need event identity."""
-    for start_us, duration_us, _task, _operator, _row in _iter_op_rows(path, window, clip):
+    """Interval-only view (keeps rows without operator identity)."""
+    for start_us, duration_us, _task, _operator, _stream, _row in _iter_op_rows(
+        path, window, clip
+    ):
         yield Interval(start_us, start_us + duration_us)
+
+
+def _natural_key(path: Path) -> list[object]:
+    parts: list[object] = []
+    token = ""
+    for char in path.name:
+        if char.isdigit():
+            token += char
+            continue
+        if token:
+            parts.append(int(token))
+            token = ""
+        parts.append(char)
+    if token:
+        parts.append(int(token))
+    return parts
+
+
+def op_summary_paths(db_path: str | Path) -> list[Path]:
+    """All ``op_summary`` slices for a rank, in profiler natural order."""
+    root = Path(db_path).parent / "mindstudio_profiler_output"
+    return sorted(root.glob("op_summary_*.csv"), key=_natural_key)
 
 
 def _has_table(connection: sqlite3.Connection, name: str) -> bool:
@@ -261,8 +304,9 @@ def _iter_task_rows(
             params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
         sql += " order by startNs"
         for row in connection.execute(sql, params):
-            # SQL 已按窗口过滤（endNs >= start / startNs <= end），无需二次判断
-            yield float(row[0]) / NS_PER_US, float(row[1]) / NS_PER_US
+            start_ns = int(row[0])
+            duration_ns = int(row[1]) - start_ns
+            yield start_ns / NS_PER_US, duration_ns / NS_PER_US
     finally:
         connection.close()
 
@@ -271,15 +315,15 @@ def iter_task_intervals(
     db_path: str | Path,
     *,
     window: Window | None = None,
-    rank: int = 0,
+    rank: int | None = None,
 ) -> Iterator[TaskIntervalEvent]:
-    """Stream ``TASK`` rows as intervals (ns -> us) without operator identity."""
+    """Stream ``TASK`` rows as intervals (integer ns diff -> us)."""
     path = str(Path(db_path))
-    for start_us, end_us in _iter_task_rows(db_path, window):
+    for start_us, duration_us in _iter_task_rows(db_path, window):
         yield TaskIntervalEvent(
             rank=rank,
             start_us=start_us,
-            duration_us=end_us - start_us,
+            duration_us=duration_us,
             source=SourceReference(kind="task_table", path=path),
         )
 
@@ -288,14 +332,14 @@ def iter_task_spans(
     db_path: str | Path, *, window: Window | None = None
 ) -> Iterator[Interval]:
     """Interval-only TASK view (timeline fallback)."""
-    for start_us, end_us in _iter_task_rows(db_path, window):
-        yield Interval(start_us, end_us)
+    for start_us, duration_us in _iter_task_rows(db_path, window):
+        yield Interval(start_us, start_us + duration_us)
 
 
 def iter_host_spans(
     db_path: str | Path, *, window: Window | None = None
 ) -> Iterator[tuple[float, float, str]]:
-    """Tuple view for timeline gap attribution (no per-event dataclass)."""
+    """Tuple view ``(start_us, duration_us, name)`` for timeline attribution."""
     path = Path(db_path)
     if not path.is_file():
         raise EventReadError(f"{path}: 文件不存在")
@@ -313,11 +357,9 @@ def iter_host_spans(
             params = [window.start_us * NS_PER_US, window.end_us * NS_PER_US]
         sql += " order by a.startNs"
         for row in connection.execute(sql, params):
-            yield (
-                float(row[0]) / NS_PER_US,
-                float(row[1]) / NS_PER_US,
-                str(row[2] or "unknown"),
-            )
+            start_ns = int(row[0])
+            duration_ns = int(row[1]) - start_ns
+            yield start_ns / NS_PER_US, duration_ns / NS_PER_US, str(row[2] or "unknown")
     finally:
         connection.close()
 
@@ -325,12 +367,12 @@ def iter_host_spans(
 def iter_host_calls(
     db_path: str | Path, *, window: Window | None = None
 ) -> Iterator[HostCall]:
-    """Stream ``CANN_API`` host calls (ns -> us), resolving names lazily."""
+    """Stream ``CANN_API`` host calls (integer ns diff -> us)."""
     path = str(Path(db_path))
-    for start_us, end_us, name in iter_host_spans(db_path, window=window):
+    for start_us, duration_us, name in iter_host_spans(db_path, window=window):
         yield HostCall(
             name=name,
             start_us=start_us,
-            duration_us=end_us - start_us,
+            duration_us=duration_us,
             source=SourceReference(kind="cann_api", path=path),
         )

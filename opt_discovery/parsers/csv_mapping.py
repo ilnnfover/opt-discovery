@@ -34,9 +34,10 @@ from .base import ParserCapabilities, ParserError
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
     from ..primitives import Window
 
-from ..primitives import COMMUNICATION_DURATION_SCALE
+from ..primitives import COMMUNICATION_DURATION_SCALE, normalize_duration, window_span
 
 __all__ = [
+    "COMMUNICATION_DURATION_SCALE",
     "ColumnSpec",
     "ExtraMetricSpec",
     "AggregateSpec",
@@ -422,7 +423,8 @@ class MappingCsvParser:
                                 f"{file.name}:{line_no}",
                             )
                             continue
-                        if not window.contains(timestamp):
+                        # 实例行沿用“起点在窗口内”的筛选策略（与 Timeline 的相交策略分开）
+                        if window_span(timestamp, 0.0, window, policy="start") is None:
                             rows_outside += 1
                             continue
                         for round_index, round_start, round_end in window.round_spans:
@@ -628,11 +630,12 @@ class MappingCsvParser:
         if total_index is not None:
             value = _to_float(row[total_index] if total_index < len(row) else None)
             if value is not None:
-                duration = _to_us(value, self.mapping.fields["total_time_us"].unit)
-                # profiler 的 Task Duration 列，COMMUNICATION 行实际是 ns，
-                # 其余（AI_CORE/AI_VECTOR_CORE/...）是 us。见 README「通信时长单位」。
-                if task_type is TaskType.COMMUNICATION:
-                    duration *= COMMUNICATION_DURATION_SCALE
+                # 单位换算 + COMMUNICATION ns 缩放由 primitives 统一处理，
+                # 与 events.py 的实例读取器共用同一入口。
+                duration = normalize_duration(
+                    _to_us(value, self.mapping.fields["total_time_us"].unit),
+                    task_type=task_type,
+                )
 
         if self.mapping.row_semantics == "instance":
             if duration is None:

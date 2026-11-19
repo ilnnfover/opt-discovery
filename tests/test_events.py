@@ -16,6 +16,7 @@ from opt_discovery.events import (
     TaskIntervalEvent,
     iter_host_calls,
     iter_op_summary_events,
+    iter_op_summary_intervals,
     iter_task_intervals,
 )
 from opt_discovery.primitives import (
@@ -67,14 +68,14 @@ def test_op_summary_reader_filter_and_clip_semantics(tmp_path: Path) -> None:
     )
     window = _window()
 
-    filtered = list(iter_op_summary_events(csv_path, window=window))
+    filtered = list(iter_op_summary_events(csv_path, window=window, rank=1))
     assert [event.operator for event in filtered] == ["MatMul", "hcom_allReduce_"]
     assert [event.duration_us for event in filtered] == [100.0, 50.0]
     assert filtered[0].task_type is TaskType.KERNEL
     assert filtered[1].task_type is TaskType.COMMUNICATION
     assert filtered[0].source.kind == "op_summary"
     assert filtered[0].source.row == 2
-    assert filtered[0].rank == 0
+    assert filtered[0].rank == 1
     assert filtered[0].interval() == Interval(1000.0, 1100.0)
 
     clipped = list(iter_op_summary_events(csv_path, window=window, clip=True))
@@ -174,3 +175,111 @@ def test_primitives_are_shared_without_parser_to_analyzer_import() -> None:
     }
     assert not any(module.startswith("opt_discovery.analyzer") for module in imports)
     assert not any(module == "..analyzer.window" for module in imports)
+
+
+def test_op_reader_preserves_stream_id_and_unknown_rank(tmp_path: Path) -> None:
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us),Stream ID\n"
+        "0,MatMul,AI_CORE,1000,100,17\n"
+        "0,Add,AI_CORE,1200,100,18\n",
+        encoding="utf-8",
+    )
+    default = list(iter_op_summary_events(path))
+    assert [event.rank for event in default] == [None, None]
+    assert [event.stream_id for event in default] == [17, 18]
+
+    explicit = list(iter_op_summary_events(path, rank=1))
+    assert [event.rank for event in explicit] == [1, 1]
+
+
+def test_rows_without_operator_are_not_kernel_events(tmp_path: Path) -> None:
+    path = tmp_path / "op_summary_1.csv"
+    path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        "0,,AI_CORE,1000,100\n",
+        encoding="utf-8",
+    )
+    assert list(iter_op_summary_events(path)) == []
+    intervals = list(iter_op_summary_intervals(path))
+    assert [(item.start_us, item.end_us) for item in intervals] == [(1000.0, 1100.0)]
+
+
+def test_epoch_short_durations_survive_all_readers(tmp_path: Path) -> None:
+    """P1-3：1.79e15 µs epoch 上的 0.1 µs 事件不能被浮点加法吃掉。"""
+    epoch = 1_790_000_000_000_000.0
+    csv_path = tmp_path / "op_summary_1.csv"
+    csv_path.write_text(
+        "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n"
+        f"0,MatMul,AI_CORE,{epoch},0.1\n"
+        f"0,hcom_allReduce_,COMMUNICATION,{epoch},100\n",
+        encoding="utf-8",
+    )
+    events = list(iter_op_summary_events(csv_path))
+    assert [event.duration_us for event in events] == pytest.approx([0.1, 0.1])
+
+    db = tmp_path / "msprof_0.db"
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute(
+        "insert into TASK values (?, ?)", (int(epoch * 1000), int(epoch * 1000) + 100)
+    )
+    connection.execute("create table CANN_API (name integer, startNs integer, endNs integer)")
+    connection.execute("create table STRING_IDS (id integer, value text)")
+    connection.execute("insert into STRING_IDS values (1, 'launch')")
+    connection.execute(
+        "insert into CANN_API values (1, ?, ?)",
+        (int(epoch * 1000), int(epoch * 1000) + 100),
+    )
+    connection.commit()
+    connection.close()
+
+    task = list(iter_task_intervals(db))[0]
+    host = list(iter_host_calls(db))[0]
+    assert task.duration_us == pytest.approx(0.1)
+    assert host.duration_us == pytest.approx(0.1)
+
+
+def test_timeline_reads_all_op_summary_slices(tmp_path: Path) -> None:
+    """P1-2：slice_1/2/10 必须全部读取，而不是只取最大分片。"""
+    from opt_discovery import events
+
+    prof = tmp_path / "PROF_000000_test"
+    output = prof / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    for name, rows in (
+        ("op_summary_slice_1.csv", 2),
+        ("op_summary_slice_2.csv", 1),
+        ("op_summary_slice_10.csv", 1),
+    ):
+        body = "".join(
+            f"0,op_{index},AI_CORE,{1000 + index * 100},10\n"
+            for index in range(rows)
+        )
+        (output / name).write_text(
+            "Device_id,OP Type,Task Type,Task Start Time(us),Task Duration(us)\n" + body,
+            encoding="utf-8",
+        )
+    (prof / "msprof_0.db").write_bytes(b"")
+    window = Window(1000.0, 2000.0, rounds=(1,))
+    intervals, source, _csv = timeline._rank_intervals(prof / "msprof_0.db", window)
+    assert source == "op_summary"
+    assert len(intervals) == 4
+    assert sum(item.duration_us for item in intervals) == pytest.approx(40.0)
+    assert [path.name for path in events.op_summary_paths(prof / "msprof_0.db")] == [
+        "op_summary_slice_1.csv",
+        "op_summary_slice_2.csv",
+        "op_summary_slice_10.csv",
+    ]
+
+
+def test_point_window_wrappers_keep_historical_filter(tmp_path: Path) -> None:
+    """P2-3：load_task_intervals(db, 1, 1) 仍返回覆盖该点的区间。"""
+    db = tmp_path / "point.db"
+    connection = sqlite3.connect(db)
+    connection.execute("create table TASK (startNs integer, endNs integer)")
+    connection.execute("insert into TASK values (1000, 1100)")
+    connection.commit()
+    connection.close()
+    intervals = timeline.load_task_intervals(db, 1.0, 1.0)
+    assert [(item.start_us, item.end_us) for item in intervals] == [(1.0, 1.1)]

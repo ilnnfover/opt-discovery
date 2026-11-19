@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .schemas.operator import TaskType
+
 __all__ = [
     "COMMUNICATION_DURATION_SCALE",
     "DEFAULT_MAX_GAP_US",
@@ -20,6 +22,8 @@ __all__ = [
     "Window",
     "WindowError",
     "WindowQuality",
+    "normalize_duration",
+    "window_span",
 ]
 
 #: msprof sqlite 时间戳是 epoch 纳秒，分析层统一用微秒
@@ -35,6 +39,50 @@ COMMUNICATION_DURATION_SCALE = 0.001
 DEFAULT_MAX_GAP_US = 100_000.0
 #: 窗口内设备忙碌比例下限
 DEFAULT_MIN_BUSY_RATIO = 0.10
+
+
+def normalize_duration(
+    duration_value: float, *, unit_scale: float = 1.0, task_type: TaskType
+) -> float:
+    """Convert a raw duration to µs and apply the COMMUNICATION ns quirk once."""
+    duration_us = float(duration_value) * unit_scale
+    if task_type is TaskType.COMMUNICATION:
+        duration_us *= COMMUNICATION_DURATION_SCALE
+    return duration_us
+
+
+def window_span(
+    start_us: float,
+    duration_us: float,
+    window: "Window | None",
+    *,
+    policy: str = "intersect",
+) -> tuple[float, float] | None:
+    """Apply a window policy and return ``(start_us, duration_us)``.
+
+    * ``policy="start"``：只按起点判断（Parser 既有的起点筛选）
+    * ``policy="intersect"``：与窗口相交即保留完整时长（Timeline 既有口径）
+    * ``policy="clip"``：裁剪到窗口；在 epoch 上尽量用“扣减两侧时长”避免先加后减
+    """
+    if window is None:
+        return start_us, duration_us
+    end_us = start_us + duration_us
+    if policy == "start":
+        if not window.contains(start_us):
+            return None
+        return start_us, duration_us
+    if policy == "intersect":
+        if end_us < window.start_us or start_us > window.end_us:
+            return None
+        return start_us, duration_us
+    if policy != "clip":
+        raise ValueError(f"unknown window policy: {policy!r}")
+    left = max(0.0, window.start_us - start_us)
+    right = max(0.0, end_us - window.end_us)
+    clipped_duration = duration_us - left - right
+    if clipped_duration <= 0.0:
+        return None
+    return start_us + left, clipped_duration
 
 
 class WindowError(ValueError):
