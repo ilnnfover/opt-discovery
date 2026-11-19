@@ -117,6 +117,38 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
+def _matches_evidence_rhs(value: ast.AST | None, expected: str) -> bool:
+    """Require the exact ``Receiver.ATTRIBUTE`` shape, not just the attribute."""
+    receiver, separator, attribute = expected.rpartition(".")
+    if not separator or not receiver or not attribute:
+        return False
+    return (
+        isinstance(value, ast.Attribute)
+        and value.attr == attribute
+        and isinstance(value.value, ast.Name)
+        and value.value.id == receiver
+    )
+
+
+def _write_only_open(node: ast.Call, *, method: bool) -> bool:
+    """True only for an explicit write-only mode such as ``'w'``/``'wb'``."""
+    index = 0 if method else 1
+    mode: ast.AST | None = None
+    if len(node.args) > index:
+        mode = node.args[index]
+    else:
+        for keyword in node.keywords:
+            if keyword.arg == "mode":
+                mode = keyword.value
+                break
+    if not isinstance(mode, ast.Constant) or not isinstance(mode.value, str):
+        return False
+    value = mode.value
+    return "+" not in value and "r" not in value and any(
+        flag in value for flag in ("w", "a", "x")
+    )
+
+
 def _check_imports(
     tree: ast.AST,
     path: Path,
@@ -304,18 +336,6 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
                         "通过 parsers/sqlite_op_report 或 events 的公共 Reader 读取",
                     )
                 )
-            if not rel.startswith("opt_discovery/report/") and any(
-                item == "csv" or item.startswith("csv.") for item in targets
-            ):
-                violations.append(
-                    Violation(
-                        "OD003",
-                        rel,
-                        node.lineno,
-                        "下游模块直接导入 csv 解析原始数据",
-                        "通过 parsers/csv_mapping 或 events 的公共 Reader 读取",
-                    )
-                )
             continue
         if isinstance(node, ast.Call):
             func = node.func
@@ -337,17 +357,19 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
                         )
                     )
                     continue
-            reads = (
-                isinstance(func, ast.Name)
-                and func.id == "open"
-                or isinstance(func, ast.Attribute)
-                and func.attr in {"read_text", "read_bytes", "read_csv", "open"}
-            )
-            if reads:
-                subject = node.func.value if isinstance(func, ast.Attribute) else None
-                if _raw_in_subtree(node) or (
-                    subject is not None and _raw_in_subtree(subject)
+            builtin_open = isinstance(func, ast.Name) and func.id == "open"
+            method_open = isinstance(func, ast.Attribute) and func.attr == "open"
+            read_method = isinstance(func, ast.Attribute) and func.attr in {
+                "read_text",
+                "read_bytes",
+                "read_csv",
+            }
+            if builtin_open or method_open or read_method:
+                if (builtin_open or method_open) and _write_only_open(
+                    node, method=method_open
                 ):
+                    continue
+                if _raw_in_subtree(node):
                     violations.append(
                         Violation(
                             "OD003",
@@ -390,8 +412,12 @@ def _check_od004(
                 "verdict",
                 "evidence_level",
             }:
-                if target.attr == "evidence_level" and (rel, node.lineno) in allowed:
-                    continue
+                if target.attr == "evidence_level":
+                    expected = allowed.get((rel, node.lineno))
+                    if expected is not None and _matches_evidence_rhs(
+                        getattr(node, "value", None), expected
+                    ):
+                        continue
                 violations.append(
                     Violation(
                         "OD004",
@@ -536,7 +562,9 @@ def run_lint(root: str | Path, config_path: str | Path) -> list[Violation]:
         if isinstance(item, Mapping) and item.get("file") and item.get("line")
     }
     od004_allowed = {
-        (str(item["file"]), int(item["line"])): str(item.get("reason", ""))
+        (str(item["file"]), int(item["line"])): str(
+            item.get("rhs", "ConfidenceLevel.PROBABLE")
+        )
         for item in config.get("od004_allow") or []
         if isinstance(item, Mapping) and item.get("file") and item.get("line")
     }

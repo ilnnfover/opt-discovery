@@ -422,3 +422,110 @@ def test_od007_quoted_key_line_is_accurate(tmp_path: Path) -> None:
     )
     violations = _violations(tmp_path, "OD007")
     assert violations[0].line == 2
+
+
+def test_od003_cli_csv_error_import_is_allowed(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/cli.py",
+        "from csv import Error\n"
+        "def f():\n"
+        "    try:\n"
+        "        return 1\n"
+        "    except Error:\n"
+        "        return 0\n",
+    )
+    assert run_lint(tmp_path, CONFIG) == []
+
+
+def test_od003_explicit_write_modes_are_not_reads(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/report/x.py",
+        "def f(rank, out):\n"
+        "    with (rank / 'op_summary_1.csv').open('w') as handle:\n"
+        "        handle.write('x')\n"
+        "    with open(out / 'operator_summary.csv', 'w') as handle:\n"
+        "        handle.write('x')\n"
+        "    with (rank / 'op_summary_1.csv').open('ab') as handle:\n"
+        "        handle.write(b'x')\n"
+        "    return open(out / 'op_summary_1.csv', 'x')\n",
+    )
+    assert run_lint(tmp_path, CONFIG) == []
+
+
+def test_od003_default_and_read_modes_are_rejected(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "opt_discovery/report/x.py",
+        "def f(rank):\n"
+        "    a = open(rank / 'op_summary_1.csv')\n"
+        "    b = open(rank / 'op_summary_1.csv', 'r')\n"
+        "    c = open(rank / 'op_summary_1.csv', 'rb')\n"
+        "    d = open(rank / 'op_summary_1.csv', 'r+')\n"
+        "    e = (rank / 'op_summary_1.csv').open()\n"
+        "    g = (rank / 'op_summary_1.csv').open('rb')\n"
+        "    return a, b, c, d, e, g\n",
+    )
+    violations = _violations(tmp_path, "OD003")
+    assert sorted(item.line for item in violations) == [2, 3, 4, 5, 6, 7]
+
+
+def test_od004_exempt_line_probable_is_allowed(tmp_path: Path) -> None:
+    import yaml
+
+    _write(
+        tmp_path,
+        "opt_discovery/experiment/feedback.py",
+        "from opt_discovery.schemas.evidence import ConfidenceLevel\n"
+        "def f(opportunity):\n"
+        "    opportunity.evidence_level = ConfidenceLevel.PROBABLE\n",
+    )
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    config["od004_allow"] = [
+        {
+            "file": "opt_discovery/experiment/feedback.py",
+            "line": 3,
+            "rhs": "ConfidenceLevel.PROBABLE",
+            "reason": "test",
+        }
+    ]
+    config_path = tmp_path / "arch_lint.yaml"
+    config_path.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+    assert run_lint(tmp_path, config_path) == []
+
+
+def test_od004_exempt_line_rewritten_rhs_is_rejected(tmp_path: Path) -> None:
+    import yaml
+
+    for name, rhs in {
+        "confirmed": "ConfidenceLevel.CONFIRMED",
+        "other_receiver": "Other.PROBABLE",
+        "raw_string": "'probable'",
+    }.items():
+        case_root = tmp_path / name
+        _write(
+            case_root,
+            "opt_discovery/experiment/feedback.py",
+            "from opt_discovery.schemas.evidence import ConfidenceLevel\n"
+            "def f(opportunity):\n"
+            f"    opportunity.evidence_level = {rhs}\n",
+        )
+        config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+        config["od004_allow"] = [
+            {
+                "file": "opt_discovery/experiment/feedback.py",
+                "line": 3,
+                "rhs": "ConfidenceLevel.PROBABLE",
+                "reason": "test",
+            }
+        ]
+        config_path = case_root / "arch_lint.yaml"
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True), encoding="utf-8"
+        )
+        violations = [
+            item for item in run_lint(case_root, config_path) if item.rule == "OD004"
+        ]
+        assert len(violations) == 1, name
+        assert violations[0].line == 3

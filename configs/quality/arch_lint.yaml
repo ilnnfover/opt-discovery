@@ -61,7 +61,10 @@ od005_allow:
     reason: best-effort early input protection; original error is reported before this handler
 
 # OD004: the only verified feedback upgrade is the existing PROBABLE write.
+# The allowance is position-scoped and only accepts this exact right-hand side;
+# changing the line's RHS or writing PROBABLE from another line is reported.
 od004_allow:
   - file: opt_discovery/experiment/feedback.py
     line: 130
+    rhs: ConfidenceLevel.PROBABLE
     reason: apply_feedback 单变量验证后最多升到 probable
