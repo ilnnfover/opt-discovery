@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**243 passed, 17 skipped**（260 用例，无 xfail）。
+全量：**246 passed, 17 skipped**（263 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 243 passed, 17 skipped（260 用例） |
+| `python -m pytest` | 0 | 246 passed, 17 skipped（263 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 243 passed, 17 skipped |
+| 3.11 全量 | 0 | 246 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -213,7 +213,7 @@ if blocking_flags:
 | P2-3 | 质量测试手工挂标记，未锁定传播 | 新增 `test_quality_end_to_end.py`：真实 CSV+log+db → analyze → 落盘 JSON → 独立 compare 读盘并退出 4 | `test_rank_and_duration_flags_propagate_to_compare` |
 | P3-1 | `quality_flags` 插在旧字段中间，位置参数有风险 | 移到 `ComparisonReport` 末尾（`generated_at` 之后）；仓库内构造均为关键字参数 | 全部 compare 测试 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **243 passed, 17 skipped**（260 用例，67 个回归）；
+验证（3.12 / 3.11）：`make check` 0；`pytest` **246 passed, 17 skipped**（263 用例，67 个回归）；
 真实数据 16 passed / 1 skipped；`verify-real --expect-blocked` 0。
 
 ## 11. 第二轮复审修复（F1/F2，2026-11-19）
@@ -246,3 +246,21 @@ if blocking_flags:
 本轮为每条 F 项都补了读取磁盘/跨进程的断言，并用变异验证确认断言是承重的。
 
 验证（3.12 / 3.11）：`make check` 0；`pytest` **243 passed, 17 skipped**（260 用例，67 个回归）。
+
+## 12. 最终增量复核修复（2026-11-19）
+
+| 级别 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| P1 | `--out`/`--out-dir` 指向普通文件时，初始化失败直接返回 1，旧 success 清单原样保留 | 两个入口先解析清单路径与 run_id，再建目录；失败分支写入本轮 `failed` 清单（阶段 `output` / `output_dir_error`，详情脱敏），覆盖旧 run_id | `test_output_dir_failure_settles_manifest`、`test_compare_output_dir_failure_settles_manifest` |
+| P1 | `--manifest` 与 compare 报告/输入同路径时，报告先写、清单后覆盖，命令仍返回 0 | 写入前校验清单路径不得与报告产物或输入重合；冲突时拒绝，返回 1，并把 failed 清单写到安全的 `out_dir/run_manifest.json`（若也冲突则放弃写入并报错） | `test_compare_manifest_cannot_overwrite_report` |
+| P2 | `--skip-timeline` 时逐 workload 状态被任意 quality code 判为 partial | 只有必需步骤失败或**blocking** 标记才置 partial；degraded（`timeline_skipped`）保持 success，与 run 级状态一致 | `test_skip_timeline_with_tp2_is_not_failure`（补 workload 状态断言） |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| P1 输出目录失败 | 失败结算写在 mkdir 之后（`_save`/`_finish` 只覆盖后续步骤） | 初始化顺序在前，mkdir 失败时还没有 run_id/清单目标，直接 return |
+| P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
+| P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **246 passed, 17 skipped**（263 用例）。

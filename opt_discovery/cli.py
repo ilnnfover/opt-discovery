@@ -890,11 +890,6 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def cmd_compare(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        print(f"[compare] 无法创建输出目录: {exc}", file=sys.stderr)
-        return MANIFEST_EXIT_FAILED
     strict = bool(getattr(args, "strict", False))
     run_id = getattr(args, "run_id", None) or new_run_id("compare")
     manifest_path = Path(getattr(args, "manifest", None) or (out_dir / "run_manifest.json"))
@@ -906,6 +901,44 @@ def cmd_compare(args: argparse.Namespace) -> int:
             previous_run_id = None
 
     artifacts: dict[str, Path] = {}
+    inputs = {
+        "a": {"name": Path(args.a).name},
+        "b": {"name": Path(args.b).name},
+    }
+
+    def _output_dir_failure(detail: str) -> None:
+        manifest = RunManifest(
+            run_id=run_id,
+            status=STATUS_FAILED,
+            strict=strict,
+            is_synthetic=False,
+            stages=(
+                StageRecord(
+                    "output",
+                    True,
+                    STAGE_FAILED,
+                    "output_dir_error",
+                    details={"error": detail},
+                ),
+            ),
+            artifacts=(),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        try:
+            target = write_manifest(manifest_path, manifest)
+            print(f"[manifest] status=failed run_id={run_id} -> {target}")
+        except OSError as exc:
+            print(f"[compare] 写 run_manifest 失败: {exc}", file=sys.stderr)
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        detail = _redact_error(exc, (out_dir, manifest_path.parent))
+        print(f"[compare] 无法创建输出目录: {detail}", file=sys.stderr)
+        _output_dir_failure(detail)
+        return MANIFEST_EXIT_FAILED
 
     def _input_record(value: str) -> dict:
         path = Path(value)
@@ -972,11 +1005,36 @@ def cmd_compare(args: argparse.Namespace) -> int:
         )
         return MANIFEST_EXIT_FAILED
 
+    report_path = out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
+    reserved = {
+        report_path.resolve(),
+        Path(args.a).resolve(),
+        Path(args.b).resolve(),
+    }
+    if manifest_path.resolve() in reserved:
+        detail = "run_manifest 路径与比较产物或输入重合，拒绝写入"
+        print(f"[compare] {detail}: {manifest_path}", file=sys.stderr)
+        fallback = out_dir / "run_manifest.json"
+        if fallback.resolve() not in reserved:
+            manifest_path = fallback
+            _finish(
+                STATUS_FAILED,
+                stages=[
+                    StageRecord("load", True, STAGE_PASSED),
+                    StageRecord(
+                        "compare",
+                        True,
+                        STAGE_FAILED,
+                        "manifest_path_conflict",
+                        details={"error": detail},
+                    ),
+                ],
+            )
+        return MANIFEST_EXIT_FAILED
+
     try:
         report = compare_tables(a, b, top=args.top)
-        target = report.write_json(
-            out_dir / f"compare_{a.workload_id}_vs_{b.workload_id}.json"
-        )
+        target = report.write_json(report_path)
         artifacts[f"compare_{a.workload_id}_vs_{b.workload_id}.json"] = target
     except Exception as exc:  # noqa: BLE001 - 执行/写出失败也要结算清单
         detail = _redact_error(exc, (out_dir, manifest_path.parent))
@@ -1038,12 +1096,6 @@ def cmd_compare(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 def cmd_analyze(args: argparse.Namespace) -> int:
     out = Path(args.out)
-    try:
-        out.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        print(f"[analyze] 无法创建输出目录: {exc}", file=sys.stderr)
-        return MANIFEST_EXIT_FAILED
-
     strict = bool(getattr(args, "strict", False))
     skip_timeline = bool(getattr(args, "skip_timeline", False))
     run_id = getattr(args, "run_id", None) or new_run_id("analyze")
@@ -1090,6 +1142,41 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         "configs": [],
     }
 
+    def _output_dir_failure(detail: str) -> None:
+        """输出目录不可用时也要结算本轮失败（清掉旧 success 清单）。"""
+        manifest = RunManifest(
+            run_id=run_id,
+            status=STATUS_FAILED,
+            strict=strict,
+            is_synthetic=False,
+            stages=(
+                StageRecord(
+                    "output",
+                    True,
+                    STAGE_FAILED,
+                    "output_dir_error",
+                    details={"error": detail},
+                ),
+            ),
+            artifacts=(),
+            inputs=inputs,
+            tool=tool_info(),
+            previous_run_id=previous_run_id,
+        )
+        try:
+            target = write_manifest(manifest_path, manifest)
+            print(f"[manifest] status=failed run_id={run_id} -> {target}")
+        except OSError as exc:
+            print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
+
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        detail = _redact_error(exc, (out, manifest_path.parent))
+        print(f"[analyze] 无法创建输出目录: {detail}", file=sys.stderr)
+        _output_dir_failure(detail)
+        return MANIFEST_EXIT_FAILED
+
     def _record(path: Path, label: str) -> None:
         if path.is_file():
             artifacts[label] = path
@@ -1122,6 +1209,21 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             source_map_failed=source_map_failed,
             failure_stage=failure_stage,
         )
+        target_path = manifest_path
+        if any(path.resolve() == target_path.resolve() for path in artifacts.values()):
+            fallback = out / "run_manifest.json"
+            if fallback.resolve() == target_path.resolve():
+                print(
+                    "[analyze] run_manifest 路径与产物重合，无法安全写入",
+                    file=sys.stderr,
+                )
+                return MANIFEST_EXIT_FAILED
+            print(
+                f"[analyze] run_manifest 与产物重合，改写到 {fallback}",
+                file=sys.stderr,
+            )
+            target_path = fallback
+
         manifest = RunManifest(
             run_id=run_id,
             status=status,
@@ -1137,7 +1239,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             previous_run_id=previous_run_id,
         )
         try:
-            target = write_manifest(manifest_path, manifest)
+            target = write_manifest(target_path, manifest)
         except OSError as exc:
             print(f"[analyze] 写 run_manifest 失败: {exc}", file=sys.stderr)
             return MANIFEST_EXIT_FAILED
@@ -1439,13 +1541,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
         codes = tuple(sorted({flag.code for flag in quality_flags}))
         quality_codes.update(codes)
-        blocking_codes.update(flag.code for flag in blocking_quality(quality_flags))
+        workload_blocking = [flag.code for flag in blocking_quality(quality_flags)]
+        blocking_codes.update(workload_blocking)
         is_synthetic = is_synthetic or table.meta.is_synthetic
         selected_ids.append(workload_id)
         workload_records.append(
             WorkloadRecord(
                 workload_id=workload_id,
-                status="partial" if (workload_timeline_failed or codes) else "success",
+                # 必需步骤失败或存在阻断型标记才算 partial；degraded 提示不改变状态
+                status=(
+                    "partial"
+                    if (workload_timeline_failed or workload_blocking)
+                    else "success"
+                ),
                 artifacts=tuple(
                     f"{workload_id}/{name}"
                     for name in (

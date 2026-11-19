@@ -672,3 +672,131 @@ def test_skip_timeline_with_tp2_is_not_failure(tmp_path: Path) -> None:
     assert {"rank_merge_inconsistent", "timeline_unavailable"}.isdisjoint(
         manifest["quality_flags"]
     )
+    # P2：降级提示不应把逐 workload 状态改成 partial
+    assert {item["status"] for item in manifest["workloads"]} == {"success"}
+
+
+def test_output_dir_failure_settles_manifest(tmp_path: Path) -> None:
+    """增量复核 P1：--out 指向普通文件时，仍要写本轮 failed 清单，不能保留旧 success。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+
+    manifest_path = tmp_path / "external" / "run.json"
+    assert (
+        main(_args(exports, workloads, out, "--strict", "--manifest", str(manifest_path)))
+        == 0
+    )
+    old_run_id = json.loads(manifest_path.read_text(encoding="utf-8"))["run_id"]
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    code = main(
+        _args(exports, workloads, blocker, "--strict", "--manifest", str(manifest_path))
+    )
+    assert code == 1
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_id"] != old_run_id
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["output"]["status"] == "failed"
+    assert stages["output"]["reason_code"] == "output_dir_error"
+    assert main(["check-manifest", "--path", str(manifest_path)]) == 0
+
+
+def test_compare_output_dir_failure_settles_manifest(tmp_path: Path) -> None:
+    """增量复核 P1：compare 的 --out-dir 是普通文件时也要结算 failed 清单。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    manifest_path = tmp_path / "external" / "compare.json"
+    assert (
+        main(
+            [
+                "compare",
+                "--a",
+                str(table),
+                "--b",
+                str(table),
+                "--out-dir",
+                str(tmp_path / "cmp"),
+                "--manifest",
+                str(manifest_path),
+                "--strict",
+            ]
+        )
+        == 0
+    )
+    old_run_id = json.loads(manifest_path.read_text(encoding="utf-8"))["run_id"]
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(blocker),
+            "--manifest",
+            str(manifest_path),
+            "--strict",
+        ]
+    )
+    assert code == 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_id"] != old_run_id
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["output"]["reason_code"] == "output_dir_error"
+    assert main(["check-manifest", "--path", str(manifest_path)]) == 0
+
+
+def test_compare_manifest_cannot_overwrite_report(tmp_path: Path, capsys) -> None:
+    """增量复核 P1：--manifest 与比较报告同路径时必须拒绝，不能返回 0。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    cmp_dir = tmp_path / "cmp"
+    report_name = (
+        "compare_qwen35-35b-a3b-prefill-eager_vs_qwen35-35b-a3b-prefill-eager.json"
+    )
+    collision = cmp_dir / report_name
+    code = main(
+        [
+            "compare",
+            "--a",
+            str(table),
+            "--b",
+            str(table),
+            "--out-dir",
+            str(cmp_dir),
+            "--manifest",
+            str(collision),
+            "--strict",
+        ]
+    )
+    assert code == 1
+    assert "重合" in capsys.readouterr().err
+    assert not collision.exists()
+
+    fallback = cmp_dir / "run_manifest.json"
+    assert fallback.is_file()
+    manifest = json.loads(fallback.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["compare"]["reason_code"] == "manifest_path_conflict"
+    assert main(["check-manifest", "--path", str(fallback)]) == 0

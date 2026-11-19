@@ -1,6 +1,6 @@
 # AE-03 独立验收 Review
 
-> 最新复审：HEAD `7d10937` 仍为 **FAIL**。见文末「修复后独立复审」。
+> 最新结论见文末「最终增量复核」。`7a78498` 的验收结果为 **FAIL**，PR #2 暂缓合并。
 
 审查日期：2026-11-19（Asia/Shanghai）。**总体验收：FAIL。** R05 和 R10 在双 rank 样例中已从实际分析链路传到 compare，且严格比较返回 4。仍存在 strict 假成功、采集契约绕过、不可比时输出比较比值，以及将上一轮数据纳入本轮产物的问题。暂不以 AE-03 已通过为依据进入 AE-04 的正式验收或合并。可以并行准备 AE-04 的独立设计和测试。
 
@@ -100,3 +100,43 @@ AE-04 正式验收或合并前，应先修复 P1 项并将已复现的场景纳�
 | 真实 Profiling 数据、NPU、托管 CI、其他 Python 版本 | BLOCKED / NOT RUN。本次使用 Python 3.12.13。实施报告中的真实数据和其他解释器结果未作为本次实测。 |
 
 进入 AE-04 正式验收或合并前，应关闭 F1 项并将对应反例纳入回归。原表中已关闭的首轮反例无需重复修复。
+
+## 最终增量复核（2026-11-19）
+
+**结论为 FAIL，PR #2 暂缓合并。** 原先的降级绕过、时间线失败未传播、旧通信记录混入以及原先复现的清单失败场景均已通过复验。输出目录创建失败仍能留下可通过校验的旧成功清单，清单与报告路径重合时 strict 还会在覆盖报告后返回 0。两项均影响 AE-03 的运行与产物契约。
+
+审查范围为 `feat/ae-03-run-contract` 上的 `7d10937a8c95d93195146ee0707f1869f88dcfa7..7a78498322598ad90ac1c4e348258914ea9f56eb`，对照实施报告 §11。复核开始时 HEAD 与本地跟踪引用一致，仅有未跟踪的 `docs/tasks/`。
+
+| 上轮问题 | 判定 | 复核证据 |
+|---|---|---|
+| F1-1 已知阻断标记被降级 | **关闭** | 将实际分析生成的 R05/R10 标记改为 `degraded`，另起进程执行 strict compare，退出 4、comparable=false。新回归通过 JSON 往返进入真实 CLI，覆盖 code 与 severity 冲突。 |
+| F1-2 timeline 失败传播 | **关闭** | 损坏双 rank 样例的主 DB，strict analyze 返回 3，清单 comparison_status=incomparable，表随盘带 `timeline_unavailable`。删除单个 rank 的 DB 得到 `rank_timeline_incomplete`。两次均能让独立 compare 返回 4，且比值为空。 |
+| F1-3 同一 workload 复用旧通信产物 | **关闭** | 首次用 SQLite 产出 4 MiB、1 任务，第二次移除 DB 并显式跳过 timeline。新 CSV 的 `comm_mib`、`comm_tasks` 两列均为空，旧 comm.json 未被登记，清单完整性校验通过。新回归的字符串断言能命中原反例，独立探针用 CSV 列名验证。 |
+| F1-4 失败结算 | **部分关闭** | 原反例均通过。导出发现失败、独立 compare 报告写入失败均生成新 failed 清单，写入失败不再打印 traceback。缺映射退出 1 并生成新清单，parse 和 timeline 均为 not_requested。输出目录创建失败仍未结算，见下方 P1。 |
+| F2-1 自定义清单路径与缺哈希 | **原反例关闭** | 独立 compare 把清单写在另一目录后，compare 与 check-manifest 均返回 0。删除 sha256 后校验返回 1。自定义清单与产物路径重合还有独立的 P1 缺口。 |
+| F2-2 compare 输入失败路径脱敏 | **关闭** | 新回归用目录充当输入，另起进程也用绝对路径指向不存在的表。两种输入失败均返回 1，load_error 清单详情含 `<path>`，无临时根路径。 |
+| F2-3 显式跳过 timeline | **部分关闭（P2）** | TP=2 的两个 workload 均移除 DB 并加 `--skip-timeline` 后，analyze 退出 0，timeline 为 required=false、not_requested，表上仅有降级提示，独立 compare 也退出 0。逐 workload 仍全被记为 partial，见下方。 |
+
+### 剩余问题
+
+| 级别 | 代码位置 | 复现、影响及修复建议 |
+|---|---|---|
+| P1（F1-4 仍开放） | `opt_discovery/cli.py:891`、`:1039` | 先生成可通过校验的外置 `--manifest`，再保留该路径、把本次 `--out-dir` 或 `--out` 指向已有普通文件。两个真实 CLI 均返回 1，清单字节保持原样、状态仍为 success，check-manifest 仍返回 0。mkdir 的失败分支在解析清单路径和运行 ID 之前就返回。应先确定本次清单目标，对可写的外置清单结算新 run_id、failed 和输出错误码。 |
+| P1（产物路径冲突） | `opt_discovery/cli.py:977`、`:943`，`opt_discovery/experiment/run_manifest.py:208` | 将 `compare --manifest` 指向本次 `compare_<a>_vs_<b>.json`。strict compare 返回 0、清单写 success，却把比较报告覆盖，随后 check-manifest 返回 1。应在首次写入前校验目标路径，拒绝清单与产物或输入重合。增加同路径的 CLI 反例。 |
+| P2（F2-3 状态不一致） | `opt_discovery/cli.py:1276`、`:1448` | 显式跳过 timeline 生成 `timeline_skipped` 提示，逐 workload 状态逻辑把任意 quality code 当成 partial。实际两组都完成了选定的必需阶段，run status 为 success，两个 workload status 反而均为 partial。应分别根据必需步骤完成状态和质量限制填写状态字段，并对照总状态与逐项状态测试。 |
+
+未发现 P0。两项 P1 的底层缺口在 `7d10937` 已存在，这次修复仍未覆盖，未发现由 `7a78498` 新引入的 P0/P1。上述结论仅评价本地指定提交及受影响入口。
+
+### 实际执行
+
+| 命令或探针 | 结果 |
+|---|---|
+| `git diff --check 7a78498^ 7a78498` | PASS，退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 make check` | PASS，退出 0，Ruff、mypy（51 文件）、配置验证通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 make verify DEMO_OUT=/tmp/ae03-final-demo.dJxXt4` | 退出 0，243 passed、17 skipped、无 xfail，合成演示通过。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -o addopts='' -q -p no:cacheprovider tests/test_run_contract.py tests/regression` | PASS，88 passed，退出 0。 |
+| `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-followup-probe.fPfjWg.py` 与 `PYTHONDONTWRITEBYTECODE=1 python3 /tmp/ae03-final-probe.PRg6Vv.py` | 在临时目录调用真实 CLI 子进程，实测上表的退出码、落盘状态、CSV 字段及清单校验结果。 |
+| 隔离 `git archive HEAD` 副本故障注入 | 分别移除已知码降级限制、timeline 失败时的表标记、汇总的本次产物过滤。各自运行对应新增测试，三次均以断言失败退出 1。实际工作树未变更生产代码。 |
+| `PYTHONDONTWRITEBYTECODE=1 env -u OPT_DISCOVERY_DATA_ROOT python3 scripts/verify_real.py --expect-blocked` | 缺数据闸门通过，真实回归为 BLOCKED。NPU、托管 CI 与其他 Python 版本未在本轮运行。本机为 Python 3.12.13。 |
+
+PR #2 的验收条件是关闭上述两项 P1，并以独立 CLI 复验确认输出目录初始化失败会结算可写清单，以及路径冲突无法发布 success。
