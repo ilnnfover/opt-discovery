@@ -131,7 +131,7 @@ if blocking_flags:
 | `tests/regression/test_r05_rank_merge.py` | +1 | `check-ranks --strict` → 3，普通 0 |
 | `tests/regression/test_known_gaps.py` | 删除 | 原 2 条 strict xfail 转为正式断言 |
 
-全量：**265 passed, 17 skipped**（282 用例，无 xfail）。
+全量：**272 passed, 17 skipped**（289 用例，无 xfail）。
 
 ## 5. 实际改动
 
@@ -156,11 +156,11 @@ if blocking_flags:
 | 检查 | 退出码 | 结果 |
 |---|---|---|
 | `make check`（ruff + mypy + validate） | 0 | 51 source files，0 类型错误 |
-| `python -m pytest` | 0 | 265 passed, 17 skipped（282 用例） |
+| `python -m pytest` | 0 | 272 passed, 17 skipped（289 用例） |
 | `python -m pytest tests/regression` | 0 | 67 passed |
 | 真实数据 `tests/test_real_data.py` | 0 | 16 passed, 1 skipped（回填场景显式 skip） |
 | `python scripts/verify_real.py --expect-blocked` | 0 | 缺数据 BLOCKED 闸门 |
-| 3.11 全量 | 0 | 265 passed, 17 skipped |
+| 3.11 全量 | 0 | 272 passed, 17 skipped |
 
 未执行：真实四组导出的完整 `analyze`（解析 + timeline 成本高、输出体积大）；AE-03 的契约用
 合成导出结构（workload.log + op_summary + sqlite 回填形态）覆盖，真实解析语义由 AE-02 的真实用例
@@ -263,7 +263,7 @@ if blocking_flags:
 | P1 清单路径冲突 | 已把 artifact 根统一到清单父目录 | 只改了“相对谁”，没有校验清单路径本身与产物/输入是否重合 |
 | P2 逐 workload 状态 | 修了 run 级状态（success/partial 由失败列表派生） | workload 级仍用“任意 quality code”判断，未区分 blocking/degraded |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **272 passed, 17 skipped**（289 用例）。
 
 ## 13. 合并前复验修复（2026-11-19）
 
@@ -281,7 +281,7 @@ if blocking_flags:
 
 现在规则统一为：**清单不得与输入或本轮产物重合**；有冲突时优先退到同目录 `run_manifest.json`，无法安全落盘则不写并返回非零，绝不覆盖输入。
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **272 passed, 17 skipped**（289 用例）。
 
 ## 14. 合并前问题总表 · 批次 1（A1/A2/B1/B4）
 
@@ -304,7 +304,7 @@ if blocking_flags:
 | B1 校验边界 | 只校验 `artifacts` 项与部分顶层字段 | 没有要求 `stages` 存在/类型正确，也没有 success 的完成态约束 |
 | B4 重复 ID | 假定每个 YAML 的 `workload_id` 唯一 | `discover_all` 用字典按 ID 合并，重复时静默覆盖 |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **272 passed, 17 skipped**（289 用例）。
 
 ## 15. 合并前问题总表 · 批次 2（A3/A4/A5/B3）
 
@@ -325,4 +325,28 @@ if blocking_flags:
 | A5 全局 scope | `same_scope = len({scopes}) == 1` 作用于全部 rank | 多 rank 时一个 full 表就会让同口径 pair 走中位数弱校验 |
 | B3 可选步骤 | comm 失败只 `print` | 清单没有对应阶段，无法区分“未请求/缺数据/失败” |
 
-验证（3.12 / 3.11）：`make check` 0；`pytest` **265 passed, 17 skipped**（282 用例）。
+验证（3.12 / 3.11）：`make check` 0；`pytest` **272 passed, 17 skipped**（289 用例）。
+
+## 16. 合并前问题总表 · 批次 3（A6/B2/B5/B6/B7）
+
+| 编号 | 问题 | 修复 | 回归 |
+|---|---|---|---|
+| A6 | 独立 `summary`/`report` 扫描目录，读回旧 `comm.json`/旧 timeline，并破坏清单 CSV 哈希 | 两个入口优先读 `run_manifest.json` 的 artifact 白名单与 workload 列表；`write_summaries`/`build_report` 接受 `artifacts`；`summary` 重建 CSV 后调用 `refresh_manifest_artifacts` 同步 sha256；无清单时保留 legacy 扫描并提示 | `test_downstream_summary_and_report_ignore_stale_artifacts` |
+| B2 | 无导出时 source_map/comm 记 passed；compare 写失败时顶层 not_requested；缺映射无阶段错误码；多对比较状态被最后一次覆盖 | 新增 `config` 阶段（`config_error`），`early/later_executed` 同时依赖 `discover_ok`；compare 写失败显式 `comparison_status=failed`；analyze 收集逐对结果后派生总体状态（failed > incomparable > success > descriptive） | `test_config_failure_marks_config_stage`、`test_no_export_marks_optional_stages_not_requested`、`test_compare_write_failure_sets_failed_status` |
+| B5 | compare 只传 workload+meta，契约读取 0 条 records，丢失 operator_set/work.count 警告 | `compare_contracts` 增加 `operator_counts` 摘要读取；`compare` 传算子→calls 映射；契约 warnings 进入 `ComparisonReport.warnings` | `test_compare_contract_sees_operator_counts` |
+| B6 | 默认四组会生成跨阶段配对，使 strict 恒为 4 | analyze 将自动跨阶段配对标记为 `descriptive`（写报告、不影响 strict 状态与退出码），新增 `comparison_status=descriptive`；同阶段配对仍严格把关 | `test_cross_phase_pairs_are_descriptive_only` |
+| B7 | 已登记产物在写清单前消失会被静默跳过；配置指纹静默跳过缺失文件 | `collect_artifacts` 缺失即 `FileNotFoundError`，analyze/compare 转为 failed 清单（`artifact_missing`）；`fingerprint_configs` 缺失即失败；配置指纹在加载后立即计算 | `test_collect_artifacts_and_fingerprints_fail_closed` |
+
+### 为什么上一轮没有解决
+
+| 现象 | 上轮做法 | 缺口 |
+|---|---|---|
+| A6 下游读旧产物 | 修了 analyze 内部汇总（`include`+本轮 artifacts） | 独立 `summary`/`report` 命令没有接入清单；重建 CSV 也不同步哈希 |
+| B2 阶段不一致 | 只修了“单 workload 写失败”和“拒绝路径” | `_analyze_stages` 的 `failure_stage` 未覆盖 `discover_ok=False` 与 config；compare `_finish` 对 report=None 一律 not_requested；多对比较取最后一次写入而非汇总 |
+| B5 契约证据 | 只把 workload+meta 传给 `compare_contracts` | 契约依赖 records 计算算子集合/调用量，摘要缺失导致检查退化为空集 |
+| B6 跨阶段 | 默认 `_comparison_pairs` 生成同模式跨阶段对，契约判不可比计入 strict | 没有区分“自动探索性配对”与“用户显式比较” |
+| B7 产物缺失 | `collect_artifacts` 对缺失文件 `continue` | 静默跳过会让 success 清单缺少产物；配置指纹同样静默 |
+
+B8（同目录并发/中断）本轮不修：单用户 CLI 无锁语义，已在 README 明确“同一输出目录不支持并发”，需要并发请使用独立目录。TOCTOU 的极端窗口仍属已知限制。
+
+验证（3.12 / 3.11）：`make check` 0；`pytest` **272 passed, 17 skipped**（289 用例）。

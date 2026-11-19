@@ -1,7 +1,7 @@
 # AE-02 历史问题回归矩阵
 
 > 错误目录来源：`README.md` 「已知数据约束」1–12。
-> 组织方式：`tests/regression/`（73 个用例：R01–R12 共 36 个 + 质量闸门 14 个 + 端到端传播 1 个
+> 组织方式：`tests/regression/`（74 个用例：R01–R12 共 36 个 + 质量闸门 15 个 + 端到端传播 1 个
 > + 补充闸门 2 个 + verify-real 契约 20 个）。AE-03 已把 R05/R10 的 strict xfail 转为正式断言。
 > CPU-only、无私有数据依赖。
 > 所有 fixture 在测试运行时生成（`tests/regression/_helpers.py`），脱敏且小于 10 行/文件。

@@ -49,6 +49,7 @@ STAGE_STATUSES = (
 COMPARISON_NOT_REQUESTED = "not_requested"
 COMPARISON_SUCCESS = "success"
 COMPARISON_INCOMPARABLE = "incomparable"
+COMPARISON_DESCRIPTIVE = "descriptive"
 COMPARISON_FAILED = "failed"
 
 #: strict 模式退出码（与 README/CLI 文档一致）
@@ -197,11 +198,14 @@ def artifact_record(path: Path, root: Path, label: str | None = None) -> dict[st
 
 
 def collect_artifacts(entries: Mapping[str, Path], root: Path) -> tuple[dict[str, Any], ...]:
-    """``label -> 绝对路径`` → 可写清单（相对 root，含 sha256）。"""
+    """``label -> 绝对路径`` → 可写清单（相对 root，含 sha256）。
+
+    登记过的产物若在写清单前消失/不可读，必须失败而不是静默跳过。
+    """
     collected: list[dict[str, Any]] = []
     for label, path in entries.items():
         if not path.is_file():
-            continue
+            raise FileNotFoundError(f"已登记的产物不存在: {label} -> {path.name}")
         collected.append(artifact_record(path, root, label))
     return tuple(sorted(collected, key=lambda item: item["path"]))
 
@@ -269,6 +273,7 @@ def verify_manifest(path: str | Path) -> list[str]:
         COMPARISON_NOT_REQUESTED,
         COMPARISON_SUCCESS,
         COMPARISON_INCOMPARABLE,
+        COMPARISON_DESCRIPTIVE,
         COMPARISON_FAILED,
     }:
         problems.append(
@@ -384,16 +389,98 @@ def tool_info(repo_root: Path | None = None) -> dict[str, Any]:
 
 
 def fingerprint_configs(paths: Sequence[Path]) -> list[dict[str, Any]]:
-    """配置指纹：只记文件名 + sha256，不写绝对路径。"""
+    """配置指纹：只记文件名 + sha256，不写绝对路径；缺失/不可读即失败。"""
     items: list[dict[str, Any]] = []
     for path in paths:
-        if path and path.is_file():
-            items.append({"name": path.name, "sha256": sha256_of(path)})
+        if not path:
+            continue
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"配置不存在或不可读: {Path(path).name}")
+        items.append({"name": Path(path).name, "sha256": sha256_of(path)})
     return items
+
+
+def artifact_allowlist(manifest_path: str | Path) -> set[str] | None:
+    """读取清单登记的相对路径；没有清单时返回 None（legacy 行为）。"""
+    target = Path(manifest_path)
+    if not target.is_file():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return None
+    return {
+        item["path"]
+        for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+
+
+def manifest_workload_ids(manifest_path: str | Path) -> set[str]:
+    target = Path(manifest_path)
+    if not target.is_file():
+        return set()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {
+        item["workload_id"]
+        for item in payload.get("workloads") or ()
+        if isinstance(item, dict) and isinstance(item.get("workload_id"), str)
+    }
+
+
+def refresh_manifest_artifacts(
+    manifest_path: str | Path, entries: Mapping[str, Path]
+) -> None:
+    """重建某个已登记产物后同步其 sha256/bytes，保持 check-manifest 一致。"""
+    target = Path(manifest_path)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    root = target.parent
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        return
+    by_path = {
+        item.get("path"): item
+        for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    changed = False
+    for label, file in entries.items():
+        relative = os.path.relpath(file.resolve(), root.resolve()).replace(os.sep, "/")
+        item = by_path.get(relative)
+        if item is None:
+            continue
+        item["bytes"] = file.stat().st_size
+        item["sha256"] = sha256_of(file)
+        item["name"] = item.get("name") or label
+        changed = True
+    if not changed:
+        return
+    handle, tmp_name = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 __all__ = [
     "COMPARISON_FAILED",
+    "COMPARISON_DESCRIPTIVE",
     "COMPARISON_INCOMPARABLE",
     "COMPARISON_NOT_REQUESTED",
     "COMPARISON_SUCCESS",
@@ -417,8 +504,11 @@ __all__ = [
     "STATUS_SUCCESS",
     "StageRecord",
     "WorkloadRecord",
+    "artifact_allowlist",
     "collect_artifacts",
     "fingerprint_configs",
+    "manifest_workload_ids",
+    "refresh_manifest_artifacts",
     "new_run_id",
     "read_manifest",
     "sha256_of",

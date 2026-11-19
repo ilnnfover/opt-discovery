@@ -375,3 +375,16 @@ def test_mixed_scope_does_not_downgrade_same_scope_pair() -> None:
         "rank0 vs rank1" in reason and "calls_ratio" in reason
         for reason in assessment.reasons
     )
+
+
+def test_compare_contract_sees_operator_counts() -> None:
+    """B5：compare 应把算子集合/调用量摘要传给契约，警告不能因 0 条 records 丢失。"""
+    eager, graph = _pair()
+    base = _table(eager, {"MatMul": 1000.0}, calls={"MatMul": 10})
+    target = _table(graph, {"Add": 1100.0}, calls={"Add": 100})
+
+    report = compare_tables(base, target)
+    text = " ".join(report.warnings)
+
+    assert "operator_set" in text
+    assert "work.count" in text

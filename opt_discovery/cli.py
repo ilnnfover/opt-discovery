@@ -49,6 +49,7 @@ from .experiment.analyzer import compare_benchmarks, load_run
 from .experiment.calibration import DEFAULT_MIN_SAMPLES, calibrate
 from .experiment.feedback import apply_feedback, load_comparison
 from .experiment.run_manifest import (
+    COMPARISON_DESCRIPTIVE,
     COMPARISON_FAILED,
     COMPARISON_INCOMPARABLE,
     COMPARISON_NOT_REQUESTED,
@@ -65,10 +66,13 @@ from .experiment.run_manifest import (
     RunManifest,
     StageRecord,
     WorkloadRecord,
+    artifact_allowlist,
     collect_artifacts,
     fingerprint_configs,
+    manifest_workload_ids,
     new_run_id,
     read_manifest,
+    refresh_manifest_artifacts,
     sha256_of,
     tool_info,
     verify_manifest,
@@ -884,7 +888,15 @@ def cmd_check_manifest(args: argparse.Namespace) -> int:
 # report
 # ---------------------------------------------------------------------------
 def cmd_report(args: argparse.Namespace) -> int:
-    target = write_markdown_report(args.dir, args.out or None)
+    root = Path(args.dir)
+    manifest = root / "run_manifest.json"
+    artifacts = artifact_allowlist(manifest) if manifest.is_file() else None
+    if manifest.is_file() and artifacts is None:
+        print(
+            "  ! run_manifest.json 无法解析，按目录扫描（legacy）",
+            file=sys.stderr,
+        )
+    target = write_markdown_report(root, args.out or None, artifacts=artifacts)
     print(f"-> {target}")
     return 0
 
@@ -893,7 +905,27 @@ def cmd_report(args: argparse.Namespace) -> int:
 # summary（两个扁平表）
 # ---------------------------------------------------------------------------
 def cmd_summary(args: argparse.Namespace) -> int:
-    workload_path, operator_path = write_summaries(args.dir)
+    root = Path(args.dir)
+    manifest = root / "run_manifest.json"
+    artifacts = artifact_allowlist(manifest) if manifest.is_file() else None
+    include = manifest_workload_ids(manifest) if artifacts is not None else None
+    if manifest.is_file() and artifacts is None:
+        print(
+            "  ! run_manifest.json 无法解析，按目录扫描（legacy）",
+            file=sys.stderr,
+        )
+    workload_path, operator_path = write_summaries(
+        root, include=include, artifacts=artifacts
+    )
+    if artifacts is not None:
+        # 重建 CSV 后同步清单哈希，避免 check-manifest 误报
+        refresh_manifest_artifacts(
+            manifest,
+            {
+                "workload_summary.csv": workload_path,
+                "operator_summary.csv": operator_path,
+            },
+        )
     rows = sum(1 for _ in operator_path.open(encoding="utf-8-sig")) - 1
     print(f"-> {workload_path}")
     print(f"-> {operator_path}  ({rows} 行算子)")
@@ -987,15 +1019,35 @@ def cmd_compare(args: argparse.Namespace) -> int:
         stages: list,
         report: ComparisonReport | None = None,
         synthetic: bool = False,
+        comparison_status_override: str | None = None,
     ) -> int:
-        if report is None:
-            comparison_status = COMPARISON_NOT_REQUESTED
+        if comparison_status_override is not None:
+            comparison_status = comparison_status_override
             quality_codes: tuple[str, ...] = ()
+        elif report is None:
+            comparison_status = COMPARISON_NOT_REQUESTED
+            quality_codes = ()
         else:
             comparison_status = (
                 COMPARISON_SUCCESS if report.comparable else COMPARISON_INCOMPARABLE
             )
             quality_codes = tuple(sorted({flag.code for flag in report.quality_flags}))
+        artifact_error: str | None = None
+        try:
+            artifact_payload = collect_artifacts(artifacts, manifest_path.parent)
+        except OSError as exc:
+            artifact_error = _redact_error(exc, (out_dir,))
+            artifact_payload = ()
+            status = STATUS_FAILED
+            stages = list(stages) + [
+                StageRecord(
+                    "artifacts",
+                    True,
+                    STAGE_FAILED,
+                    "artifact_missing",
+                    details={"error": artifact_error},
+                )
+            ]
         manifest = RunManifest(
             run_id=run_id,
             status=status,
@@ -1005,7 +1057,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
             quality_flags=quality_codes,
             comparison_status=comparison_status,
             # 与 analyze 一致：产物路径相对清单父目录，支持清单写在输出目录之外
-            artifacts=collect_artifacts(artifacts, manifest_path.parent),
+            artifacts=artifact_payload,
             inputs=inputs,
             tool=tool_info(),
             previous_run_id=previous_run_id,
@@ -1098,6 +1150,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
                     "compare", True, STAGE_FAILED, "compare_error", details={"error": detail}
                 ),
             ],
+            comparison_status_override=COMPARISON_FAILED,
         )
         return MANIFEST_EXIT_FAILED
     print(f"[compare] {report.a_id} -> {report.b_id}  comparable={report.comparable}")
@@ -1175,6 +1228,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     comm_attempts = 0
     comm_runs = 0
     comparison_failed = False
+    comparison_results: list[dict] = []
     timeline_runs = 0
     is_synthetic = False
     comparison_status = COMPARISON_NOT_REQUESTED
@@ -1281,7 +1335,6 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         discover_ok: bool = True,
         failure_stage: str | None = None,
     ) -> int:
-        inputs["configs"] = fingerprint_configs(config_paths)
         stages = _analyze_stages(
             args,
             discover_ok=discover_ok,
@@ -1296,6 +1349,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             timeline_runs=timeline_runs,
             comparison_status=comparison_status,
             comparison_failed=comparison_failed,
+            comparison_results=comparison_results,
             source_map_failed=source_map_failed,
             duplicate_ids=duplicate_ids,
             comm_failures=comm_failures,
@@ -1342,6 +1396,44 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             return MANIFEST_EXIT_FAILED
         target_path = manifest_path
 
+        try:
+            artifact_payload = collect_artifacts(artifacts, manifest_path.parent)
+        except OSError as exc:
+            detail = _redact_error(exc, (out,))
+            print(f"[analyze] 产物登记失败: {detail}", file=sys.stderr)
+            failed = RunManifest(
+                run_id=run_id,
+                status=STATUS_FAILED,
+                strict=strict,
+                is_synthetic=is_synthetic,
+                stages=(
+                    StageRecord(
+                        "artifacts",
+                        True,
+                        STAGE_FAILED,
+                        "artifact_missing",
+                        details={"error": detail},
+                    ),
+                ),
+                workloads=tuple(workload_records),
+                quality_flags=tuple(sorted(quality_codes)),
+                comparison_status=comparison_status,
+                artifacts=(),
+                inputs=inputs,
+                tool=tool_info(),
+                previous_run_id=previous_run_id,
+            )
+            fallback = _manifest_target(extra=(manifest_path,))
+            if fallback is None:
+                print("[analyze] 无安全的 run_manifest 路径", file=sys.stderr)
+                return MANIFEST_EXIT_FAILED
+            try:
+                target = write_manifest(fallback, failed)
+                print(f"[manifest] status=failed run_id={run_id} -> {target}")
+            except OSError as write_exc:
+                print(f"[analyze] 写 run_manifest 失败: {write_exc}", file=sys.stderr)
+            return MANIFEST_EXIT_FAILED
+
         manifest = RunManifest(
             run_id=run_id,
             status=status,
@@ -1351,7 +1443,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             workloads=tuple(workload_records),
             quality_flags=tuple(sorted(quality_codes)),
             comparison_status=comparison_status,
-            artifacts=collect_artifacts(artifacts, manifest_path.parent),
+            artifacts=artifact_payload,
             inputs=inputs,
             tool=tool_info(),
             previous_run_id=previous_run_id,
@@ -1440,9 +1532,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             ruleset, getattr(args, "device_profile", None)
         )
         engine = DiagnosisEngine(ruleset, device_profile=device_profile)
+        inputs["configs"] = fingerprint_configs(config_paths)
     except Exception as exc:  # noqa: BLE001
         print(f"[analyze] 配置加载失败: {_error(exc)}", file=sys.stderr)
-        _save(STATUS_FAILED, has_tables=False, failure_stage="parse")
+        _save(STATUS_FAILED, has_tables=False, failure_stage="config")
         return MANIFEST_EXIT_FAILED
 
     tables: dict[str, OperatorTable] = {}
@@ -1825,12 +1918,20 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             _record(target, target.name)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! compare 失败（{key_a} vs {key_b}）: {_error(exc)}", file=sys.stderr)
-            comparison_failed = True
+            comparison_results.append(
+                {"a": key_a, "b": key_b, "status": "failed", "same_phase": True}
+            )
             continue
-        if not comparison.comparable:
-            comparison_status = COMPARISON_INCOMPARABLE
-        elif comparison_status == COMPARISON_NOT_REQUESTED:
-            comparison_status = COMPARISON_SUCCESS
+        same_phase = table_a.workload.execution.phase is table_b.workload.execution.phase
+        if not same_phase:
+            pair_status = "descriptive"
+        elif comparison.comparable:
+            pair_status = "passed"
+        else:
+            pair_status = "incomparable"
+        comparison_results.append(
+            {"a": key_a, "b": key_b, "status": pair_status, "same_phase": same_phase}
+        )
         print(
             f"  - {key_a} -> {key_b}: comparable={comparison.comparable} "
             f"total_ratio={_fmt_ratio(comparison)} "
@@ -1856,6 +1957,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"  ! summary 输出失败: {_error(exc)}", file=sys.stderr)
         output_failures.append("summary")
+
+    strict_results = [item for item in comparison_results if item["same_phase"]]
+    if any(item["status"] == "failed" for item in strict_results):
+        comparison_status = COMPARISON_FAILED
+    elif any(item["status"] == "incomparable" for item in strict_results):
+        comparison_status = COMPARISON_INCOMPARABLE
+    elif strict_results:
+        comparison_status = COMPARISON_SUCCESS
+    elif comparison_results:
+        comparison_status = COMPARISON_DESCRIPTIVE
+    else:
+        comparison_status = COMPARISON_NOT_REQUESTED
+    comparison_failed = comparison_status == COMPARISON_FAILED
 
     if (
         missing_exports
@@ -1894,6 +2008,7 @@ def _analyze_stages(
     timeline_runs: int,
     comparison_status: str,
     comparison_failed: bool,
+    comparison_results: list[dict] | None = None,
     source_map_failed: bool,
     duplicate_ids: list[str] | None = None,
     comm_failures: list[str] | None = None,
@@ -1903,9 +2018,9 @@ def _analyze_stages(
 ) -> list[StageRecord]:
     """把本轮 run 状态映射为阶段清单（AE-03 契约的可审计部分）。"""
     skip_timeline = bool(getattr(args, "skip_timeline", False))
-    early = failure_stage in ("discover", "parse")
-    parse_executed = failure_stage not in ("discover", "parse") and discover_ok
-    later_executed = failure_stage is None
+    early = failure_stage in ("discover", "parse", "config") or not discover_ok
+    parse_executed = failure_stage not in ("discover", "parse", "config") and discover_ok
+    later_executed = failure_stage is None and discover_ok
     parse_failed = bool(missing_logs or window_failures or parse_failures)
     duplicate_ids = duplicate_ids or []
     discover_failed = not discover_ok or bool(missing_exports) or bool(duplicate_ids)
@@ -1933,6 +2048,16 @@ def _analyze_stages(
                 "missing": list(missing_exports),
                 "duplicates": list(duplicate_ids),
             },
+        ),
+        StageRecord(
+            "config",
+            True,
+            (
+                STAGE_FAILED
+                if failure_stage == "config"
+                else (STAGE_NOT_REQUESTED if not discover_ok else STAGE_PASSED)
+            ),
+            "config_error" if failure_stage == "config" else None,
         ),
         StageRecord(
             "parse",
@@ -2041,6 +2166,7 @@ def _analyze_stages(
                     else None
                 )
             ),
+            details={"pairs": list(comparison_results or ())},
         ),
     ]
 

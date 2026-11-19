@@ -10,6 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
 import yaml
 from conftest import REPO_ROOT
 
@@ -1157,3 +1158,134 @@ def test_optional_comm_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:
     assert stages["comm"]["status"] == "failed"
     assert stages["comm"]["reason_code"] == "comm_failed"
     assert any("comm failure" in item for item in stages["comm"]["details"]["failed"])
+
+
+def test_downstream_summary_and_report_ignore_stale_artifacts(tmp_path: Path) -> None:
+    """A6：独立 summary/report 只读取本轮清单登记的文件，且重建 CSV 后清单仍一致。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+
+    stale = out / "qwen35-35b-a3b-prefill-eager" / "comm.json"
+    stale.write_text(json.dumps({"mib_total": 4.0, "unique_tasks": 1}), encoding="utf-8")
+    (exports / "qwen35-prefill" / "PROF_000000_test" / "msprof_0.db").unlink()
+    assert main(_args(exports, workloads, out, "--strict", "--skip-timeline")) == 0
+
+    assert main(["summary", "--dir", str(out)]) == 0
+    rows = (out / "workload_summary.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert not any("4.0" in row for row in rows)
+    assert main(["check-manifest", "--path", str(out / "run_manifest.json")]) == 0
+
+    report = tmp_path / "report.md"
+    assert main(["report", "--dir", str(out), "--out", str(report)]) == 0
+    text = report.read_text(encoding="utf-8")
+    assert "4.0" not in text
+
+
+def test_config_failure_marks_config_stage(tmp_path: Path, capsys) -> None:
+    """B2：配置失败要有 config 阶段错误码，parse 不得记 passed。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    missing = tmp_path / "missing.yaml"
+
+    code = main(
+        _args(exports, workloads, out, "--strict", "--summary-mapping", str(missing))
+    )
+    assert code == 1
+
+    manifest = _manifest(out)
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["discover"]["status"] == "passed"
+    assert stages["config"]["status"] == "failed"
+    assert stages["config"]["reason_code"] == "config_error"
+    assert stages["parse"]["status"] == "not_requested"
+    capsys.readouterr()
+
+
+def test_no_export_marks_optional_stages_not_requested(tmp_path: Path, capsys) -> None:
+    """B2：无导出时 source_map/comm/compare 不能记 passed。"""
+    exports = tmp_path / "empty"
+    exports.mkdir()
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict", "--source-map"))
+    assert code == 2
+
+    manifest = _manifest(out)
+    stages = {item["name"]: item for item in manifest["stages"]}
+    for name in ("config", "parse", "timeline", "comm", "source_map", "compare"):
+        assert stages[name]["status"] == "not_requested", name
+    capsys.readouterr()
+
+
+def test_compare_write_failure_sets_failed_status(tmp_path: Path, monkeypatch) -> None:
+    """B2：报告写入失败时 comparison_status 不能是 not_requested。"""
+    exports = tmp_path / "exports"
+    _write_export(exports, "qwen35-prefill")
+    workloads = _workloads(tmp_path)
+    out = tmp_path / "out"
+    assert main(_args(exports, workloads, out, "--strict")) == 0
+    table = out / "qwen35-35b-a3b-prefill-eager" / "operator_table.json"
+
+    def _boom(self, path):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(
+        "opt_discovery.analyzer.compare.ComparisonReport.write_json", _boom
+    )
+    cmp_dir = tmp_path / "cmp"
+    code = main(
+        ["compare", "--a", str(table), "--b", str(table), "--out-dir", str(cmp_dir), "--strict"]
+    )
+    assert code == 1
+
+    manifest = json.loads((cmp_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["comparison_status"] == "failed"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    assert stages["compare"]["reason_code"] == "compare_error"
+
+
+def test_cross_phase_pairs_are_descriptive_only(tmp_path: Path) -> None:
+    """B6：自动生成的跨阶段对比写描述性报告，不把 strict 拖成 4。"""
+    exports = tmp_path / "exports"
+    for name in ("qwen35-prefill", "qwen35-prefill-graph-noex", "qwen35-decode", "qwen35-decode-graph-noex"):
+        _write_export(exports, name)
+    workloads = _workloads(
+        tmp_path,
+        {
+            "prefill_eager": {"hardware.device_count": 1},
+            "prefill_graph": {"hardware.device_count": 1},
+            "decode_eager": {"hardware.device_count": 1},
+            "decode_graph": {"hardware.device_count": 1},
+        },
+    )
+    out = tmp_path / "out"
+
+    code = main(_args(exports, workloads, out, "--strict"))
+    assert code == 0
+
+    manifest = _manifest(out)
+    assert manifest["status"] == "success"
+    assert manifest["comparison_status"] == "success"
+    stages = {item["name"]: item for item in manifest["stages"]}
+    pairs = stages["compare"]["details"]["pairs"]
+    assert sum(1 for item in pairs if item["same_phase"]) == 2
+    assert sum(1 for item in pairs if not item["same_phase"]) == 2
+    assert any(item["status"] == "descriptive" for item in pairs)
+
+
+def test_collect_artifacts_and_fingerprints_fail_closed(tmp_path: Path) -> None:
+    """B7：已登记产物/配置消失时不能静默跳过。"""
+    from opt_discovery.experiment.run_manifest import collect_artifacts, fingerprint_configs
+
+    missing = tmp_path / "missing.json"
+    with pytest.raises(FileNotFoundError):
+        collect_artifacts({"x": missing}, tmp_path)
+    with pytest.raises(FileNotFoundError):
+        fingerprint_configs([missing])

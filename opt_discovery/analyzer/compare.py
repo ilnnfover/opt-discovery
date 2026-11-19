@@ -149,9 +149,13 @@ def _summarize(table: OperatorTable) -> dict[str, dict[str, float | None]]:
     return summary
 
 
-def _meta_payload(table: OperatorTable) -> dict:
-    """契约只读 ``meta.extra``，不要为此序列化全部算子记录。"""
-    return {"extra": dict(table.meta.extra or {})}
+def _contract_payload(table: OperatorTable) -> dict:
+    """契约只读 workload/meta 与算子计数，不序列化全部记录。"""
+    return {
+        "workload": table.workload.to_dict(),
+        "meta": {"extra": dict(table.meta.extra or {})},
+        "operator_counts": {record.operator: record.calls for record in table.records},
+    }
 
 
 def _window_of(table: OperatorTable) -> dict | None:
@@ -238,16 +242,15 @@ def compare_tables(
         warnings.append(f"质量提示（{flag.code}）：{flag.message}")
 
     # 采集契约 gate：与独立 check-runs 使用同一实现，比较入口不再绕过。
-    contract = compare_contracts(
-        {"workload": a.workload.to_dict(), "meta": _meta_payload(a)},
-        {"workload": b.workload.to_dict(), "meta": _meta_payload(b)},
-    )
+    contract = compare_contracts(_contract_payload(a), _contract_payload(b))
     if contract.verdict == "incomparable":
         comparable = False
         reasons.extend(
             f"采集契约不通过（{item.name}）：{item.a} vs {item.b}（{item.note}）"
             for item in contract.failures
         )
+    for item in contract.warnings:
+        warnings.append(f"采集契约提示（{item.name}）：{item.note}")
 
     if a.workload.execution.phase is not b.workload.execution.phase:
         warnings.append(
