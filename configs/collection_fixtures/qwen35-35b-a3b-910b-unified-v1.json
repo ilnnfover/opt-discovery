@@ -1,0 +1,63 @@
+{
+  "dataset_id": "qwen35-35b-a3b-910b-unified-v1",
+  "contract_id": "qwen35-35b-a3b-910b-unified-v1",
+  "collection_contract_sha256": "c6edbf7bb2fddc3d",
+  "active_rounds": [0, 1, 2, 3, 4],
+  "window_rounds": [0, 1, 2],
+  "fixed": {
+    "dtype": "bfloat16",
+    "tensor_parallel_size": 2,
+    "max_num_seqs": 32,
+    "max_model_len": 8192,
+    "seed": 42,
+    "enable_prefix_caching": false,
+    "enable_chunked_prefill": true,
+    "concurrency": 1
+  },
+  "profiling": {
+    "switches": [
+      "--aic-metrics=ArithmeticUtilization",
+      "--sys-hardware-mem=on"
+    ],
+    "msproftx": "off",
+    "summary_format": "csv"
+  },
+  "runs": {
+    "qwen35-35b-a3b-prefill-eager": {
+      "run_id": "prefill-eager",
+      "export_dir": "qwen35-prefill",
+      "phase": "prefill",
+      "mode": "eager",
+      "graph_mode": "none",
+      "output_length": 1,
+      "ranks": ["device_0", "device_1"]
+    },
+    "qwen35-35b-a3b-prefill-graph": {
+      "run_id": "prefill-graph",
+      "export_dir": "qwen35-prefill-graph-noex",
+      "phase": "prefill",
+      "mode": "graph",
+      "graph_mode": "full_and_piecewise",
+      "output_length": 1,
+      "ranks": ["device_0", "device_1"]
+    },
+    "qwen35-35b-a3b-decode-eager": {
+      "run_id": "decode-eager",
+      "export_dir": "qwen35-decode",
+      "phase": "decode",
+      "mode": "eager",
+      "graph_mode": "none",
+      "output_length": 64,
+      "ranks": ["device_0", "device_1"]
+    },
+    "qwen35-35b-a3b-decode-graph": {
+      "run_id": "decode-graph",
+      "export_dir": "qwen35-decode-graph-noex",
+      "phase": "decode",
+      "mode": "graph",
+      "graph_mode": "full_and_piecewise",
+      "output_length": 64,
+      "ranks": ["device_0", "device_1"]
+    }
+  }
+}

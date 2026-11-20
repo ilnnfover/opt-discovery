@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
 out/
 
 # profiler 导出的临时产物（MSTX 探针等）

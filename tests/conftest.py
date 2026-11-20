@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,32 @@ from opt_discovery.schemas.workload import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """稳定、可复现的 Hypothesis profile。
+
+    ``derandomize=True`` 让同一份代码每次得到同一组输入；``max_examples`` 默认 30，
+    既覆盖边界又避免把 CI 拖慢。失败时 Hypothesis 会打印 seed 与最小反例。
+    需要临时放大/缩小示例数时使用 ``OPT_DISCOVERY_PROPERTY_EXAMPLES``。
+    """
+    try:
+        from hypothesis import HealthCheck, settings
+    except ImportError:  # dev extra 未安装时不影响非属性测试
+        return
+    examples = int(os.environ.get("OPT_DISCOVERY_PROPERTY_EXAMPLES", "30"))
+    settings.register_profile(
+        "opt-discovery",
+        max_examples=examples,
+        derandomize=True,
+        deadline=None,
+        print_blob=True,
+        suppress_health_check=[
+            HealthCheck.too_slow,
+            HealthCheck.function_scoped_fixture,
+        ],
+    )
+    settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "opt-discovery"))
 
 
 @pytest.fixture
