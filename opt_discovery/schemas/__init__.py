@@ -8,6 +8,17 @@ from .evidence import (
     EvidenceItem,
     MissingEvidence,
 )
+from .evidence_gate import (
+    ArtifactReference,
+    EvidenceSource,
+    PromotionDecision,
+    ValidationBundle,
+    ValidationResult,
+    ValidationScope,
+    promote_evidence,
+    trusted_evidence_level,
+    withdraw_evidence,
+)
 from .metrics import PROVENANCE_WEIGHT, Metric, Provenance, weakest_provenance
 from .operator import (
     SCHEMA_VERSION as OPERATOR_SCHEMA_VERSION,
@@ -82,4 +93,13 @@ __all__ = [
     "Phase",
     "WorkloadError",
     "WorkloadSpec",
+    "ArtifactReference",
+    "EvidenceSource",
+    "PromotionDecision",
+    "ValidationBundle",
+    "ValidationResult",
+    "ValidationScope",
+    "promote_evidence",
+    "trusted_evidence_level",
+    "withdraw_evidence",
 ]

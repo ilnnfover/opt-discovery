@@ -84,6 +84,8 @@ def opportunities_from_diagnosis(
             caveats = tuple(candidate.caveats)
             competing = [note for note in operator_diagnosis.notes if "并存" in note]
             caveats += tuple(competing) + ("尚未建立 Kernel -> 源码映射，source_refs 为空",)
+            if report.is_synthetic:
+                caveats += ("输入数据为合成数据，不能作为真实验证依据",)
             drafts.append(
                 {
                     "operator": operator_diagnosis.operator,
@@ -92,6 +94,7 @@ def opportunities_from_diagnosis(
                     "hypothesis": _hypothesis(operator_diagnosis, candidate, bottleneck),
                     "bottleneck": bottleneck,
                     "evidence_level": candidate.level,
+                    "is_synthetic": report.is_synthetic,
                     "evidence": list(candidate.evidence),
                     "missing_evidence": _missing(candidate),
                     "suggested_actions": candidate.suggested_actions,

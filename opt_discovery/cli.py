@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import glob as _glob
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -96,6 +97,7 @@ from .parsers.sqlite_op_report import SqliteOpReportParser
 from .parsers.synthetic import SCENARIOS, build_synthetic_table
 from .report.generator import write_report as write_markdown_report
 from .report.summary_csv import write_summaries
+from .schemas.evidence_gate import EvidenceGateError, ValidationBundle
 from .schemas.operator import OperatorTable
 from .schemas.opportunity import read_opportunities, write_opportunities
 from .schemas.quality import (
@@ -661,20 +663,86 @@ def cmd_validate_thresholds(args: argparse.Namespace) -> int:
 # feedback（把 A/B 结果回填到机会）
 # ---------------------------------------------------------------------------
 def cmd_feedback(args: argparse.Namespace) -> int:
+    if not math.isfinite(args.min_effect) or not 0.0 <= args.min_effect <= 1.0:
+        print("[feedback] --min-effect 必须是 [0, 1] 内的有限数值", file=sys.stderr)
+        return 2
+    if args.compare and args.validation:
+        print(
+            "[feedback] --compare 与 --validation 不能同时使用："
+            "裸比较只观察，结构化验证负责升级，请分开调用",
+            file=sys.stderr,
+        )
+        return 2
+
     opportunities = read_opportunities(args.opportunities)
-    comparison = load_comparison(args.compare)
-    result = apply_feedback(
-        opportunities,
-        comparison,
-        operator=args.operator,
-        change=args.change,
-        min_effect=args.min_effect,
-    )
+    validation = None
+    if args.validation:
+        try:
+            validation = ValidationBundle.from_file(args.validation)
+        except (OSError, ValueError, EvidenceGateError) as exc:
+            print(f"[feedback] 无法读取结构化验证：{exc}", file=sys.stderr)
+            return 2
+        if args.operator and args.operator != validation.operator:
+            print(
+                f"[feedback] --operator={args.operator!r} 与 validation.operator="
+                f"{validation.operator!r} 不一致",
+                file=sys.stderr,
+            )
+            return 2
+        if args.change and args.change != validation.change_id:
+            print(
+                f"[feedback] --change={args.change!r} 与 validation.change_id="
+                f"{validation.change_id!r} 不一致",
+                file=sys.stderr,
+            )
+            return 2
+
+    if not args.compare and validation is None:
+        print("[feedback] 需要 --compare 或 --validation", file=sys.stderr)
+        return 2
+
+    comparison = load_comparison(args.compare) if args.compare else None
+    try:
+        result = apply_feedback(
+            opportunities,
+            comparison,
+            operator=args.operator,
+            change=args.change,
+            min_effect=args.min_effect,
+            validation=validation,
+            artifact_root=args.artifact_root,
+        )
+    except EvidenceGateError as exc:
+        print(f"[feedback] 验证参数或输入不合法：{exc}", file=sys.stderr)
+        return 2
+    if validation is not None and result.matched == 0:
+        print(
+            f"[feedback] validation.opportunity_id={validation.opportunity_id!r} "
+            "未匹配任何机会",
+            file=sys.stderr,
+        )
+        return 2
+
     target = write_opportunities(opportunities, args.out or args.opportunities)
-    print(f"[feedback] {comparison.get('a')} -> {comparison.get('b')}  verdict={result.verdict}")
-    print(f"  作用域: {'单算子 ' + result.operator if result.operator else '工作负载级（不归因到单个算子）'}")
+    if comparison is not None:
+        print(f"[feedback] {comparison.get('a')} -> {comparison.get('b')}  verdict={result.verdict}")
+    elif validation is not None:
+        print(f"[feedback] 结构化验证 change={validation.change_id}  verdict={result.verdict}")
     print(
-        f"  matched={result.matched} upgraded={result.upgraded} "
+        "  作用域: "
+        + (
+            "结构化验证 " + (result.operator or "")
+            if validation is not None
+            else (
+                "单算子观察 " + result.operator
+                if result.operator
+                else "工作负载级（不归因到单个算子）"
+            )
+        )
+    )
+    print(
+        f"  matched={result.matched} validated={result.validated} "
+        f"upgraded={result.upgraded} blocked={result.blocked} "
         f"rejected={result.rejected} untouched={result.untouched}"
     )
     for note in result.notes:
@@ -687,7 +755,9 @@ def cmd_feedback(args: argparse.Namespace) -> int:
                 f"level={item.evidence_level.value:<10} delta={measured.get('latency_median_delta_pct')}%"
             )
     print(f"-> {target}")
-    return 0
+    # A structurally blocked validation is still auditable (the opportunity
+    # file was written), but the command must not report success.
+    return 1 if validation is not None and result.blocked else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2473,12 +2543,26 @@ def build_parser() -> argparse.ArgumentParser:
                        help="micro-benchmark 设备档案 JSON（默认按 ruleset 的 device_profile_id 自动查找）")
     p_cal.set_defaults(func=cmd_calibrate)
 
-    p_fb = sub.add_parser("feedback", help="把 bench 的 A/B 结果回填到机会（迭代 6）")
+    p_fb = sub.add_parser("feedback", help="回填 bench 观察，或用结构化验证升级证据")
     p_fb.add_argument("--opportunities", required=True)
-    p_fb.add_argument("--compare", required=True, help="bench_compare.json")
-    p_fb.add_argument("--operator", default=None, help="单变量实验：本次只改了哪个算子")
-    p_fb.add_argument("--change", default=None, help="改动描述，会写进机会的 extra")
+    p_fb.add_argument(
+        "--compare",
+        default=None,
+        help="bench_compare.json；裸比较只作为观察记录，不升级证据",
+    )
+    p_fb.add_argument(
+        "--validation",
+        default=None,
+        help="结构化 ValidationBundle JSON；证据升级必须提供",
+    )
+    p_fb.add_argument("--operator", default=None, help="仅用于观察匹配；与 validation 不一致时拒绝")
+    p_fb.add_argument("--change", default=None, help="改动描述；与 validation 不一致时拒绝")
     p_fb.add_argument("--min-effect", type=float, default=0.05)
+    p_fb.add_argument(
+        "--artifact-root",
+        default=None,
+        help="validation 中相对产物路径的根目录（默认当前目录）",
+    )
     p_fb.add_argument("--out", default=None, help="默认原地更新")
     p_fb.set_defaults(func=cmd_feedback)
 

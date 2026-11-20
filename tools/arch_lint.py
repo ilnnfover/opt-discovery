@@ -118,9 +118,16 @@ def _call_name(node: ast.Call) -> str | None:
 
 
 def _matches_evidence_rhs(value: ast.AST | None, expected: str) -> bool:
-    """Require the exact ``Receiver.ATTRIBUTE`` shape, not just the attribute."""
+    """Require the exact allowed right-hand side shape.
+
+    ``ConfidenceLevel.PROBABLE`` must be that attribute access; a bare name such
+    as ``target_level`` is accepted only when configured as a computed gate
+    value.  This keeps the OD004 exemptions narrower than a file-wide waiver.
+    """
     receiver, separator, attribute = expected.rpartition(".")
-    if not separator or not receiver or not attribute:
+    if not separator:
+        return isinstance(value, ast.Name) and value.id == expected
+    if not receiver or not attribute:
         return False
     return (
         isinstance(value, ast.Attribute)
@@ -397,7 +404,9 @@ def _check_od003(tree: ast.AST, rel: str) -> list[Violation]:
 
 
 def _check_od004(
-    tree: ast.AST, rel: str, allowed: Mapping[tuple[str, int], str]
+    tree: ast.AST,
+    rel: str,
+    allowed: Mapping[tuple[str, int], str],
 ) -> list[Violation]:
     if rel == "opt_discovery/schemas/quality.py":
         return []
@@ -424,7 +433,7 @@ def _check_od004(
                         rel,
                         node.lineno,
                         f"直接改写证据字段 {target.attr}",
-                        "通过 schemas.quality.attach / QualityFlag 的公共构造函数升级证据",
+                        "通过 schemas.evidence_gate.promote_evidence / withdraw_evidence 升级或撤回证据",
                     )
                 )
             if isinstance(target, ast.Subscript):
