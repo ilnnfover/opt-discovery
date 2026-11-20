@@ -57,14 +57,22 @@ od002_authorized_files:
 # best-effort path cannot mask the original error.
 od005_allow:
   - file: opt_discovery/cli.py
-    line: 1387
+    line: 1457
     reason: best-effort early input protection; original error is reported before this handler
 
-# OD004: the only verified feedback upgrade is the existing PROBABLE write.
-# The allowance is position-scoped and only accepts this exact right-hand side;
-# changing the line's RHS or writing PROBABLE from another line is reported.
+# OD004: evidence levels may only be written through the controlled gate.
+# Each exemption is an exact file + line + right-hand side, so a second write
+# with the same variable name elsewhere in the module is still reported.
 od004_allow:
-  - file: opt_discovery/experiment/feedback.py
-    line: 130
-    rhs: ConfidenceLevel.PROBABLE
-    reason: apply_feedback 单变量验证后最多升到 probable
+  - file: opt_discovery/schemas/evidence_gate.py
+    line: 1007
+    rhs: target_level
+    reason: _apply_promotion 只写唯一闸门 evaluate_validation 计算出的 target_level
+  - file: opt_discovery/schemas/evidence_gate.py
+    line: 1129
+    rhs: target_level
+    reason: withdraw_evidence 只写显式撤回计算出的 target_level
+  - file: opt_discovery/schemas/evidence_gate.py
+    line: 1250
+    rhs: target_level
+    reason: trusted_evidence_level 只写保守降级计算出的 target_level

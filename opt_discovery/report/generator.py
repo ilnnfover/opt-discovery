@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..schemas.evidence_gate import trusted_level_for_mapping
+
 __all__ = ["build_report", "write_report"]
 
 
@@ -239,16 +241,27 @@ def build_report(
     add("")
     add("| ID | 算子 | Workload | 瓶颈 | 级别 | 分数 | 影响 | 缺失证据 |")
     add("|---|---|---|---|---|---|---|---|")
+    untrusted_levels: list[str] = []
     for name, payload in opportunities.items():
         for item in (payload or {}).get("opportunities", [])[:5]:
             scores = item.get("scores") or {}
+            level, trust_note = trusted_level_for_mapping(item)
+            if trust_note:
+                untrusted_levels.append(f"{item['opportunity_id']}: {trust_note}")
+            shown_level = f"{level}（不可信）" if trust_note else level
             add(
                 f"| {item['opportunity_id']} | `{item['operator']}` | `{name}` | "
-                f"{item['bottleneck']} | {item['evidence_level']} | "
+                f"{item['bottleneck']} | {shown_level} | "
                 f"{_num(scores.get('value'), 4)} | {_num(scores.get('impact'), 3)} | "
                 f"{len(item.get('missing_evidence', []))} |"
             )
     add("")
+    if untrusted_levels:
+        add("> **证据可信性**：以下记录缺少可核验的验证契约或曾被判定为不可信，"
+            "已按 probable（不可信）展示，不进入结论。")
+        for note in untrusted_levels:
+            add(f"> - {note}")
+        add("")
     add("> 分数为占位模型：impact 取累计时间占比（非关键路径），"
         "feasibility/cost 为经验占位值，详见各机会的 `score_basis`。")
     add("")
@@ -267,13 +280,16 @@ def build_report(
         add("|---|---|---|---|---|---|---|")
         for name, item, measured in measured_rows[:20]:
             delta = measured.get("latency_median_delta_pct")
+            level, _trust_note = trusted_level_for_mapping(item)
+            shown_level = f"{level}（不可信）" if _trust_note else level
             add(
                 f"| {item['opportunity_id']} | `{item['operator']}` | `{name}` | "
-                f"{item.get('status')} | {item.get('evidence_level')} | "
+                f"{item.get('status')} | {shown_level} | "
                 f"{'-' if delta is None else f'{delta:+.1f}%'} | {measured.get('verdict')} |"
             )
         add("")
-        add("> 工作负载级 A/B 不能归因到单个算子；只有单变量实验（--operator）才升级证据级别。")
+        add("> 工作负载级 A/B 不能归因到单个算子；裸 bench 观察不改变证据级别，"
+            "只有结构化验证（--validation）才升级。")
         add("")
 
     # -- 6. 对比 ----------------------------------------------------------

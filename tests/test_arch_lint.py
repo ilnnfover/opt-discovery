@@ -471,6 +471,65 @@ def test_od003_default_and_read_modes_are_rejected(tmp_path: Path) -> None:
     assert sorted(item.line for item in violations) == [2, 3, 4, 5, 6, 7]
 
 
+def test_od004_gate_is_restricted_to_exact_computed_line(tmp_path: Path) -> None:
+    import yaml
+
+    gate = "opt_discovery/schemas/evidence_gate.py"
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    config["od004_allow"] = [
+        {
+            "file": gate,
+            "line": 2,
+            "rhs": "target_level",
+            "reason": "test gate",
+        }
+    ]
+    config_path = tmp_path / "arch_lint.yaml"
+    config_path.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+
+    _write(
+        tmp_path,
+        gate,
+        "def f(opportunity, target_level):\n"
+        "    opportunity.evidence_level = target_level\n"
+        "def g(opportunity, target_level):\n"
+        "    opportunity.evidence_level = target_level\n",
+    )
+    violations = [item for item in run_lint(tmp_path, config_path) if item.rule == "OD004"]
+    # The exact authorized line is exempt; the same bare variable name in
+    # another function of the same module is still a violation.
+    assert [item.line for item in violations] == [4]
+
+    _write(
+        tmp_path,
+        gate,
+        "def f(opportunity):\n"
+        "    opportunity.evidence_level = ConfidenceLevel.CONFIRMED\n",
+    )
+    assert [item for item in run_lint(tmp_path, config_path) if item.rule == "OD004"]
+
+    _write(
+        tmp_path,
+        gate,
+        "def f(opportunity, target_level):\n"
+        "    opportunity.severity = target_level\n",
+    )
+    assert [item for item in run_lint(tmp_path, config_path) if item.rule == "OD004"]
+
+    _write(
+        tmp_path,
+        "opt_discovery/analyzer/other.py",
+        "def f(opportunity, target_level):\n"
+        "    opportunity.evidence_level = target_level\n",
+    )
+    violations = [
+        item
+        for item in run_lint(tmp_path, config_path)
+        if item.rule == "OD004" and item.path == "opt_discovery/analyzer/other.py"
+    ]
+    assert violations
+
+
 def test_od004_exempt_line_probable_is_allowed(tmp_path: Path) -> None:
     import yaml
 

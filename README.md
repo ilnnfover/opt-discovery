@@ -272,20 +272,42 @@ source-map --table out/steady/<wl>/operator_table.json
 ```bash
 bench --harness $NPU_STACK/qwen35-decode-only.py --out out/bench/eager --label eager
 bench-compare --a out/bench/a/benchmark.json --b out/bench/b/benchmark.json
-feedback --opportunities out/steady/<wl>/opportunities.json --compare out/bench/bench_compare.json \
-         --operator <Op> --change "..."
+# 只记录观察，不升级证据：
+feedback --opportunities out/steady/<wl>/opportunities.json \
+         --compare out/bench/bench_compare.json --operator <Op> --change "..."
+# 结构化验证（唯一升级路径）：
+feedback --opportunities out/steady/<wl>/opportunities.json \
+         --validation validation.json
 ```
 
 `bench` 直接跑现有 harness（它们没有 CLI 参数，只打印 `ACTIVE_ROUND`），解析整轮延迟；
 `bench-compare` 判定阈值写死（<3 轮 → `insufficient_samples`；中位延迟变化 <±5% → 无显著差异）。
 
-回填规则：
+反馈分两层，且**不能同时提供**：`--compare` 是**裸观察**，只写 `measured`
+（`source=benchmark_observation`，`verified=false`），不改变 `evidence_level`；
+`--validation` 是结构化 `ValidationBundle`，由 `schemas.evidence_gate.promote_evidence`
+统一校验机会、生成实例、算子、workload、change、baseline/candidate、输入、可比性、
+正确性、样本、不确定性、来源和产物摘要。两者同时提供会直接退出 2，避免用整轮
+benchmark 去匹配单算子/kernel 效果。
+
+结构化 bundle 必须显式引用机会的 `opportunity_instance_id`（生成时写入的 UUID，
+序列化和重读保留）。单个算子实验（`operator`）不是端到端：kernel + operator 最多到
+`probable`；只有 kernel + `model` 或 `serving` 且产物摘要独立时才能 `confirmed`。
+样本阈值 `--min-effect` 必须是 `[0, 1]` 内的有限值并随审计记录；即使允许 0 阈值，
+零改善也不会被判为收益。
 
 | 场景 | 状态 | 证据级别 |
 |---|---|---|
-| 单算子实验 `b_faster`（≤ −5%） | `accepted` | 升一级，**上限 probable** |
-| 单算子实验 `b_slower`（≥ +5%） | `rejected` | 不变 |
+| 裸单算子观察 `b_faster`（≤ −5%） | `accepted` | **不变** |
+| 裸单算子观察 `b_slower`（≥ +5%） | `rejected` | **不变** |
 | **工作负载级 A/B** | `validating` | **不变**（不能归因到单个算子） |
+| 结构化单条有效实验（含 operator） | `accepted` | 升一级，**上限 probable** |
+| 结构化 kernel + 独立 `model`/`serving` 有效结果 | `accepted` | 可 `confirmed` |
+
+历史无审计的 `confirmed`、缺少 `instance_id`/`is_synthetic` 的旧记录会在读取/报告时
+保守降级为 `probable（不可信）`，并在报告中明确标注；缺失或摘要变化的产物同样会
+触发降级。完整契约、正例和历史数据处理见
+[AE-07 迁移说明](docs/engineering/phase6/migration.md)。
 
 ### 阈值标定
 

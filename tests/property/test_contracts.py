@@ -657,7 +657,12 @@ def _comparison(verdict: str, delta: float | None = -20.0) -> dict:
     operator_scoped=st.booleans(),
     verdict=st.sampled_from(["b_faster", "insufficient_samples", "undetermined"]),
 )
-def test_feedback_only_upgrades_with_operator_attribution(operator_scoped, verdict) -> None:
+def test_bare_comparison_never_upgrades_evidence(operator_scoped, verdict) -> None:
+    """A bare bench payload is an observation, not a validated experiment.
+
+    AE-07: only a structured ValidationBundle may change evidence_level.  The
+    old ``--operator``-only upgrade is intentionally replaced by this contract.
+    """
     item = _opportunity()
     before = item.evidence_level
     result = apply_feedback(
@@ -667,13 +672,13 @@ def test_feedback_only_upgrades_with_operator_attribution(operator_scoped, verdi
         change="fixture-change",
     )
 
-    if not operator_scoped or verdict != "b_faster":
-        assert item.evidence_level is before
-        assert result.upgraded == 0
-        assert item.status.value in ("discovered", "validating")
-    else:
-        assert item.evidence_level is ConfidenceLevel.PROBABLE
-        assert result.upgraded == 1
+    assert item.evidence_level is before
+    assert result.upgraded == 0
+    assert result.validated == 0
+    assert item.status.value in ("discovered", "validating", "accepted", "rejected")
+    if verdict == "insufficient_samples":
+        assert result.matched == 0
+        assert "measured" not in item.extra
 
 
 def test_synthetic_vs_measured_comparison_is_blocked() -> None:
@@ -688,14 +693,12 @@ def test_synthetic_vs_measured_comparison_is_blocked() -> None:
     assert any("synthetic_mismatch" in reason for reason in report.reasons)
 
 
-def test_feedback_payload_has_no_verified_source_boundary_yet() -> None:
-    """AE-07 缺口：当前 comparison 字典没有可验证来源字段。
-
-    本测试只锁定「现有 API 不会伪造 source/synthetic 字段」，不把合成机会
-    升级问题写成通过；正式来源边界由 AE-07 引入。
-    """
+def test_bare_comparison_payload_is_marked_unverified_observation() -> None:
+    """The observation record must say it is unverified; no silent 'manual'."""
     item = _opportunity()
     apply_feedback([item], _comparison("b_faster"), operator=item.operator, change="x")
     measured = item.extra["measured"]
-    assert "source" not in measured
-    assert "synthetic" not in measured
+    assert measured["source"] == "benchmark_observation"
+    assert measured["verified"] is False
+    assert measured["synthetic"] is None
+    assert item.evidence_level is ConfidenceLevel.HYPOTHESIS
