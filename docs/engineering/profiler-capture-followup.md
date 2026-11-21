@@ -107,3 +107,27 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 中间失败记录（同一目录，`smoke-spawn*.log`）：`No module named 'vllm_ascend_split_batch.*'`（工作区副本缺 `.py`，仅剩 `__pycache__`，属既有环境问题、非致命）、`bootstrapping phase`（缺 `__main__` 保护）、`No module named 'acl'`（`PYTHONPATH` 被覆盖）。
 
 `__main__` 保护已同步到仓库的四个 harness 模板（`scripts/harness/qwen35-*.py`）。在临时输出目录用 `recollect_contract.build_harnesses` 生成四份脚本，确认预热与采集轮数的覆盖参数生效，且以 `__mp_main__` 加载时未创建 vLLM 引擎。补采阶段的真实 NPU 验收涵盖 Decode Eager。
+
+## MSTX 采集（已验证可落库）
+
+`msprof --msproftx=on` 对 PyTorch 进程采不到 mstx：最小复现里 `torch.npu.mstx.range_start` 恒返回 0，库里只有 `ENUM_MSTX_EVENT_TYPE`。可用路径是进程内 `torch_npu.profiler` + `experimental_config(mstx=True)`；`vllm_ascend` 把 `msprof_tx` 写死为 `False`，需要外部覆盖。
+
+三个必要条件：
+
+1. **导出的表是 `MSTX_EVENTS`**（不是老的 `MsprofTx`），列名 `startNs/endNs/eventType/rangeId/category/message/globalTid/...`，`message` 与 `category` 是 `STRING_IDS` 的索引。
+2. **挂点必须挂 Ascend 的子类**：`vllm_ascend.worker.worker.NPUWorker` 与 `vllm_ascend.worker.model_runner_v1.NPUModelRunner`。只挂上游 `GPUModelRunner` 不会触发——首轮实测静默覆盖率 0%。
+3. **`llm.stop_profile()` 的在线导出会被 RPC 超时打断**（`RuntimeError: cancelled` → EngineCore 退出），raw 目录完整但 db 未生成；用 `scripts/mstx/export_offline.sh <rank 目录> --with-text` 离线 `--parse/--export` 即可补齐。
+
+短跑验证（Graph、2 轮、`/root/prof/opt-eager-audit.f7CaOu/mstx-short`，每 rank 一个 `_ascend_pt`）：
+
+| 打点 | 次数 | 合计 | 每次 |
+|---|---:|---:|---:|
+| `worker_execute`（`NPUWorker.execute_model`） | 131 | 2374.9 ms | 18.1 ms |
+| HCCL AllGather range（框架自带） | 128 | 34.3 ms | 0.27 ms |
+| HCCL Allreduce range（框架自带） | 128 | 33.8 ms | 0.26 ms |
+| `sync_wait_stream` | 126 | 15.49 ms | 0.12 ms |
+| `sync_wait_device` | 1 | 0.16 ms | — |
+
+同一次采集、同一 rank 的库里同时有 `TASK` / `CANN_API` / `MSTX_EVENTS`（515 行），时间基准与 harness 的 `PROFILE_START/STOP` 一致（epoch ns，边界偏差 <30 ms）。
+
+用这批数据跑 `analyzer.timeline.summarize(db, window, mstx=...)`：窗口 2.825 s、设备忙 1.783 s（63.1%）、空闲 36.9%，**MSTX 覆盖 97% 的静默空洞**（结论：空洞落在 Python 前向/调度区间，不是下发受限），同步等待 15.49 ms/2 轮 ≈ 7.7 ms/轮（占比 <1%）。注意这是带 profiler 的短跑，每轮 1.43 s，绝对值不可与正式采集（1.09 s/轮）直接比较。
