@@ -5,7 +5,7 @@
     PYTHONPATH=<repo>/scripts/mstx \
     VLLM_MSTX_PATCH=1 python3 $NPU_STACK/qwen35-decode-only.py
 
-打点内容（名字即 ``MsprofTx.message``）：
+打点内容：
 
 | 名字 | 位置 | 用途 |
 |---|---|---|
@@ -16,9 +16,8 @@
 
 注意：
 
-* 本文件**未在 NPU 上验证**（开发容器无驱动），所有补丁都 try/except 包裹，
-  打点失败不影响业务逻辑；
-* 只有当采集侧真的产出 ``MsprofTx`` 表时，本项目的 ``load_mstx`` 才有数据可读。
+* 在发出打点的进程内启用 torch_npu.profiler 的 MSTX，并导出 DB。
+* 用 ``scripts/enable_mstx.sh`` 启动时会检查实际输出的 ``MSTX_EVENTS``。
 """
 
 import os

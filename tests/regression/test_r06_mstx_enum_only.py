@@ -49,7 +49,7 @@ def test_enum_table_alone_does_not_mean_mstx_was_collected(tmp_path: Path) -> No
     assert trace.available is False
     assert trace.ranges == ()
     assert trace.sync_us == 0.0
-    assert any("没有开启 MSTX" in note for note in trace.notes)
+    assert any("缺少 MsprofTx / MSTX_EVENTS 表" in note for note in trace.notes)
     assert any("无法进一步归因" in note for note in trace.notes)
 
 

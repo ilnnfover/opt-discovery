@@ -30,6 +30,7 @@ class LogParseError(ValueError):
 
 _ROUND_RE = re.compile(
     r"ACTIVE_ROUND\s+(?P<index>\d+)\s+start\s+(?P<start>\d+(?:\.\d+)?)\s+end\s+(?P<end>\d+(?:\.\d+)?)"
+    r"(?:[ \t]+out_tokens[ \t]+(?P<output>\d+))?"
 )
 _PROMPT_RE = re.compile(r"PROMPT_TOKENS\s+(?P<tokens>\d+)")
 _LOAD_RE = re.compile(r"LOAD_SECONDS\s+(?P<seconds>\d+(?:\.\d+)?)")
@@ -44,6 +45,7 @@ class Round:
     index: int
     start_us: float
     end_us: float
+    output_tokens: int | None = None
 
     @property
     def duration_us(self) -> float:
@@ -79,6 +81,7 @@ class RunLog:
                 index=int(match.group("index")),
                 start_us=float(match.group("start")) * 1e6,
                 end_us=float(match.group("end")) * 1e6,
+                output_tokens=int(output) if (output := match.group("output")) else None,
             )
             for match in _ROUND_RE.finditer(text)
         )

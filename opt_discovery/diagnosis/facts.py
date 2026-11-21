@@ -121,7 +121,8 @@ FACT_CATALOG: dict[str, FactSpec] = {
         "arithmetic_intensity", "flop/byte", "算术强度", "derived", ("flops", "bytes_moved")
     ),
     "bytes_moved": FactSpec("bytes_moved", "bytes", "搬运字节数", "measured"),
-    "flops": FactSpec("flops", "count", "浮点运算次数", "measured"),
+    "flops": FactSpec("flops", "count", "Cube 浮点运算次数", "measured"),
+    "vector_flops": FactSpec("vector_flops", "flop", "Vector 浮点运算次数", "measured"),
     "block_num": FactSpec(
         "block_num", "count", "每实例平均使用的 AI Core 块数（Block Num）", "measured"
     ),
@@ -422,7 +423,11 @@ def build_facts(
 
     # -- arithmetic intensity, if both inputs exist ----------------------
     flops, bytes_moved = facts.get("flops"), facts.get("bytes_moved")
-    if flops and bytes_moved and bytes_moved.value > 0:
+    partial_inputs = set(record.attributes.get("partial_metric_inputs", "").split(","))
+    if (
+        flops and bytes_moved and bytes_moved.value > 0
+        and not partial_inputs.intersection(("flops", "bytes_moved"))
+    ):
         put(
             "arithmetic_intensity",
             flops.value / bytes_moved.value,
@@ -441,6 +446,7 @@ def build_facts(
             and aicore_fact
             and aicore_fact.value > 0
             and flops_fact.value > 0
+            and not partial_inputs.intersection(("flops", "aicore_time_us"))
         ):
             achieved = flops_fact.value / (aicore_fact.value * 1e-6)
             put(

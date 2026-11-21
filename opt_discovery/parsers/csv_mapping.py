@@ -74,6 +74,7 @@ _NULL_TOKENS = {"", "-", "--", "n/a", "na", "none", "null", "nan"}
 
 #: 支持的派生指标计算（逐实例，从非数值列推导）
 _COMPUTED_METRICS = {"bytes_from_shapes", "bytes_time_for"}
+_INSTRUMENT_METRICS = {"cube_utilization", "flops", "vector_flops"}
 
 #: dtype 名 -> 字节数（键全部小写；昇腾导出常见 DT_ 前缀与裸名都收录）
 _DTYPE_SIZES: dict[str, float] = {
@@ -534,6 +535,17 @@ class MappingCsvParser:
         records = [
             group.to_record(self.mapping, workload.workload_id) for group in groups.values()
         ]
+        tracked = [spec.name for spec in self.mapping.extra_metrics if spec.name in _INSTRUMENT_METRICS]
+        if tracked:
+            meta.extra["extra_metric_coverage"] = [
+                {
+                    "operator": group.operator,
+                    "labels": dict(group.labels),
+                    "metrics": {name: group.extra_coverage(name) for name in tracked},
+                }
+                for group in groups.values()
+                if group.has_time
+            ]
         meta.extra["groups"] = len(records)
         meta.extra["rows_outside_window"] = rows_outside
         if window is not None:
@@ -777,9 +789,13 @@ class MappingCsvParser:
 
         for extra in self.mapping.extra_metrics:
             positions = columns.extras.get(extra.name)
-            if not positions:
-                continue
             if extra.when_task_types and task_type not in extra.when_task_types:
+                continue
+            if extra.name in _INSTRUMENT_METRICS:
+                group.extra_eligible[extra.name] = group.extra_eligible.get(extra.name, 0) + 1
+                if positions:
+                    group.extra_columns[extra.name] = group.extra_columns.get(extra.name, 0) + 1
+            if not positions:
                 continue
             if extra.computed == "bytes_from_shapes":
                 if row_bytes is not None:
@@ -858,6 +874,8 @@ class _Group:
     device_us: float | None = None
     extra_sum: dict[str, float] = field(default_factory=dict)
     extra_count: dict[str, int] = field(default_factory=dict)
+    extra_eligible: dict[str, int] = field(default_factory=dict)
+    extra_columns: dict[str, int] = field(default_factory=dict)
     extra_max: dict[str, float] = field(default_factory=dict)
     extra_min: dict[str, float] = field(default_factory=dict)
     flag_tasks: dict[str, int] = field(default_factory=dict)
@@ -901,6 +919,22 @@ class _Group:
         self.extra_max[spec.name] = max(self.extra_max.get(spec.name, value), value)
         self.extra_min[spec.name] = min(self.extra_min.get(spec.name, value), value)
 
+    def extra_coverage(self, name: str) -> dict:
+        eligible = self.extra_eligible.get(name, 0)
+        column_rows = self.extra_columns.get(name, 0)
+        samples = self.extra_count.get(name, 0)
+        if eligible == 0:
+            status = "not_applicable"
+        elif column_rows == 0:
+            status = "missing_column"
+        elif samples == 0:
+            status = "empty"
+        elif samples < eligible:
+            status = "partial"
+        else:
+            status = "complete"
+        return {"status": status, "eligible_rows": eligible, "column_rows": column_rows, "samples": samples}
+
     def to_record(self, mapping: CsvMapping, workload_id: str) -> OperatorRecord:
         extras: dict[str, Metric] = {}
         for spec in mapping.extra_metrics:
@@ -936,6 +970,13 @@ class _Group:
 
         attributes = {"raw_operator": self.raw_operator}
         attributes.update(self.labels)
+        if mapping.row_semantics == "instance":
+            partial = [
+                name for name in ("flops", "aicore_time_us", "bytes_moved")
+                if 0 < self.extra_count.get(name, 0) < self.calls
+            ]
+            if partial:
+                attributes["partial_metric_inputs"] = ",".join(partial)
         for flag_spec in mapping.row_flags:
             count = self.flag_tasks.get(flag_spec.name, 0)
             extras[f"{flag_spec.name}_tasks"] = Metric(

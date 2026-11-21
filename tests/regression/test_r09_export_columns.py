@@ -132,3 +132,51 @@ def test_wide_export_keeps_pipe_split_metrics(tmp_path: Path) -> None:
     assert not {"mac_time_us", "mte2_time_us", "cube_utilization"} & set(
         table.meta.extra["missing_extra_metrics"]
     )
+
+
+def test_counter_coverage_preserves_missing_empty_partial_and_inapplicable(tmp_path: Path) -> None:
+    from opt_discovery.diagnosis.facts import build_facts
+
+    header = tuple(name for name in HEADER_46 if name != "aic_cube_fops")
+    base = {"Task Start Time(us)": 0, "Task Duration(us)": 10, "aicore_time(us)": 8}
+    rows = [
+        _row(header, {**base, "Task Type": "AI_VECTOR_CORE", "OP Type": "VectorAdd",
+                      "aiv_vector_fops": 1_000, "cube_utilization(%)": 0}),
+        _row(header, {**base, "Task Type": "AI_VECTOR_CORE", "OP Type": "VectorAdd"}),
+        _row(header, {**base, "Task Type": "AI_CORE", "OP Type": "MatMul"}),
+        _row(header, {**base, "Task Type": "COMMUNICATION", "OP Type": "hcom",
+                      "cube_utilization(%)": 50}),
+    ]
+    table = _parse(tmp_path, header, rows)
+    coverage = {row["operator"]: row["metrics"] for row in table.meta.extra["extra_metric_coverage"]}
+    assert coverage["VectorAdd"]["cube_utilization"] == {
+        "status": "partial", "eligible_rows": 2, "column_rows": 2, "samples": 1,
+    }
+    assert coverage["VectorAdd"]["flops"]["status"] == "missing_column"
+    assert coverage["MatMul"]["cube_utilization"]["status"] == "empty"
+    assert coverage["hcom"]["cube_utilization"]["status"] == "not_applicable"
+
+    records = {record.operator: record for record in table.records}
+    assert "cube_utilization" not in records["hcom"].extra
+    assert "cube_utilization" not in records["MatMul"].extra
+    assert records["VectorAdd"].extra["cube_utilization"].value == 0
+    facts = build_facts(records["VectorAdd"], device_profile={"peak_bf16_tflops": 1})
+    assert facts.value("vector_flops") == 1000
+    assert facts.value("aicore_utilization") is None
+    assert facts.value("vector_utilization") is None
+
+
+def test_cube_derived_ratios_require_full_instance_coverage(tmp_path: Path) -> None:
+    from opt_discovery.diagnosis.facts import build_facts
+
+    base = {
+        "Task Type": "AI_CORE", "OP Type": "MatMul", "Task Start Time(us)": 0,
+        "Task Duration(us)": 10, "aicore_time(us)": 8,
+        "Input Shapes": "1,32", "Input Data Types": "DT_BF16",
+    }
+    rows = [_row(HEADER_46, {**base, "aic_cube_fops": 512}), _row(HEADER_46, base)]
+    record, = _parse(tmp_path, HEADER_46, rows).records
+    assert record.extra["flops"].value == 512
+    facts = build_facts(record, device_profile={"peak_bf16_tflops": 1})
+    assert facts.value("aicore_utilization") is None
+    assert facts.value("arithmetic_intensity") is None

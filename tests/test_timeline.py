@@ -211,3 +211,14 @@ def test_sync_verdict_added_to_synchronization_candidates(tmp_path):
     annotate_diagnosis(report, summary)
     caveats = report.candidates()[0].caveats
     assert any("Event/Barrier" in item for item in caveats)
+
+
+def test_submit_per_task_uses_same_rank_as_cann_api(tmp_path):
+    first = _make_db(tmp_path / "first.db", [(0, 100), (200, 300)],
+                     [(100, 120, 0)], names=("aclrtLaunchKernelWithHostArgs",))
+    second = _make_db(tmp_path / "second.db", [(0, 100), (200, 300), (400, 500)], [])
+    result = summarize(first, Window(0, 1000, rounds=(0,)), extra_db_paths=[second]).to_dict()
+    assert result["task_count"] == 5
+    assert result["submit_calls"] == 1
+    assert result["host_rank_task_count"] == 2
+    assert result["submit_per_task"] == pytest.approx(0.5)

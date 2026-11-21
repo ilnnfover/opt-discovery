@@ -55,10 +55,7 @@ od002_authorized_files:
 
 # OD005: broad exceptions may only be swallowed where an explicit cleanup or
 # best-effort path cannot mask the original error.
-od005_allow:
-  - file: opt_discovery/cli.py
-    line: 1457
-    reason: best-effort early input protection; original error is reported before this handler
+od005_allow: []
 
 # OD004: evidence levels may only be written through the controlled gate.
 # Each exemption is an exact file + line + right-hand side, so a second write

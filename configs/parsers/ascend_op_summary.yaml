@@ -111,6 +111,8 @@ extra_metrics:
     columns: ["cube_utilization(%)"]
     unit: "%"
     agg: mean
+    when:
+      task_type: [kernel, other]
   - name: communication_time_us
     # 通信任务的设备时长就是通信时间；仅对 COMMUNICATION 行采集。
     # 单位陷阱：COMMUNICATION 行的 Task Duration 实际是 ns（见已知数据约束 8），
@@ -134,11 +136,15 @@ extra_metrics:
     columns: ["aic_cube_fops"]
     unit: flop
     agg: sum
+    when:
+      task_type: [kernel, other]
   - name: vector_flops
     # Vector 核运算数，单位 FLOPs（口径同上，未单独 micro-benchmark）
     columns: ["aiv_vector_fops"]
     unit: flop
     agg: sum
+    when:
+      task_type: [kernel, other]
   - name: aiv_time_us
     # Vector 流水时间；与 aicore_time 分别对应两种执行单元
     columns: ["aiv_time(us)"]
