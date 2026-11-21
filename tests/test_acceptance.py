@@ -96,3 +96,33 @@ def test_acceptance_failed_comparison(tmp_path):
     report = build_acceptance(tmp_path, comparison)
     assert report.verdict == "incomplete"
     assert report.comparison["status"] == "fail"
+
+
+def test_acceptance_prefill_does_not_require_tokens(tmp_path):
+    """prefill 的 output_length=1，harness 打印 sample，不应被判成缺 token。"""
+    directory = tmp_path / "20260101-000000-prefill-graph"
+    output = directory / "PROF_000001_x" / "mindstudio_profiler_output"
+    output.mkdir(parents=True)
+    (output / "op_summary_0001.csv").write_text(",".join(OP_HEADER) + "\n", encoding="utf-8")
+    rounds = [f"ACTIVE_ROUND {i} start 1.0 end 2.0 sample ' of'" for i in range(2)]
+    (directory / "workload.log").write_text("\n".join(rounds) + "\n", encoding="utf-8")
+    manifest = {
+        "run_id": "prefill-graph",
+        "exit_code": 0,
+        "variables": {"mode": "graph", "graph_mode": "full_and_piecewise", "output_length": 1},
+        "checks": {
+            "ok": True, "active_rounds": 2, "expected_rounds": 2,
+            "out_tokens_per_round": [None, None],
+            "ranks": [
+                {"device": f"device_{i}", "dir": f"PROF_{i}", "db": True,
+                 "db_size_mb": 80.0, "op_summary_csv": 1, "ok": True}
+                for i in range(2)
+            ],
+        },
+    }
+    (directory / "collection_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = build_acceptance(tmp_path)
+    run = report.runs[0]
+    assert run.output_length == 1
+    assert run.problems == []

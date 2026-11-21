@@ -53,6 +53,7 @@ class RunAcceptance:
     expected_rounds: int | None = None
     tokens: list[int] = field(default_factory=list)
     metrics: dict[str, bool] = field(default_factory=dict)
+    output_length: int | None = None
     problems: list[str] = field(default_factory=list)
 
     @property
@@ -70,6 +71,7 @@ class RunAcceptance:
             "active_rounds": self.active_rounds,
             "expected_rounds": self.expected_rounds,
             "tokens": self.tokens,
+            "output_length": self.output_length,
             "metrics": self.metrics,
             "problems": self.problems,
             "ok": self.ok,
@@ -153,8 +155,14 @@ def _check_run(directory: Path, manifest: dict[str, Any]) -> RunAcceptance:
         ],
         active_rounds=rounds or int(checks.get("active_rounds") or 0),
         expected_rounds=int(expected) if expected is not None else None,
-        tokens=tokens or [int(value) for value in checks.get("out_tokens_per_round") or []],
+        tokens=tokens
+        or [
+            int(value)
+            for value in checks.get("out_tokens_per_round") or []
+            if value is not None
+        ],
         metrics=_metric_flags(_op_summary_headers(directory)),
+        output_length=(manifest.get("variables") or {}).get("output_length"),
     )
 
     if run.exit_code not in (0, None):
@@ -170,10 +178,14 @@ def _check_run(directory: Path, manifest: dict[str, Any]) -> RunAcceptance:
             run.problems.append(f"{item['device']}: 缺 op_summary csv")
     if run.expected_rounds is not None and run.active_rounds != run.expected_rounds:
         run.problems.append(f"active_rounds {run.active_rounds} != 期望 {run.expected_rounds}")
-    if not run.tokens:
-        run.problems.append("没有解析到 out_tokens")
-    elif len(set(run.tokens)) != 1:
-        run.problems.append(f"每轮 token 数不一致: {sorted(set(run.tokens))}")
+    # prefill 的 output_length=1，harness 打印的是 sample 而不是 out_tokens，
+    # 因此只在 decode（output_length>1）时强制要求每轮 token 数。
+    expects_tokens = run.output_length is None or run.output_length > 1
+    if expects_tokens:
+        if not run.tokens:
+            run.problems.append("没有解析到 out_tokens")
+        elif len(set(run.tokens)) != 1:
+            run.problems.append(f"每轮 token 数不一致: {sorted(set(run.tokens))}")
     return run
 
 
