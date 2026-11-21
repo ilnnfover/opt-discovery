@@ -16,6 +16,7 @@ msproftx_model.py`` 的查询语句确定：
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,30 @@ __all__ = ["MstxRange", "MstxTrace", "MstxError", "load_mstx", "SYNC_HINTS"]
 #: 名字里带这些片段的范围视为"同步等待"
 SYNC_HINTS = ("sync", "wait", "barrier", "join", "allreduce_wait")
 
-_TABLE = "MsprofTx"
+#: 两种落库形态，优先选有记录的表：
+#:
+#: * ``MsprofTx``   —— msprof CLI ``--msproftx=on``（AscendCL/msTX 路径）落的老表；
+#: * ``MSTX_EVENTS`` —— ``torch_npu.profiler``（``experimental_config(mstx=True)``）
+#:   落的新表。列名不同（``startNs/endNs/eventType/globalTid``），且 ``message``
+#:   与 ``category`` 是 ``STRING_IDS`` 的索引（``4294967295`` 表示无效）。
+#:
+#: 官方明确 PyTorch 场景不支持 ``msprof --msproftx=on`` 采 mstx，所以实际产出的
+#: 往往是 ``MSTX_EVENTS``；只认 ``MsprofTx`` 会把"采到了"误报成"没有开启"。
+_TABLE_SCHEMAS: tuple[tuple[str, dict[str, str]], ...] = (
+    (
+        "MsprofTx",
+        {"start": "start_time", "end": "end_time", "event": "event_type",
+         "message": "message", "tid": "tid", "category": "category"},
+    ),
+    (
+        "MSTX_EVENTS",
+        {"start": "startNs", "end": "endNs", "event": "eventType",
+         "message": "message", "tid": "globalTid", "category": "category"},
+    ),
+)
+
+#: STRING_IDS 里表示"无效索引"的哨兵值
+_INVALID_STRING_ID = 4294967295
 
 
 class MstxError(RuntimeError):
@@ -113,27 +137,46 @@ def _resolve_message(value: Any, strings: dict[int, str] | None) -> str:
     return text or "unknown"
 
 
+def _resolve_category(value: Any, strings: dict[int, str] | None) -> str:
+    """category 在新表里也是 STRING_IDS 索引；哨兵值表示"未设置"。"""
+    if value is None:
+        return ""
+    if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+        index = int(value)
+        if index == _INVALID_STRING_ID:
+            return ""
+        if strings and index in strings:
+            return strings[index]
+        return ""
+    return str(value).strip()
+
+
 def load_mstx(db_path: str | Path, window: Any | None = None) -> MstxTrace:
     path = Path(db_path)
     if not path.is_file():
         raise MstxError(f"{path}: 文件不存在")
 
-    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    with connection:
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as connection:
         tables = _tables(connection)
-        if _TABLE not in tables:
+        matches = [(name, schema) for name, schema in _TABLE_SCHEMAS if name in tables]
+        if not matches:
+            known = " / ".join(name for name, _ in _TABLE_SCHEMAS)
             return MstxTrace(
                 db_path=str(path),
                 available=False,
                 notes=(
-                    f"缺少 {_TABLE} 表：本次采集没有开启 MSTX 打点，"
+                    f"缺少 {known} 表：此库没有 MSTX 打点，"
                     "host_silent 只能停在“无法进一步归因”",
                 ),
             )
-        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({_TABLE})")}
-        required = {"start_time", "end_time", "message"}
+        table, schema = next(
+            (item for item in matches if connection.execute(f"SELECT 1 FROM {item[0]} LIMIT 1").fetchone()),
+            matches[0],
+        )
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        required = {schema["start"], schema["end"], schema["message"]}
         if not required <= columns:
-            raise MstxError(f"{path}: {_TABLE} 列不符，缺少 {sorted(required - columns)}")
+            raise MstxError(f"{path}: {table} 列不符，缺少 {sorted(required - columns)}")
 
         strings: dict[int, str] | None = None
         if "STRING_IDS" in tables:
@@ -142,25 +185,39 @@ def load_mstx(db_path: str | Path, window: Any | None = None) -> MstxTrace:
                 for row in connection.execute("select id, value from STRING_IDS")
             }
 
-        rows = list(
-            connection.execute(
-                f"select start_time, end_time, event_type, message, "
-                f"coalesce(tid, 0), coalesce(category, '') from {_TABLE}"
-            )
+        def pick(key: str, default: str) -> str:
+            column = schema[key]
+            return column if column in columns else default
+
+        start_col, end_col = pick("start", "0"), pick("end", "0")
+        event_col, message_col = pick("event", "0"), pick("message", "message")
+        tid_col, category_col = pick("tid", "0"), pick("category", "''")
+        query = (
+            f"select {start_col}, {end_col}, coalesce({event_col}, 0), "
+            f"coalesce({message_col}, ''), coalesce({tid_col}, 0), "
+            f"coalesce({category_col}, '') from {table}"
         )
+        rows = list(connection.execute(query))
 
     if not rows:
         return MstxTrace(
-            db_path=str(path), available=True, notes=(f"{_TABLE} 表为空（采集时未实际打点）",)
+            db_path=str(path), available=True, notes=(f"{table} 表为空（采集时未实际打点）",)
         )
 
     raw = [
-        (float(start), float(end), int(event or 0), _resolve_message(message, strings),
-         int(tid or 0), str(category or ""))
+        (
+            float(start),
+            float(end),
+            int(event or 0),
+            _resolve_message(message, strings) if message != _INVALID_STRING_ID else "unknown",
+            int(tid or 0),
+            _resolve_category(category, strings) if table == "MSTX_EVENTS" else str(category),
+        )
         for start, end, event, message, tid, category in rows
+        if start is not None and end is not None and end >= start
     ]
 
-    unit = _sniff_unit(raw, window)
+    unit = "ns" if table == "MSTX_EVENTS" or not raw else _sniff_unit(raw, window)
     factor = 1000.0 if unit == "ns" else 1.0
     ranges: list[MstxRange] = []
     for start, end, event, name, tid, category in raw:
@@ -173,8 +230,9 @@ def load_mstx(db_path: str | Path, window: Any | None = None) -> MstxTrace:
         ranges.append(MstxRange(name, start_us, end_us, event, tid, category))
 
     notes = [
-        f"{_TABLE}: {len(raw)} 条打点，窗口内 {len(ranges)} 条",
-        f"时间单位按 {unit} 解释（用窗口落窗率嗅探）",
+        f"{table}: {len(raw)} 条打点，窗口内 {len(ranges)} 条",
+        f"时间单位按 {unit} 解释"
+        + ("（MSTX_EVENTS schema）" if table == "MSTX_EVENTS" else "（用窗口落窗率嗅探）"),
     ]
     if any(item.is_sync for item in ranges):
         notes.append("存在同步类打点（名字含 sync/wait/barrier），可用于支撑 synchronization_bound")

@@ -66,7 +66,7 @@ def test_sparse_data_reports_missing_metrics(ruleset):
 
 
 def test_rich_data_produces_candidates_and_opportunities(ruleset):
-    workload = WorkloadSpec.from_yaml(WORKLOAD_DIR / "prefill_graph.yaml")
+    workload = WorkloadSpec.from_yaml(WORKLOAD_DIR / "prefill_eager.yaml")
     table = build_synthetic_table("rich", workload)
     report = DiagnosisEngine(ruleset).diagnose_table(table)
 
@@ -85,6 +85,23 @@ def test_rich_data_produces_candidates_and_opportunities(ruleset):
             assert opp.missing_evidence, "假设级机会必须说明缺什么证据"
         # 未校准时不得出现 confirmed
         assert opp.evidence_level is not ConfidenceLevel.CONFIRMED
+
+
+def test_graph_scopes_host_and_sync_rules_out_of_operator_diagnosis(ruleset):
+    workload = WorkloadSpec.from_yaml(WORKLOAD_DIR / "prefill_graph.yaml")
+    table = build_synthetic_table("rich", workload)
+    report = DiagnosisEngine(ruleset).diagnose_table(table)
+
+    assert any("sync_wait_us" in record.extra for record in table.records)
+    target_rules = {
+        "launch_bound.host_submit_dominant",
+        "launch_bound.host_gap_dominant",
+        "launch_bound.small_kernel_many_calls",
+        "synchronization_bound.wait_dominant",
+    }
+    for operator in report.operators:
+        states = {item.rule_id: item.status for item in operator.evaluations if item.rule_id in target_rules}
+        assert states == dict.fromkeys(target_rules, "not_applicable")
 
 
 def test_opportunity_ids_are_unique(ruleset):

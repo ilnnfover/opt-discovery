@@ -45,7 +45,7 @@ def test_missing_table_is_reported_not_faked(tmp_path):
     db = _make_db(tmp_path / "p.db", tasks=[(0, 100)], host=[])
     trace = load_mstx(db, Window(0, 1000, rounds=(1,)))
     assert trace.available is False
-    assert "没有开启 MSTX" in trace.notes[0]
+    assert "缺少 MsprofTx / MSTX_EVENTS 表" in trace.notes[0]
 
 
 def test_ranges_are_windowed_and_unit_detected(tmp_path):
@@ -158,3 +158,27 @@ def test_rank_duration_mismatch_flagged_not_silent(tmp_path):
     assert summary.rank_duration_inconsistent is True
     assert any("累计时长相差数倍" in note for note in summary.notes)
     assert not any("不对称" in note for note in summary.notes)
+
+
+def test_torch_mstx_ns_uses_table_schema_and_resolves_string_ids(tmp_path):
+    db = tmp_path / "torch_npu.db"
+    with sqlite3.connect(db) as connection:
+        connection.executescript("""
+            CREATE TABLE STRING_IDS (id INTEGER, value TEXT);
+            INSERT INTO STRING_IDS VALUES (1, 'sync_wait'), (2, 'python');
+            CREATE TABLE MsprofTx (start_time INTEGER, end_time INTEGER, message TEXT);
+            CREATE TABLE MSTX_EVENTS (startNs INTEGER, endNs INTEGER, eventType INTEGER,
+                                      message INTEGER, globalTid INTEGER, category INTEGER);
+            INSERT INTO MSTX_EVENTS VALUES
+                (10000, 30000, 2, 1, 17, 2),
+                (14000, 16000, 2, 1, 18, 4294967295),
+                (20000, 16000, 2, 1, 18, 4294967295);
+        """)
+    trace = load_mstx(db, Window(12, 18, rounds=(1,)))
+    assert trace.available
+    assert trace.unit == "ns"
+    first, second = trace.ranges
+    assert (first.start_us, first.end_us, first.name, first.tid, first.category) == (
+        12, 18, "sync_wait", 17, "python",
+    )
+    assert second.category == ""
