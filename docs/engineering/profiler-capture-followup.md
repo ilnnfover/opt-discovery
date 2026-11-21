@@ -71,3 +71,38 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 判断：异常发生在 `fork` 之后的子进程调用 `set_num_threads` 时。父进程已初始化 OpenMP 线程池，fork 出的 EngineCore 继承了无效的池对象；因此把 `OMP_NUM_THREADS` 调成 1 无法规避——崩溃取决于池对象状态，与线程数无关。下一轮应改多进程启动方式（例如 `VLLM_WORKER_MULTIPROC_METHOD=spawn`），而不是继续调线程数。该改法尚未验证。
 
 本轮未执行严格比较：收集器退出 1、`checks.ok=false`，按门槛不进入 `verify-recapture.sh`。原始产物、`collector.log`、`collection_manifest.json`、`workload.log` 均保留在上述目录。
+
+#### 第三轮补采（改多进程启动方式，成功）
+
+第二轮的判断得到验证：崩溃与线程数无关，改线程数无效。真正的修法是让 EngineCore 不再 `fork`，配合两处配套改动：
+
+| 改动 | 原因 |
+|---|---|
+| `VLLM_WORKER_MULTIPROC_METHOD=spawn` | 避免子进程继承父进程已初始化的 OpenMP 池（`set_num_threads` 断言） |
+| `PYTHONPATH` 追加而非覆盖 | spawn 子进程是全新解释器；覆盖会丢掉 `set_env.sh` 提供的 CANN 路径，worker 报 `No module named 'acl'` |
+| harness 加 `if __name__ == "__main__"` | spawn 会用 `runpy` 重新执行主文件，无保护会递归构建引擎并触发 `bootstrapping phase` 报错 |
+
+`OMP_NUM_THREADS=1`、jemalloc 预加载、显式关闭引擎等第二轮设置全部保留。
+
+采集结果：
+
+| 项 | 值 |
+|---|---|
+| 采集目录 | `/root/prof/opt-eager-audit.f7CaOu/manual-eager.IvFC7q` |
+| 批次目录 | `20261121-151524-decode-eager` |
+| 收集器退出码 | 0 |
+| `checks.ok` | true |
+| rank | device_0 / device_1，各 1 份 `op_summary`，合并库 1011.2 / 1011.9 MB |
+| 轮次 | 5 / 5，`out_tokens` 均为 64 |
+| 排除目录 | 1 个空会话（msprof 二次 attach） |
+
+严格比较（`verify-recapture.sh`）：
+
+| 步骤 | 退出码 | 结果 |
+|---|---:|---|
+| `analyze --strict --rounds 0-3` | 0 | `status=success` |
+| `compare --strict`（Eager vs Graph） | 0 | `status=success` |
+
+**结论**：原始 Eager 批次因 worker 初始化失败无法复现的问题已修复；新采集与原 Graph 表在严格阈值下可比，此前的 `rank_merge_inconsistent` / `rank_duration_inconsistent` 未在新批次上复现。
+
+中间失败记录（同一目录，`smoke-spawn*.log`）：`No module named 'vllm_ascend_split_batch.*'`（工作区副本缺 `.py`，仅剩 `__pycache__`，属既有环境问题、非致命）、`bootstrapping phase`（缺 `__main__` 保护）、`No module named 'acl'`（`PYTHONPATH` 被覆盖）。
