@@ -21,6 +21,7 @@ import os
 import sys
 from pathlib import Path
 
+from .analyzer.acceptance import build_acceptance
 from .analyzer.collection_audit import audit_collection
 from .analyzer.comm import summarize_comm
 from .analyzer.compare import ComparisonReport, compare_tables
@@ -451,8 +452,33 @@ def cmd_check_collection(args: argparse.Namespace) -> int:
     if args.out:
         target = write_json_file(args.out, report.to_dict())
         print(f"-> {target}")
-    # 0=完全通过, 2=数据未齐(非错误), 1=参数不一致/无数据
-    return {"pass": 0, "incomplete": 2, "fail": 1, "no_data": 1}[report.verdict]
+
+    code = {"pass": 0, "incomplete": 2, "fail": 1, "no_data": 1}[report.verdict]
+
+    comparison = getattr(args, "comparison", None)
+    acceptance_path = getattr(args, "acceptance", None)
+    if comparison or acceptance_path:
+        acceptance = build_acceptance(args.dir, comparison)
+        print(f"  [验收] verdict={acceptance.verdict}")
+        for run in acceptance.runs:
+            covered = ",".join(flag for flag, hit in run.metrics.items() if hit) or "none"
+            tokens = sorted(set(run.tokens)) if run.tokens else []
+            print(
+                f"    {run.run_id}: ranks={len(run.ranks)} "
+                f"rounds={run.active_rounds}/{run.expected_rounds} "
+                f"tokens={tokens or '-'} metrics={covered}"
+            )
+            for problem in run.problems:
+                print(f"      ! {problem}")
+        print(f"    比较: {acceptance.comparison['status']}")
+        if acceptance_path:
+            target = write_json_file(acceptance_path, acceptance.to_dict())
+            print(f"-> {target}")
+        # 报告存在阻断项时，退出码与审计结论取更严重的一侧
+        severity = {"pass": 0, "incomplete": 1, "fail": 2, "no_data": 2}
+        worst = max(severity[report.verdict], severity[acceptance.verdict])
+        code = {0: 0, 1: 2, 2: 1}[worst]
+    return code
 
 
 # ---------------------------------------------------------------------------
@@ -2521,7 +2547,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_cc = sub.add_parser("check-collection", help="审计统一补采是否满足参数契约")
     p_cc.add_argument("--dir", default=str(DATA_ROOT / "unified"))
-    p_cc.add_argument("--out", default=None)
+    p_cc.add_argument("--out", default=None, help="契约审计 JSON")
+    p_cc.add_argument("--comparison", default=None, help="compare 产物 JSON（可选，用于验收报告）")
+    p_cc.add_argument("--acceptance", default=None, help="验收报告 JSON 输出路径")
     p_cc.set_defaults(func=cmd_check_collection)
 
     p_cov = sub.add_parser("graph-coverage", help="图覆盖率（FULL/PIECEWISE 覆盖到哪一步）")
