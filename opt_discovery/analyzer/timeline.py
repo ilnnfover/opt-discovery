@@ -137,6 +137,7 @@ class TimelineSummary:
     host_acl_busy_us: float = 0.0
     submit_calls: int = 0
     submit_time_us: float = 0.0
+    host_rank_task_count: int | None = None
     top_acl_names: tuple[tuple[str, int, float], ...] = ()
     device_busy_all_us: float = 0.0
     per_rank: tuple[dict, ...] = ()
@@ -144,6 +145,7 @@ class TimelineSummary:
     rank_duration_inconsistent: bool = False
     mstx_available: bool = False
     mstx_ranges: int = 0
+    mstx_db: str | None = None
     mstx_sync_us: float = 0.0
     silent_covered_by_mstx_us: float = 0.0
     silent_unattributed_us: float = 0.0
@@ -189,6 +191,8 @@ class TimelineSummary:
     @property
     def bottleneck_hint(self) -> str:
         """工作负载级的方向性提示；证据不足时明确返回 undetermined。"""
+        if self.rank_duration_inconsistent:
+            return "undetermined"
         if self.overlap_available:
             if self.comm_exposed_share_of_span >= 0.15:
                 return "communication_exposed"
@@ -202,7 +206,8 @@ class TimelineSummary:
 
     @property
     def submit_per_task(self) -> float:
-        return self.submit_calls / self.task_count if self.task_count else 0.0
+        tasks = self.task_count if self.host_rank_task_count is None else self.host_rank_task_count
+        return self.submit_calls / tasks if tasks else 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -234,10 +239,12 @@ class TimelineSummary:
             "acl_coverage_of_analyzed_idle": round(self.acl_coverage_of_analyzed_idle, 4),
             "submit_calls": self.submit_calls,
             "submit_time_us": self.submit_time_us,
+            "host_rank_task_count": self.host_rank_task_count,
             "submit_per_task": round(self.submit_per_task, 3),
             "top_acl_names": [list(item) for item in self.top_acl_names],
             "mstx_available": self.mstx_available,
             "mstx_ranges": self.mstx_ranges,
+            "mstx_db": self.mstx_db,
             "mstx_sync_us": round(self.mstx_sync_us, 3),
             "silent_covered_by_mstx_us": round(self.silent_covered_by_mstx_us, 3),
             "silent_unattributed_us": round(self.silent_unattributed_us, 3),
@@ -773,7 +780,13 @@ def summarize(
     mstx_available = bool(getattr(mstx, "available", False))
     if mstx_available and getattr(mstx, "ranges", None):
         mstx_ranges = sorted(mstx.ranges, key=lambda item: item.start_us)
-        mstx_sync = float(getattr(mstx, "sync_us", 0.0))
+        mstx_sync = sum(
+            end - start for start, end in _merge(
+                Interval(item.start_us, item.end_us)
+                for item in mstx_ranges
+                if getattr(item, "is_sync", False)
+            )
+        )
         per_name: dict[str, float] = {}
         for gap_start, gap_end in silent_gaps:
             pieces = [
@@ -850,7 +863,7 @@ def summarize(
             )
     if mstx is not None and not mstx_available:
         notes.append(
-            "MSTX 未开启（库里缺少 MsprofTx 表）：host_silent 只能停在“无法进一步归因”，"
+            "MSTX 未开启或当前库缺少对应的打点表：host_silent 只能停在“无法进一步归因”，"
             "需要带打点复采（scripts/enable_mstx.sh）"
         )
     if mstx_available:
@@ -923,9 +936,11 @@ def summarize(
         host_acl_busy_us=host_busy,
         submit_calls=submit_calls,
         submit_time_us=submit_time,
+        host_rank_task_count=per_rank[0]["tasks"] if per_rank else tasks,
         top_acl_names=top_names,
         mstx_available=mstx_available,
         mstx_ranges=len(mstx_ranges),
+        mstx_db=getattr(mstx, "db_path", None) if mstx_available else None,
         mstx_sync_us=mstx_sync,
         silent_covered_by_mstx_us=silent_covered,
         silent_unattributed_us=max(0.0, silent_total - silent_covered),
@@ -939,7 +954,9 @@ def summarize(
     )
 
 
-def annotate_diagnosis(report, summary: TimelineSummary) -> list[str]:  # noqa: ANN001
+def annotate_diagnosis(
+    report, summary: TimelineSummary, *, graph: bool = False,
+) -> list[str]:  # noqa: ANN001
     """Attach workload-level timeline evidence to a diagnosis report.
 
     Returns the appended notes.  Launch/sync candidates get an extra caveat when
@@ -951,8 +968,17 @@ def annotate_diagnosis(report, summary: TimelineSummary) -> list[str]:  # noqa: 
     appended.append(
         f"Timeline（窗口内）：设备空闲 {idle * 100:.1f}%，其中 Host ACL 活动覆盖 "
         f"{acl_share * 100:.1f}% 的空闲时间；下发调用 {summary.submit_calls} 次"
-        f"（{summary.submit_per_task:.2f}/task）"
+        f"（主库 rank {summary.submit_per_task:.2f}/task）"
     )
+
+    if graph:
+        appended.append(
+            "图重放可以一次提交多个设备任务。下发、ACL 覆盖和 gap 归因仅描述 workload 窗口，"
+            "CANN_API 与 TASK 的 connectionId 不用于逐算子关联。"
+        )
+    if summary.rank_duration_inconsistent:
+        appended.append("rank 时长记录不一致，本窗口不提供下发、同步或设备瓶颈判断。")
+        return appended
 
     launched = [c for c in report.candidates() if c.bottleneck == "launch_bound"]
     if idle < 0.10:
@@ -960,6 +986,8 @@ def annotate_diagnosis(report, summary: TimelineSummary) -> list[str]:  # noqa: 
             f"Timeline 证据：设备接近满负荷（空闲 {idle * 100:.1f}%），"
             "下发受限假设缺少空间，应先看 kernel 执行时长"
         )
+    elif not summary.analyzed_gaps:
+        verdict = "Timeline 证据：没有达到归因阈值的 gap，下发受限证据不足"
     elif acl_share >= 0.5:
         verdict = "Timeline 证据：空闲期间 Host 在下发 ACL 调用，支持下发受限假设"
     elif summary.silent_covered_by_mstx_us > 0 and summary.silent_unattributed_us < summary.silent_covered_by_mstx_us:
@@ -974,8 +1002,11 @@ def annotate_diagnosis(report, summary: TimelineSummary) -> list[str]:  # noqa: 
         )
     else:
         verdict = "Timeline 证据：空闲主要由 Host 静默 gap 构成，下发受限假设缺少直接支撑"
-    for candidate in launched:
-        candidate.caveats = tuple(candidate.caveats) + (verdict,)
+    if graph:
+        appended.append(verdict)
+    else:
+        for candidate in launched:
+            candidate.caveats = tuple(candidate.caveats) + (verdict,)
 
     if summary.overlap_available:
         comm_verdict = (
@@ -1003,13 +1034,15 @@ def annotate_diagnosis(report, summary: TimelineSummary) -> list[str]:  # noqa: 
             )
     else:
         sync_verdict = (
-            "Timeline 证据：本数据没有 Event/Barrier 等待区间，"
-            "aclrtSynchronizeStream 平均 <1µs（异步返回），同步受限无法证实"
+            "Timeline 证据：窗口内没有用于识别 Event/Barrier 等等待的 MSTX 区间，同步受限证据不足"
         )
-    for candidate in report.candidates():
-        if candidate.bottleneck == "synchronization_bound":
-            candidate.caveats = tuple(candidate.caveats) + (sync_verdict,)
-    if launched:
+    if graph:
+        appended.append(sync_verdict)
+    else:
+        for candidate in report.candidates():
+            if candidate.bottleneck == "synchronization_bound":
+                candidate.caveats = tuple(candidate.caveats) + (sync_verdict,)
+    if launched and not graph:
         appended.append(
             f"已为 {len(launched)} 个 launch_bound 候选附加 Timeline 证据说明"
             f"（Host ACL 覆盖空闲 {acl_share * 100:.1f}%）"

@@ -186,6 +186,7 @@ rules:
     bottleneck: launch_bound
     description: Host 提交时间显著高于 Device 执行时间
     applies_to:
+      mode: [eager, unknown]
       task_type: [kernel]
     required:
       - {fact: cpu_submit_over_device, op: ">=", threshold: host_overhead_ratio}
@@ -205,6 +206,7 @@ rules:
     description: 大量小算子，疑似下发开销主导（仅假设，未验证）
     allow_hypothesis_only: true
     applies_to:
+      mode: [eager, unknown]
       task_type: [kernel]
     supporting:
       - {fact: calls, op: ">=", threshold: high_call_count}
@@ -222,6 +224,7 @@ rules:
     bottleneck: launch_bound
     description: 提交到启动的间隙显著，疑似下发链路排队
     applies_to:
+      mode: [eager, unknown]
       task_type: [kernel]
     required:
       - {fact: host_gap_over_device, op: ">=", threshold: host_gap_ratio}
@@ -233,9 +236,13 @@ rules:
     caveats:
       - 间隙可能是设备侧排队，不一定是 Host 问题
 
+  # Graph replay hosts submissions at workload scope. Timeline reports its
+  # evidence without assigning replay calls or wait durations to operators.
   - id: synchronization_bound.wait_dominant
     bottleneck: synchronization_bound
     description: 同步等待时间相对 Device 执行时间偏高
+    applies_to:
+      mode: [eager, unknown]
     required:
       - {fact: sync_wait_over_device, op: ">=", threshold: sync_wait_ratio}
     supporting:

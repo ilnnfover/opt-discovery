@@ -227,6 +227,23 @@ def compare_contracts(a: dict[str, Any], b: dict[str, Any]) -> ContractReport:
         )
     )
 
+    collection_a = ((a.get("meta") or {}).get("extra") or {}).get("collection")
+    collection_b = ((b.get("meta") or {}).get("extra") or {}).get("collection")
+    if collection_a and collection_b:
+        for key in ("contract_sha256", "profiling"):
+            left, right = collection_a.get(key), collection_b.get(key)
+            if left is None or right is None:
+                status, note = WARN, "采集清单缺少该字段"
+            elif left == right:
+                status, note = PASS, "采集清单一致"
+            else:
+                status, note = FAIL, "采集参数或指标组不同，无法归因"
+            checks.append(_check(f"collection.{key}", left, right, status, note))
+    elif collection_a or collection_b:
+        checks.append(_check(
+            "collection", bool(collection_a), bool(collection_b), WARN, "一侧未绑定采集清单"
+        ))
+
     # 7. 算子集合与实现路径
     ops_a = {record["operator"] for record in _records(a)}
     ops_b = {record["operator"] for record in _records(b)}

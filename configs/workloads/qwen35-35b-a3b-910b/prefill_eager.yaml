@@ -54,4 +54,5 @@ notes:
 labels:
   stage: profiling
   tp: "2"
+  collection_run_id: prefill-eager
   export_dir: qwen35-prefill

@@ -30,6 +30,11 @@ from pathlib import Path
 import yaml
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from opt_discovery.collectors.profiler_dir import ExportError, inspect_ranks  # noqa: E402
+from opt_discovery.collectors.workload_log import LogParseError, RunLog  # noqa: E402
+
 CONTRACT_PATH = REPO / "configs" / "collection_contract.yaml"
 #: 原始 harness 目录：可选（$NPU_STACK）；未设置时直接用仓库内模板
 SOURCE_HARNESS_DIR = (
@@ -42,9 +47,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def build_harnesses(contract: dict) -> dict[str, Path]:
+def build_harnesses(contract: dict, *, write: bool = True) -> dict[str, Path]:
     """复制 harness 并注入契约里固定的参数，不改动 $NPU_STACK 原文件。"""
-    HARNESS_DIR.mkdir(parents=True, exist_ok=True)
+    if write:
+        HARNESS_DIR.mkdir(parents=True, exist_ok=True)
     fixed = contract["fixed"]
     result: dict[str, Path] = {}
     for run in contract["runs"]:
@@ -104,7 +110,8 @@ def build_harnesses(contract: dict) -> dict[str, Path]:
         # 从后往前替换，避免偏移；上面 zip 顺序即 (后, 前)
 
         target = HARNESS_DIR / run["harness"]
-        target.write_text(text, encoding="utf-8")
+        if write:
+            target.write_text(text, encoding="utf-8")
         result[run["id"]] = target
     return result
 
@@ -116,52 +123,53 @@ def _command(contract: dict, run: dict, harness: Path, dest: Path) -> list[str]:
         *profiling["switches"],
         f"--msproftx={profiling['msproftx']}",
         f"--summary-format={profiling['summary_format']}",
-        f"--output={dest / 'PROF'}",
+        f"--output={dest}",
         f"--application={contract['fixed']['python']} {harness}",
     ]
     return command
 
 
-def _check(dest: Path, contract: dict) -> dict:
+def _check(dest: Path, contract: dict, run: dict) -> dict:
     """返回两 rank 的自检结果；不完整时标记 ok=False 而不是静默通过。"""
-    rank_dirs = sorted((dest / "PROF").glob("PROF_*"))
-    # msprof 会被重复 attach（vLLM 子进程重新初始化），产生额外的 PROF_* 目录。
-    # 按 device 去重，只保留数据量最大的那一份，否则会把 rank 数算多。
-    best: dict[str, tuple[Path, int, list, list]] = {}
-    for rank_dir in rank_dirs:
-        dbs = sorted(rank_dir.glob("msprof_*.db"))
-        out = rank_dir / "mindstudio_profiler_output"
-        summaries = sorted(out.glob("op_summary*.csv")) if out.is_dir() else []
-        if not dbs and not summaries:
-            continue
-        devices = [item.name for item in rank_dir.glob("device_*")]
-        key = devices[0] if devices else rank_dir.name
-        size = max((db.stat().st_size for db in dbs), default=0)
-        if key not in best or size > best[key][1]:
-            best[key] = (rank_dir, size, dbs, summaries)
-    ranks = [
-        {
-            "dir": rank_dir.name,
-            "device": key,
-            "db": bool(dbs),
-            "db_size_mb": round(size / 1e6, 1),
-            "op_summary_csv": len(summaries),
-            "ok": bool(dbs) and bool(summaries),
-        }
-        for key, (rank_dir, size, dbs, summaries) in sorted(best.items())
-    ]
-    duplicates = len(rank_dirs) - len(ranks)
-    log = dest / "workload.log"
-    rounds = len(re.findall(r"ACTIVE_ROUND \d+", log.read_text(errors="replace"))) if log.is_file() else 0
+    errors: list[str] = []
+    ranks = []
+    excluded: dict[str, str] = {}
+    try:
+        exports, excluded = inspect_ranks(dest)
+        for rank in exports:
+            size = max((db.stat().st_size for db in rank.msprof_dbs), default=0)
+            ranks.append({
+                "dir": rank.directory.name,
+                "device": rank.device,
+                "db": bool(rank.msprof_dbs),
+                "db_size_mb": round(size / 1e6, 1),
+                "op_summary_csv": len(rank.op_summary_files),
+                "ok": bool(rank.msprof_dbs and rank.op_summary_files),
+            })
+    except (ExportError, OSError) as exc:
+        errors.append(str(exc))
+
+    rounds = ()
+    try:
+        rounds = RunLog.parse(dest / "workload.log").rounds
+    except (LogParseError, OSError) as exc:
+        errors.append(str(exc))
     expected = contract["fixed"]["active_rounds"]
+    output_tokens = [item.output_tokens for item in rounds]
     return {
         "ranks": ranks,
-        "duplicate_prof_dirs": max(0, duplicates),
-        "active_rounds": rounds,
+        "duplicate_prof_dirs": len(excluded),
+        "excluded_prof_dirs": excluded,
+        "active_rounds": len(rounds),
         "expected_rounds": expected,
-        "ok": len(ranks) == contract["fixed"]["tensor_parallel_size"]
+        "out_tokens_per_round": output_tokens,
+        "errors": errors,
+        "ok": not errors
+        and len(ranks) == contract["fixed"]["tensor_parallel_size"]
         and all(item["ok"] for item in ranks)
-        and rounds == expected,
+        and tuple(item.index for item in rounds) == tuple(range(expected))
+        and all(item.duration_us > 0 for item in rounds)
+        and all(value in (None, run["output_length"]) for value in output_tokens),
     }
 
 
@@ -272,11 +280,12 @@ def main() -> int:
         print(f"[preflight] {run_id}: {detail}", flush=True)
         return 0
     contract_sha = hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest()[:16]
-    harnesses = build_harnesses(contract)
+    harnesses = build_harnesses(contract, write=not args.dry_run)
     if args.out_root is None:
         args.out_root = str(Path(os.environ.get("PROF_ROOT", "exports")) / "unified")
     out_root = Path(args.out_root)
-    out_root.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        out_root.mkdir(parents=True, exist_ok=True)
 
     env = {k: v for k, v in os.environ.items()}
     for key in contract.get("unset_environment") or ():
@@ -294,21 +303,22 @@ def main() -> int:
         if code:
             return code
         dest = out_root / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{run['id']}"
-        dest.mkdir(parents=True, exist_ok=True)
         command = _command(contract, run, harnesses[run["id"]], dest)
         print(f"\n=== [{index}/{len(runs)}] {run['id']}  dest={dest}", flush=True)
         print("   " + " ".join(command), flush=True)
         if args.dry_run:
             continue
 
+        dest.mkdir()
         started = _now()
         with (dest / "workload.log").open("w", encoding="utf-8") as handle:
             rc = subprocess.call(command, stdout=handle, stderr=subprocess.STDOUT, env=env)
-        checks = _check(dest, contract)
+        checks = _check(dest, contract, run)
         manifest = {
             "contract_id": contract["contract_id"],
             "contract_sha256": contract_sha,
             "run_id": run["id"],
+            "export_dir": ".",
             "fixed": contract["fixed"],
             "profiling": contract["profiling"],
             "variables": {k: run[k] for k in ("mode", "graph_mode", "output_length")},
@@ -329,8 +339,11 @@ def main() -> int:
             f"op_summary={[r['op_summary_csv'] for r in checks['ranks']]} ok={checks['ok']}",
             flush=True,
         )
-        if not checks["ok"]:
+        if rc != 0 or not checks["ok"]:
             print(f"   [WARN] {run['id']} 自检未通过，详情见 collection_manifest.json", file=sys.stderr)
+
+    if args.dry_run:
+        return 0
 
     summary = out_root / "collection_summary.json"
     summary.write_text(
@@ -342,7 +355,7 @@ def main() -> int:
                 "runs": [
                     {
                         "run_id": m["run_id"],
-                        "ok": m["checks"]["ok"],
+                        "ok": m["exit_code"] == 0 and m["checks"]["ok"],
                         "ranks": len(m["checks"]["ranks"]),
                         "exit_code": m["exit_code"],
                     }
@@ -355,7 +368,7 @@ def main() -> int:
         encoding="utf-8",
     )
     print(f"\n-> {summary}", flush=True)
-    return 0 if all(m["checks"]["ok"] for m in manifest_all) else 1
+    return 0 if all(m["exit_code"] == 0 and m["checks"]["ok"] for m in manifest_all) else 1
 
 
 if __name__ == "__main__":

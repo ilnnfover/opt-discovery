@@ -125,7 +125,11 @@ def audit_collection(
         )
     )
 
-    checks = {item["run_id"]: (item.get("checks") or {}).get("ok", False) for item in manifests}
+    checks = {
+        item["run_id"]: item.get("exit_code", 0) == 0
+        and (item.get("checks") or {}).get("ok") is True
+        for item in manifests
+    }
     items.append(
         AuditItem(
             "per_run_checks",

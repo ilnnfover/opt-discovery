@@ -189,29 +189,58 @@ COMMUNICATION 行时长单位是 ns（其余 µs），且两 rank 任务数相�
 
 统计取**并集**而非累加（同一空洞内多线程并发事件若累加，覆盖率会算出 4593%）。
 
-| Workload | 空闲 | ACL 覆盖空闲 | 下发/task |
-|---|---|---|---|
-| decode-eager | 42.2% | 74.8% | 1.06 |
-| decode-graph | 15.9% | 25.9% | 0.05 |
-| prefill-eager | 64.2% | 31.4% | 0.93 |
-| prefill-graph | 44.9% | 28.3% | 0.48 |
+`submit_per_task` 使用主库的 Host 下发调用数与同一 rank 的任务数
+（`host_rank_task_count`）。`task_count` 仍是所有已分析 rank 的任务总数。
+ACL 覆盖描述主库 Host 活动与已分析设备空洞的时间重叠。图重放可以一次提交多个任务。
+Graph 下发与同步提示仅写入 workload 的 `diagnosis.json` 说明及 `timeline.json`。
+CANN_API 和 TASK 的 `connectionId` 无法提供可用的逐算子关联。
 
-结论会自动注入对应候选的 `caveats`，例如 decode 的 `launch_bound` 会被标注
-"设备接近满负荷（空闲 15.9%），下发受限假设缺少空间"。
+PyTorch MSTX 需要在发出打点的进程中启用
+`torch_npu.profiler._ExperimentalConfig(mstx=True)`（旧版使用 `msprof_tx=True`），
+并启用 DB 导出。若由 vLLM-Ascend WorkerProfiler 启停采集，须在 worker 的配置中启用该开关。
+应用可以使用 `MSTX_TRACE_DIR` 作为 trace handler 的输出目录。
+[Ascend PyTorch Profiler](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0033.html)
 
-MSTX 可用性（2026-11-16 复核更正）：msprof CLI 的 `--msproftx=on` **不支持** PyTorch 场景
-（官方文档明确），正确用法是 `torch_npu.profiler` + `_ExperimentalConfig(mstx=True)`——
-已在 910B2 实测可用（range/marker 全部落盘，可传 stream 关联 device 侧活动）。
-`scripts/enable_mstx.sh` 待按此更正。
+```bash
+./scripts/enable_mstx.sh /path/to/new-trace -- python /path/to/configured_harness.py
+opt-discovery timeline --export /path/to/capture --workload configs/workloads/qwen35-35b-a3b-910b/decode_graph.yaml \
+  --mstx-db /path/to/same-rank-trace/ascend_pytorch_profiler_0.db --out /path/to/timeline.json
+```
+
+`enable_mstx.sh` 启动已配置的 harness 并检查是否导出实际 MSTX 记录。
+独立库须来自同次采集的同一 rank，并有落在分析窗口内的有效区间。
+单独复跑的 MSTX trace 应按它自己的采集窗口审阅。
 
 ### Eager vs Graph：先过契约，再比较
+
+统一补采脚本将 `PROF_*` 直接写入批次目录。读取端也支持旧的 `PROF/PROF_*`，
+可用 `--export` 直接指定带时间戳的批次目录。批量 `analyze` 按 workload YAML 的
+`labels.collection_run_id` 查找采集清单，历史固定目录仍使用 `labels.export_dir`。
+同一个 run ID 有多份采集时，将选定的一份放在单独的导出根下。
+默认分析窗口以清单的 `fixed.window_rounds` 为准。实采轮数由 `active_rounds` 与日志核对，
+可以通过 `--rounds 0-4` 显式分析全部五轮。
+
+| 实采指标组 | 采集字段 | 分析事实 | 条件 |
+|---|---|---|---|
+| PipeUtilization | `cube_utilization(%)` | `cube_utilization` | 对有效样本取均值，再按百分比归一化 |
+| ArithmeticUtilization | `aic_cube_fops` | `flops`、`aicore_utilization` | 利用率另需 Cube 流水时间与设备 BF16 峰值 |
+| ArithmeticUtilization | `aiv_vector_fops` | `vector_flops` | Vector 峰值尚未标定，保留实测计数 |
+| ArithmeticUtilization | `aic_cube_fops`、输入输出 Shape 与 dtype | `arithmetic_intensity` | 依赖估算搬运字节，口径为 Cube FLOPs / bytes |
+
+同次采集只选一组 `--aic-metrics`。上表对应当前实采的 33/46 列导出。
+仪表组记在 `meta.extra.collection.profiling`，
+实际列覆盖见 `meta.extra.extra_metric_coverage`，其中 `missing_column`、`empty`、
+`partial`、`complete` 和 `not_applicable` 区分缺列、全空、部分采到、完整和不适用。
+缺测值保留为空，采集组变化会触发比较契约检查。
+Cube 派生比率要求相关列覆盖同一批实例。分子或分母仅覆盖部分实例时保留已测计数，
+暂不产出 `aicore_utilization` 或 `arithmetic_intensity`。
 
 ```bash
 check-runs --a out/steady/<wl-a> --b out/steady/<wl-b>
 ```
 
-检查 9 项：阶段、硬件、输入形状、采集参数（`max_num_seqs` / `cudagraph_capture_sizes` / `concurrency`）、
-窗口轮次、算子集合、**通信字节量**、记录数。任一 `fail` 即判 `incomparable`，明确拒绝出结论。
+检查阶段、硬件、输入形状、采集参数、窗口轮次、算子集合、通信字节量与记录数。
+两侧都有采集清单时再检查契约哈希和仪表组。任一项目失败即判 `incomparable`。
 
 `compare` 另外会自动告警：执行模式不同、Graph 下算子集合收缩（71 → 44 个，
 "消失的算子" ≠ 未执行）、采集参数差异。

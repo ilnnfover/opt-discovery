@@ -111,7 +111,7 @@ from .schemas.quality import (
 )
 from .schemas.quality import attach as attach_quality
 from .schemas.quality import blocking as blocking_quality
-from .schemas.workload import WorkloadSpec
+from .schemas.workload import ExecutionMode, WorkloadSpec
 from .source_analysis.mapping import (
     DEFAULT_REPOS,
     attach_to_opportunities,
@@ -368,23 +368,33 @@ def cmd_timeline(args: argparse.Namespace) -> int:
 
     bundle = discover_bundle(args.workload, args.export)
     rank = bundle.rank(args.rank)
-    db_files = sorted(rank.directory.glob("msprof_*.db"))
+    db_files = rank.msprof_dbs
     if not db_files:
         print(f"{rank.directory}: 未找到 msprof_*.db", file=sys.stderr)
         return 2
     db = db_files[0]
+    mstx_db = Path(args.mstx_db) if args.mstx_db else db
+    if args.out and any(_same_file(Path(args.out), path) for path in (*db_files, mstx_db)):
+        print("timeline 输出不能覆盖输入数据库", file=sys.stderr)
+        return 2
 
     window = None
-    if args.rounds:
+    if args.rounds != "":
         if bundle.run_log is None:
             print("缺少 workload.log，无法按轮次切窗", file=sys.stderr)
             return 2
-        window = select_rounds_window(bundle.run_log, _parse_rounds(args.rounds))
+        selected_rounds = (
+            _parse_rounds(args.rounds) if args.rounds else bundle.window_rounds or (1, 2, 3, 4)
+        )
+        window = select_rounds_window(bundle.run_log, selected_rounds)
 
-    mstx = load_mstx(db, window)
-    summary = summarize_timeline(
-        db, window, min_gap_us=args.min_gap_us, mstx=mstx, extra_db_paths=db_files[1:]
-    )
+    mstx = load_mstx(mstx_db, window)
+    if args.mstx_db and (
+        window is None or not any(item.duration_us > 0 for item in mstx.ranges)
+    ):
+        print("外部 MSTX 库必须来自同次采集，并在 workload 窗口内包含有效区间", file=sys.stderr)
+        return 2
+    summary = summarize_timeline(db, window, min_gap_us=args.min_gap_us, mstx=mstx)
     target = summary.write_json(args.out) if args.out else None
 
     print(f"[timeline] {bundle.workload_id}  rank={rank.rank}  db={db.name}")
@@ -824,7 +834,7 @@ def cmd_comm(args: argparse.Namespace) -> int:
 
     bundle = discover_bundle(args.workload, args.export)
     rank = bundle.rank(args.rank)
-    db_files = sorted(rank.directory.glob("msprof_*.db"))
+    db_files = rank.msprof_dbs
     if not db_files:
         print(f"{rank.directory}: 未找到 msprof_*.db", file=sys.stderr)
         return 2
@@ -863,7 +873,7 @@ def cmd_check_ranks(args: argparse.Namespace) -> int:
     from .collectors import discover_bundle
 
     bundle = discover_bundle(args.workload, args.export)
-    rounds = _parse_rounds(args.rounds)
+    rounds = _parse_rounds(args.rounds) if args.rounds else bundle.window_rounds or (1, 2, 3, 4)
     window = select_rounds_window(bundle.run_log, rounds) if bundle.run_log else None
 
     parser = MappingCsvParser(CsvMapping.load(args.summary_mapping))
@@ -1454,8 +1464,9 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                     for path in sorted(workloads_dir.glob("*.yaml"))
                 ]
             )
-        except Exception:  # noqa: BLE001 - 保护尽力而为，不能掩盖原始错误
-            pass
+        except Exception as protect_exc:  # noqa: BLE001 - 保留原始输出失败
+            print(f"[analyze] 输入保护检查失败: {_redact_error(protect_exc, (exports_root, workloads_dir))}",
+                  file=sys.stderr)
         _output_dir_failure(detail)
         return MANIFEST_EXIT_FAILED
 
@@ -1639,14 +1650,17 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         return MANIFEST_EXIT_FAILED
     by_id = {bundle.workload_id: bundle for bundle in bundles}
     for workload in expected_workloads:
-        if workload.labels.get("export_dir") and workload.workload_id not in by_id:
+        if (
+            (workload.labels.get("export_dir") or workload.labels.get("collection_run_id"))
+            and workload.workload_id not in by_id
+        ):
             missing_exports.append(workload.workload_id)
             workload_records.append(
                 WorkloadRecord(workload.workload_id, "failed", reason_code="missing_export")
             )
     if not bundles:
         print(
-            "没有找到可用导出：请确认 workload YAML 中的 labels.export_dir 指向 "
+            "没有找到可用导出：请确认 workload YAML 的 collection_run_id 或 export_dir 匹配 "
             f"{args.exports_root} 下的目录",
             file=sys.stderr,
         )
@@ -1657,17 +1671,19 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     for bundle in bundles:
         if bundle.run_log is not None:
             _protect(Path(bundle.run_log.path))
+            if bundle.collection is not None:
+                _protect(Path(bundle.run_log.path).with_name("collection_manifest.json"))
         for rank_export in bundle.ranks:
             for csv_path in rank_export.op_summary_files:
                 _protect(csv_path)
             if rank_export.op_report_db:
                 _protect(rank_export.op_report_db)
-            for db_path in rank_export.directory.glob("msprof_*.db"):
+            for db_path in rank_export.msprof_dbs:
                 _protect(db_path)
 
     # 2) 配置加载：失败时也要写本轮 failed 清单，不能保留旧 success 状态
     try:
-        rounds = _parse_rounds(args.rounds)
+        rounds = _parse_rounds(args.rounds) if args.rounds is not None else None
         mapping = CsvMapping.load(args.summary_mapping)
         parser = MappingCsvParser(mapping)
         ruleset = load_ruleset(args.rules, args.thresholds)
@@ -1684,7 +1700,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     tables: dict[str, OperatorTable] = {}
     all_opportunities: dict[str, list] = {}
     print(
-        f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds}，rank={args.rank}，"
+        f"[analyze] {len(bundles)} 个 export，窗口 rounds={rounds or 'auto'}，rank={args.rank}，"
         f"strict={strict}，run_id={run_id}"
     )
     for bundle in bundles:
@@ -1697,7 +1713,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             )
             continue
         try:
-            window = select_rounds_window(bundle.run_log, rounds)
+            window = select_rounds_window(bundle.run_log, rounds or bundle.window_rounds or (1, 2, 3, 4))
             rank = bundle.rank(args.rank)
         except Exception as exc:  # noqa: BLE001 - 逐 Workload 报告，不中断整批
             print(f"  - {workload_id}: 窗口/rank 失败（{_error(exc)}）")
@@ -1726,6 +1742,11 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                 )
             )
             continue
+        if bundle.collection is not None:
+            table.meta.extra["collection"] = {
+                key: bundle.collection.get(key)
+                for key in ("contract_sha256", "run_id", "started_at", "profiling")
+            }
         tables[workload_id] = table
         quality_flags: list = []
 
@@ -1783,10 +1804,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         db_files: list[Path] = []
         db_ranks = 0
         for item in bundle.ranks:
-            found = sorted(item.directory.glob("msprof_*.db"))
+            found = item.msprof_dbs
             if found:
                 db_ranks += 1
-            db_files.extend(found)
+                db_files.append(found[0])
 
         # R10 + timeline 覆盖：只有“必须执行 timeline”时，缺 DB 才算质量异常
         if skip_timeline:
@@ -1860,7 +1881,10 @@ def cmd_analyze(args: argparse.Namespace) -> int:
                         db_files[0], window, mstx=mstx, extra_db_paths=db_files[1:]
                     )
                     report.notes = report.notes + tuple(
-                        annotate_with_timeline(report, timeline)
+                        annotate_with_timeline(
+                            report, timeline,
+                            graph=bundle.workload.execution.mode is ExecutionMode.GRAPH,
+                        )
                     )
                     _guard_output(out / workload_id / "timeline.json")
                     timeline.write_json(out / workload_id / "timeline.json")
@@ -2478,8 +2502,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_timeline = sub.add_parser("timeline", help="设备空洞归因（TASK + CANN_API）")
     p_timeline.add_argument("--export", default=str(DATA_ROOT / "qwen35-prefill"))
     p_timeline.add_argument("--workload", required=True)
-    p_timeline.add_argument("--rounds", default="1-4")
+    p_timeline.add_argument("--rounds", help="默认使用采集清单的 window_rounds，历史导出使用 1-4")
     p_timeline.add_argument("--rank", type=int, default=0)
+    p_timeline.add_argument("--mstx-db", help="同次采集、同 rank 的独立 MSTX 数据库")
     p_timeline.add_argument("--min-gap-us", type=float, default=100.0)
     p_timeline.add_argument("--out", default=None)
     p_timeline.set_defaults(func=cmd_timeline)
@@ -2488,7 +2513,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ranks.add_argument("--export", required=True)
     p_ranks.add_argument("--workload", required=True)
     p_ranks.add_argument("--summary-mapping", default=str(SUMMARY_MAPPING))
-    p_ranks.add_argument("--rounds", default="1-4")
+    p_ranks.add_argument("--rounds", help="默认使用采集清单的 window_rounds，历史导出使用 1-4")
     p_ranks.add_argument(
         "--strict", action="store_true", help="rank 不一致时以退出码 3 结束（默认仍为 0）"
     )
@@ -2634,7 +2659,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--summary-mapping", default=str(SUMMARY_MAPPING))
     p_analyze.add_argument("--rules", default=str(DEFAULT_RULES))
     p_analyze.add_argument("--thresholds", default=None)
-    p_analyze.add_argument("--rounds", default="1-4")
+    p_analyze.add_argument("--rounds", help="默认使用采集清单的 window_rounds，历史导出使用 1-4")
     p_analyze.add_argument("--rank", type=int, default=0)
     p_analyze.add_argument("--top", type=int, default=12)
     p_analyze.add_argument("--out", default="out/steady")
