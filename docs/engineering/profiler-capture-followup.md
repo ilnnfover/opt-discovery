@@ -46,13 +46,12 @@ CodeBuddy 在隔离工作目录使用既有 Eager 契约。采集脚本的实验
 
 #### 第二轮补采（OMP_NUM_THREADS=1 + jemalloc 预加载）
 
-为规避首轮 worker 初始化阶段的 OpenMP 线程池异常，第二轮把 `OMP_NUM_THREADS=1` 提前到 Python 启动前，并预加载 jemalloc（`LD_PRELOAD=/usr/lib64/libjemalloc.so.2:`），其余沿用同一契约和隔离 harness（最后一轮结束后显式关闭引擎）。
+为规避首轮 worker 初始化阶段的 OpenMP 线程池异常，第二轮把 `OMP_NUM_THREADS=1` 提前到 Python 启动前，并通过 `LD_PRELOAD` 预加载 jemalloc。其余沿用同一契约和隔离 harness，最后一轮结束后显式关闭引擎。
 
 本轮没有再出现显存不足，但仍然在 worker 初始化阶段崩溃，完成 0 轮。
 
 | 项 | 值 |
 |---|---|
-| 采集目录 | `/root/prof/opt-eager-audit.f7CaOu/manual-eager.t4cNoB` |
 | 批次目录 | `20261121-141744-decode-eager` |
 | 收集器退出码 | 1 |
 | `checks.ranks` | 空；两个 `PROF_*` 均判为 `no_operator_export` |
@@ -68,13 +67,13 @@ This process (pid=485842) is multi-threaded, use of fork() may lead to deadlocks
 Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.cpp:64
 ```
 
-判断：异常发生在 `fork` 之后的子进程调用 `set_num_threads` 时。父进程已初始化 OpenMP 线程池，fork 出的 EngineCore 继承了无效的池对象；因此把 `OMP_NUM_THREADS` 调成 1 无法规避——崩溃取决于池对象状态，与线程数无关。下一轮应改多进程启动方式（例如 `VLLM_WORKER_MULTIPROC_METHOD=spawn`），而不是继续调线程数。该改法尚未验证。
+日志显示异常发生在 `fork` 之后的子进程调用 `set_num_threads` 时。预设 `OMP_NUM_THREADS=1` 后仍然复现，下一轮改用 `VLLM_WORKER_MULTIPROC_METHOD=spawn`。
 
-本轮未执行严格比较：收集器退出 1、`checks.ok=false`，按门槛不进入 `verify-recapture.sh`。原始产物、`collector.log`、`collection_manifest.json`、`workload.log` 均保留在上述目录。
+本轮收集器退出 1，`checks.ok=false`，严格比较为 NOT_RUN。
 
 #### 第三轮补采（改多进程启动方式，成功）
 
-第二轮的判断得到验证：崩溃与线程数无关，改线程数无效。真正的修法是让 EngineCore 不再 `fork`，配合两处配套改动：
+补采使用以下启动设置，最终完成五轮。
 
 | 改动 | 原因 |
 |---|---|
@@ -84,27 +83,27 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 
 `OMP_NUM_THREADS=1`、jemalloc 预加载、显式关闭引擎等第二轮设置全部保留。
 
-采集结果：
-
 | 项 | 值 |
 |---|---|
-| 采集目录 | `/root/prof/opt-eager-audit.f7CaOu/manual-eager.IvFC7q` |
 | 批次目录 | `20261121-151524-decode-eager` |
 | 收集器退出码 | 0 |
 | `checks.ok` | true |
 | rank | device_0 / device_1，各 1 份 `op_summary`，合并库 1011.2 / 1011.9 MB |
 | 轮次 | 5 / 5，`out_tokens` 均为 64 |
-| 排除目录 | 1 个空会话（msprof 二次 attach） |
+| 结束元数据 | 两个主会话均有 host 和 device 的 `end_info` 及对应 `.done` |
+| 排除目录 | 1 个无算子导出的会话，标记为 `no_operator_export` |
 
-严格比较（`verify-recapture.sh`）：
+分析采用第 0–3 轮，Graph 输入沿用原 Decode Graph 的同窗口产物。
 
 | 步骤 | 退出码 | 结果 |
 |---|---:|---|
-| `analyze --strict --rounds 0-3` | 0 | `status=success` |
-| `compare --strict`（Eager vs Graph） | 0 | `status=success` |
+| `analyze --strict --rounds 0-3` | 0 | PASS，`status=success`，`quality_flags=[]` |
+| `compare --strict`（Eager vs Graph） | 0 | PASS，`status=success`，`comparison_status=success`，`comparable=true` |
 
-**结论**：原始 Eager 批次因 worker 初始化失败无法复现的问题已修复；新采集与原 Graph 表在严格阈值下可比，此前的 `rank_merge_inconsistent` / `rank_duration_inconsistent` 未在新批次上复现。
+在 `b8c9162` 独立复跑以上两项，退出码和结果一致。`python scripts/verify_summary.py --out "$VERIFY_OUT"` 退出 0，其中 `make check` 和 `make verify` 均为 PASS，测试 529 通过、29 跳过。该轮工程验证的历史真实回归为 NOT_RUN，补采数据由上表的两条命令独立验收。
+
+补采的 rank 0 与 rank 1 分别记录 362,116 和 362,107 次调用，算子累计时长分别为 2.626 s 和 2.578 s，`rank_quality.consistent=true`。原批次的 rank 时长异常和后续补采尝试的 worker 初始化失败均未在本次补采出现。Graph/Eager 的 `total_ratio=1.3163` 表示算子累计时长比。两批使用的进程启动方式分别为 `fork` 和 `spawn`，端到端性能归因仍需要同启动设置的对照。
 
 中间失败记录（同一目录，`smoke-spawn*.log`）：`No module named 'vllm_ascend_split_batch.*'`（工作区副本缺 `.py`，仅剩 `__pycache__`，属既有环境问题、非致命）、`bootstrapping phase`（缺 `__main__` 保护）、`No module named 'acl'`（`PYTHONPATH` 被覆盖）。
 
-`__main__` 保护已同步到仓库的四个 harness 模板（`scripts/harness/qwen35-*.py`），因此用 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 时不需要再对副本做临时改造。`collect_contract.build_harnesses` 的注入（`max_num_seqs`、轮数、flush 等待）在包裹后仍然生效，已用临时副本回归验证。
+`__main__` 保护已同步到仓库的四个 harness 模板（`scripts/harness/qwen35-*.py`）。在临时输出目录用 `recollect_contract.build_harnesses` 生成四份脚本，确认预热与采集轮数的覆盖参数生效，且以 `__mp_main__` 加载时未创建 vLLM 引擎。补采阶段的真实 NPU 验收涵盖 Decode Eager。
