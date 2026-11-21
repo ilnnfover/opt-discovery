@@ -106,3 +106,5 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 **结论**：原始 Eager 批次因 worker 初始化失败无法复现的问题已修复；新采集与原 Graph 表在严格阈值下可比，此前的 `rank_merge_inconsistent` / `rank_duration_inconsistent` 未在新批次上复现。
 
 中间失败记录（同一目录，`smoke-spawn*.log`）：`No module named 'vllm_ascend_split_batch.*'`（工作区副本缺 `.py`，仅剩 `__pycache__`，属既有环境问题、非致命）、`bootstrapping phase`（缺 `__main__` 保护）、`No module named 'acl'`（`PYTHONPATH` 被覆盖）。
+
+`__main__` 保护已同步到仓库的四个 harness 模板（`scripts/harness/qwen35-*.py`），因此用 `VLLM_WORKER_MULTIPROC_METHOD=spawn` 时不需要再对副本做临时改造。`collect_contract.build_harnesses` 的注入（`max_num_seqs`、轮数、flush 等待）在包裹后仍然生效，已用临时副本回归验证。
