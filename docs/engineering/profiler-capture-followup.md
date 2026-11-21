@@ -108,9 +108,23 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 
 `__main__` 保护已同步到仓库的四个 harness 模板（`scripts/harness/qwen35-*.py`）。在临时输出目录用 `recollect_contract.build_harnesses` 生成四份脚本，确认预热与采集轮数的覆盖参数生效，且以 `__mp_main__` 加载时未创建 vLLM 引擎。补采阶段的真实 NPU 验收涵盖 Decode Eager。
 
-## MSTX 采集（已验证可落库）
+## Decode Eager 与 Graph 同设置复采
 
-`msprof --msproftx=on` 对 PyTorch 进程采不到 mstx：最小复现里 `torch.npu.mstx.range_start` 恒返回 0，库里只有 `ENUM_MSTX_EVENT_TYPE`。可用路径是进程内 `torch_npu.profiler` + `experimental_config(mstx=True)`；`vllm_ascend` 把 `msprof_tx` 写死为 `False`，需要外部覆盖。
+补采批次为 `20261121-151524-decode-eager` 和 `20261121-164851-decode-graph`。两批均使用 `spawn`、`OMP_NUM_THREADS=1`、TP=2 及相同的 ArithmeticUtilization 和 HBM 采集配置。两份采集清单均为 `checks.ok=true`，每组都有两张卡和五轮各 64 个输出 token。
+
+| 第 0–3 轮 | Decode Eager | Decode Graph |
+|---|---:|---:|
+| 单次请求耗时中位数（s） | 14.452 | 1.091 |
+| rank 0 算子累计时长（s） | 2.626 | 3.464 |
+| rank 1 / rank 0 累计时长比 | 0.981666 | 1.000463 |
+
+请求耗时由同轮 `ACTIVE_ROUND` 的 `end - start` 得出。本次带 profiler 的采集中，Eager/Graph 请求耗时中位数比为 13.24，Graph/Eager 算子累计时长比为 1.3192。`operator_table.json` 的 `rank_quality.consistent` 均为 true，质量标记为空。Graph 与 Eager 的 HCCL 记录计数口径不同，比较产物给出的通信字节量比为 1.014。
+
+独立复跑 `python -m opt_discovery.cli analyze --strict --rounds 0-3 --exports-root "$PAIR_EXPORTS" --workloads-dir "$PAIR_WORKLOADS" --out "$PAIR_OUT"`，退出 0。再用两份 `operator_table.json` 执行 `python -m opt_discovery.cli compare --strict --a "$EAGER_TABLE" --b "$GRAPH_TABLE" --out-dir "$COMPARE_OUT"`，退出 0，`comparable=true`，`reasons=[]`。
+
+## MSTX 采集与离线导出
+
+`enable_mstx.sh` 通过 `VLLM_MSTX_PATCH=1` 安装进程内补丁，启用 `_ExperimentalConfig` 的 `mstx`（旧版为 `msprof_tx`）和 DB 格式，并挂点到 vLLM-Ascend 的 worker 与 runner。harness 负责配置 torch profiler 和调用 `start_profile()`、`stop_profile()`。
 
 三个必要条件：
 
@@ -118,7 +132,7 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 2. **挂点必须挂 Ascend 的子类**：`vllm_ascend.worker.worker.NPUWorker` 与 `vllm_ascend.worker.model_runner_v1.NPUModelRunner`。只挂上游 `GPUModelRunner` 不会触发——首轮实测静默覆盖率 0%。
 3. **`llm.stop_profile()` 的在线导出会被 RPC 超时打断**（`RuntimeError: cancelled` → EngineCore 退出），raw 目录完整但 db 未生成；用 `scripts/mstx/export_offline.sh <rank 目录> --with-text` 离线 `--parse/--export` 即可补齐。
 
-短跑验证（Graph、2 轮、`/root/prof/opt-eager-audit.f7CaOu/mstx-short`，每 rank 一个 `_ascend_pt`）：
+Graph 两轮短跑使用同样的 profiler 开关覆盖和挂点。每 rank 有一份 `_ascend_pt`，下表为 rank 0 窗口内的记录。
 
 | 打点 | 次数 | 合计 | 每次 |
 |---|---:|---:|---:|
@@ -128,6 +142,29 @@ Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.c
 | `sync_wait_stream` | 126 | 15.49 ms | 0.12 ms |
 | `sync_wait_device` | 1 | 0.16 ms | — |
 
-同一次采集、同一 rank 的库里同时有 `TASK` / `CANN_API` / `MSTX_EVENTS`（515 行），时间基准与 harness 的 `PROFILE_START/STOP` 一致（epoch ns，边界偏差 <30 ms）。
+两个 rank 的合并库都包含 `TASK`、`CANN_API` 和 515 条 `MSTX_EVENTS`。按 harness 记录的 `PROFILE_START/STOP` 切 2.825 s 窗口后，每个 rank 保留 513 条范围记录。
 
-用这批数据跑 `analyzer.timeline.summarize(db, window, mstx=...)`：窗口 2.825 s、设备忙 1.783 s（63.1%）、空闲 36.9%，**MSTX 覆盖 97% 的静默空洞**（结论：空洞落在 Python 前向/调度区间，不是下发受限），同步等待 15.49 ms/2 轮 ≈ 7.7 ms/轮（占比 <1%）。注意这是带 profiler 的短跑，每轮 1.43 s，绝对值不可与正式采集（1.09 s/轮）直接比较。
+使用 `analyzer.timeline.summarize(db, window, mstx=...)` 复核，rank 0 和 rank 1 的静默空洞覆盖分别为 97.18% 和 96.48%，同步区间并集分别为 15.49 ms 和 80.11 ms。覆盖主要来自 `worker_execute`，说明这些空洞与该执行范围在时间上重叠。定位具体等待或下发原因需要更细粒度的打点。
+
+在 rank 0 原始文件的独立工作副本上执行 `bash scripts/mstx/export_offline.sh "$PROF_COPY" --with-text`，退出 0，重新得到 `op_summary` 和含三张表的合并库。模拟宿主命令失败且仍留存 `PROF_*` 时，启动脚本保留宿主退出码并提示离线导出。仓库补丁的 profiler 参数覆盖由 CPU 测试验证。
+
+`python scripts/verify_summary.py --real --out "$VERIFY_OUT"` 退出 3。`make check` 与 `make verify` 均退出 0，后者有 532 项通过、29 项跳过。历史真实回归为 SKIPPED，28 项通过，1 项因两张卡均有 CSV 而跳过 SQLite 回填场景。本次复核使用已有 NPU 数据，仓库补丁改动后的新采集为 NOT_RUN。
+
+### 仓库流程复现（enable_mstx.sh → 离线导出）
+
+用仓库脚本跑两轮 Graph 冒烟，确认入库的补丁本身能复现完整链路：
+
+```
+bash scripts/enable_mstx.sh <dest> -- python3 scripts/mstx/smoke_graph.py
+```
+
+`stop_profile()` 仍报 `cancelled`（预期），脚本按提示改走
+`scripts/mstx/export_offline.sh <rank 目录> --with-text`。两个 rank 结果一致：
+
+| rank | MSTX_EVENTS | TASK | CANN_API | 打点构成 | 窗口偏差 |
+|---|---:|---|---|---|---|
+| rank0 | 647 | ✓ | ✓ | `worker_execute` 132、`execute_model` 132、HCCL 128+128、`sync_wait_stream` 126、`sync_wait_device` 1 | 首 +2.9 ms / 尾 +23.1 ms |
+| rank1 | 647 | ✓ | ✓ | 同上 | 首 +2.9 ms / 尾 +22.7 ms |
+
+窗口偏差是 `start_profile`/`stop_profile` 的传播延迟，两个 rank 一致，可作为
+"同次采集、同 rank 对齐"的判据（首 <5 ms、尾 <30 ms）。

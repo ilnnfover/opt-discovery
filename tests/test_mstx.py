@@ -217,6 +217,15 @@ def test_install_wraps_ascend_runner_once(monkeypatch):
     fake_torch_npu.npu = types.SimpleNamespace(mstx=Mstx())
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
 
+    # 用假 torch 顶替，避免测试真的初始化 NPU 运行时（进程退出时会段错误）
+    class _Stream:
+        def synchronize(self):
+            return None
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.npu = types.SimpleNamespace(Stream=_Stream, synchronize=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
     class NPUModelRunner:
         def execute_model(self, value):
             return value + 1
@@ -245,3 +254,35 @@ def test_install_wraps_ascend_runner_once(monkeypatch):
 
     sc._install()  # 幂等：不得重复包装
     assert [c for c in calls if c == ("start", "worker_execute")] == [("start", "worker_execute")]
+
+
+def test_install_enables_modern_and_legacy_profiler_configs(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from scripts.mstx import sitecustomize as sc
+
+    class ModernConfig:
+        def __init__(self, mstx=False, export_type="text"):
+            self.mstx, self.export_type = mstx, export_type
+
+    class LegacyConfig:
+        def __init__(self, msprof_tx=False, export_type="text"):
+            self.msprof_tx, self.export_type = msprof_tx, export_type
+
+    monkeypatch.setattr(sc, "TARGETS", ())
+    monkeypatch.setattr(sc, "SYNC_TARGETS", ())
+    monkeypatch.setenv("VLLM_MSTX_PATCH", "1")
+    for config, flag in ((ModernConfig, "mstx"), (LegacyConfig, "msprof_tx")):
+        profiler = SimpleNamespace(_ExperimentalConfig=config, ExportType=SimpleNamespace(Db="db"))
+        monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+            npu=SimpleNamespace(mstx=object()),
+            profiler=profiler,
+        ))
+        sc._install()
+        sc._install()
+
+        value = config(False, ["text"])
+        assert getattr(value, flag) is True
+        assert value.export_type == ["text", "db"]
+        assert config(export_type="db").export_type == ["db"]

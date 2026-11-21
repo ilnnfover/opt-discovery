@@ -195,19 +195,20 @@ ACL 覆盖描述主库 Host 活动与已分析设备空洞的时间重叠。图�
 Graph 下发与同步提示仅写入 workload 的 `diagnosis.json` 说明及 `timeline.json`。
 CANN_API 和 TASK 的 `connectionId` 无法提供可用的逐算子关联。
 
-PyTorch MSTX 需要在发出打点的进程中启用
-`torch_npu.profiler._ExperimentalConfig(mstx=True)`（旧版使用 `msprof_tx=True`），
-并启用 DB 导出。若由 vLLM-Ascend WorkerProfiler 启停采集，须在 worker 的配置中启用该开关。
-应用可以使用 `MSTX_TRACE_DIR` 作为 trace handler 的输出目录。
+用 `enable_mstx.sh` 启动配置了进程内 torch profiler 的 harness。补丁会挂到
+vLLM-Ascend 的 worker 和 runner，在 `_ExperimentalConfig` 中启用 MSTX 和 DB 导出。
+应用可以使用 `MSTX_TRACE_DIR` 作为 profiler 输出目录。
 [Ascend PyTorch Profiler](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0033.html)
 
 ```bash
 ./scripts/enable_mstx.sh /path/to/new-trace -- python /path/to/configured_harness.py
+./scripts/mstx/export_offline.sh /path/to/new-trace/rank_dir --with-text
 opt-discovery timeline --export /path/to/capture --workload configs/workloads/qwen35-35b-a3b-910b/decode_graph.yaml \
   --mstx-db /path/to/same-rank-trace/ascend_pytorch_profiler_0.db --out /path/to/timeline.json
 ```
 
-`enable_mstx.sh` 启动已配置的 harness 并检查是否导出实际 MSTX 记录。
+在线导出失败且保留 `PROF_*` 时，启动脚本会打印离线导出命令。离线导出会写入
+指定目录，对要保留的原始采集，可将该目录复制到工作目录后执行。
 独立库须来自同次采集的同一 rank，并有落在分析窗口内的有效区间。
 单独复跑的 MSTX trace 应按它自己的采集窗口审阅。
 

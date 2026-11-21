@@ -42,25 +42,30 @@ for dir in "${DIRS[@]}"; do
   fi
 done
 
-echo "== 自检 MSTX_EVENTS"
+echo "== 自检 MSTX_EVENTS、TASK 与 CANN_API"
 python3 - "${DIRS[@]}" <<'PY'
-import glob
 import sqlite3
 import sys
+from contextlib import closing
+from pathlib import Path
 
+required = ("MSTX_EVENTS", "TASK", "CANN_API")
 missing = 0
-for directory in sys.argv[1:]:
-    dbs = sorted(glob.glob(f"{directory}/msprof_*.db"))
+for directory in map(Path, sys.argv[1:]):
+    dbs = sorted(directory.glob("msprof_*.db"))
     if not dbs:
         print(f"  [FAIL] {directory}: 没有生成 msprof_*.db")
         missing += 1
         continue
     db = dbs[-1]
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
-    n = con.execute("select count(*) from MSTX_EVENTS").fetchone()[0] if "MSTX_EVENTS" in tables else 0
-    print(f"  {db.split('/')[-2]}: MSTX_EVENTS={n} TASK={'TASK' in tables} CANN_API={'CANN_API' in tables}")
-    if "MSTX_EVENTS" not in tables or n == 0:
+    with closing(sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)) as con:
+        tables = {row[0] for row in con.execute("select name from sqlite_master where type='table'")}
+        absent = sorted(set(required) - tables)
+        n = con.execute("select count(*) from MSTX_EVENTS").fetchone()[0] if "MSTX_EVENTS" in tables else 0
+    if absent or n == 0:
+        print(f"  [FAIL] {directory}: 缺表={absent}，MSTX_EVENTS={n}")
         missing += 1
+    else:
+        print(f"  {directory.name}: MSTX_EVENTS={n} TASK=True CANN_API=True")
 raise SystemExit(1 if missing else 0)
 PY

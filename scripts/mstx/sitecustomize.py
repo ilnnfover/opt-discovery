@@ -17,9 +17,8 @@
 
 三个已验证的坑：
 
-1. **``msprof --msproftx=on`` 采不到 PyTorch 的 mstx**（``range_start`` 恒返回 0）。
-   必须在进程内启用 ``torch_npu.profiler`` 且 ``experimental_config`` 里
-   ``mstx=True``；``vllm_ascend`` 把它写死成 ``msprof_tx=False``，需要外部覆盖。
+1. PyTorch 采集由进程内的 ``torch_npu.profiler`` 启停。本补丁为其启用 MSTX
+   和 DB 导出，兼容使用 ``msprof_tx`` 的版本。
 2. **挂点要挂 Ascend 的子类**：``vllm_ascend`` 用 ``NPUModelRunner`` / ``NPUWorker``
    覆盖了上游实现，只挂 ``GPUModelRunner`` 不会触发（实测静默覆盖率 0%）。
 3. **``stop_profile()`` 的在线导出容易因 RPC 超时被 ``cancelled``**。raw 数据本身
@@ -28,6 +27,8 @@
 """
 
 import os
+from functools import wraps
+from inspect import signature
 
 #: (模块名, 类名, 方法名, 打点标签)。顺序即优先级；同一类被包装一次后不再重复。
 TARGETS: tuple[tuple[str, str, str, str], ...] = (
@@ -44,6 +45,41 @@ SYNC_TARGETS: tuple[tuple[str, str, str], ...] = (
     ("torch.npu.Stream", "synchronize", "sync_wait_stream"),
     ("torch.npu", "synchronize", "sync_wait_device"),
 )
+
+
+def _enable_profiler_mstx(profiler) -> None:
+    config = getattr(profiler, "_ExperimentalConfig", None)
+    db = getattr(getattr(profiler, "ExportType", None), "Db", None)
+    if config is None or db is None:
+        return
+    original = config.__init__
+    if getattr(original, "_mstx_wrapped", False):
+        return
+    try:
+        layout = signature(original)
+    except (TypeError, ValueError):
+        return
+    flag = next((name for name in ("mstx", "msprof_tx") if name in layout.parameters), None)
+    if flag is None or "export_type" not in layout.parameters:
+        return
+
+    @wraps(original)
+    def patched(self, *args, **kwargs):
+        bound = layout.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        bound.arguments[flag] = True
+        export = bound.arguments["export_type"]
+        if isinstance(export, (list, tuple)):
+            formats = list(export)
+        else:
+            formats = [export] if export else []
+        if db not in formats:
+            formats.append(db)
+        bound.arguments["export_type"] = formats
+        original(*bound.args, **bound.kwargs)
+
+    patched._mstx_wrapped = True  # type: ignore[attr-defined]
+    config.__init__ = patched
 
 
 def _wrap(owner, attribute: str, label: str, mstx) -> None:
@@ -88,6 +124,8 @@ def _install() -> None:
         mstx = torch_npu.npu.mstx
     except Exception:  # pragma: no cover - 无 NPU 环境
         return
+
+    _enable_profiler_mstx(getattr(torch_npu, "profiler", None))
 
     for module_name, class_name, attribute, label in TARGETS:
         try:

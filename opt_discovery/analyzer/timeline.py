@@ -872,7 +872,7 @@ def summarize(
             notes.append(
                 f"MSTX 打点覆盖了 {ratio:.0%} 的静默空洞（{len(mstx_ranges)} 个范围）；"
                 + (
-                    "这些空洞落在 Python 阶段内，属上层调度/等待，不是下发受限"
+                    "这些空洞与 Python 阶段重叠，具体原因需要更细粒度的打点"
                     if ratio >= 0.5
                     else "仍有较多空洞未被任何打点覆盖，归因能力有限"
                 )
@@ -992,8 +992,8 @@ def annotate_diagnosis(
         verdict = "Timeline 证据：空闲期间 Host 在下发 ACL 调用，支持下发受限假设"
     elif summary.silent_covered_by_mstx_us > 0 and summary.silent_unattributed_us < summary.silent_covered_by_mstx_us:
         verdict = (
-            "Timeline 证据：静默空洞主要落在 MSTX 打点的 Python 阶段内，"
-            "属上层调度/等待；下发受限假设缺少支撑"
+            "Timeline 证据：静默空洞主要与 MSTX 标记的 Python 阶段重叠，"
+            "现有打点粒度只能定位重叠区间"
         )
     elif acl_share >= 0.2:
         verdict = (
