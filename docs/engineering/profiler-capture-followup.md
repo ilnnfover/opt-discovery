@@ -36,4 +36,38 @@ Rank 0 与 rank 1 各有 307,552 与 307,436 条计算任务。按算子看，`M
 
 ### 离线重解析
 
-在独立副本保留原始采集文件和元数据，排除既有数据库与 CSV。使用同一版本 CANN 执行 `msprof --parse=on --output="$REEXPORT/PROF"`，退出 0。新生成的两个 `ascend_task.db` 与对应的原设备库 SHA-256 分别相同，确认本次差异无法从现存原始采集恢复。结束元数据缺失的具体原因仍需通过补采验证。[CANN 离线解析和导出文档](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0021.html)
+在独立副本保留原始采集文件和元数据，排除既有数据库与 CSV。使用同一版本 CANN 执行 `msprof --parse=on --output="$REEXPORT/PROF"` 和 `msprof --export=on --type=text --summary-format=csv --output="$REEXPORT/PROF"`，均退出 0。两个重新生成的 `ascend_task.db` 和两份 `op_summary*.csv` 与原文件的 SHA-256 分别一致。现有采集经离线重导后仍保留同样的 rank 时长差异。结束元数据缺失的具体原因仍需通过补采验证。[CANN 离线解析和导出文档](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0021.html)
+
+### Eager 补采
+
+CodeBuddy 在隔离工作目录使用既有 Eager 契约。采集脚本的实验调整是在最后一个 `ACTIVE_ROUND` 结束并完成设备同步后，显式请求 vLLM EngineCore 关闭。原始采集和仓库中的 harness 保留。
+
+首个启动在 worker 初始化时遇到显存不足和 OpenMP 线程池异常，完成 0 轮。一个 worker 报告 25.81 GiB 可用显存，要求 51.81 GiB。外层 msprof 退出 0，采集自检识别到无有效 rank 和轮次，收集器退出 1。该批次不进入比较。重试在相关基准进程退出、两张卡连续空闲后启动。
+
+#### 第二轮补采（OMP_NUM_THREADS=1 + jemalloc 预加载）
+
+为规避首轮 worker 初始化阶段的 OpenMP 线程池异常，第二轮把 `OMP_NUM_THREADS=1` 提前到 Python 启动前，并预加载 jemalloc（`LD_PRELOAD=/usr/lib64/libjemalloc.so.2:`），其余沿用同一契约和隔离 harness（最后一轮结束后显式关闭引擎）。
+
+本轮没有再出现显存不足，但仍然在 worker 初始化阶段崩溃，完成 0 轮。
+
+| 项 | 值 |
+|---|---|
+| 采集目录 | `/root/prof/opt-eager-audit.f7CaOu/manual-eager.t4cNoB` |
+| 批次目录 | `20261121-141744-decode-eager` |
+| 收集器退出码 | 1 |
+| `checks.ranks` | 空；两个 `PROF_*` 均判为 `no_operator_export` |
+| `checks.active_rounds` | 0 / 5 |
+| 崩溃点 | `ATen/ParallelOpenMP.cpp:64`，`set_num_threads` → `Invalid thread pool!` |
+
+关键日志（`workload.log`）：
+
+```
+multiprocessing/popen_fork.py:66: DeprecationWarning:
+This process (pid=485842) is multi-threaded, use of fork() may lead to deadlocks in the child.
+  what():  pool INTERNAL ASSERT FAILED at "/pytorch/aten/src/ATen/ParallelOpenMP.cpp":64
+Exception raised from set_num_threads at /pytorch/aten/src/ATen/ParallelOpenMP.cpp:64
+```
+
+判断：异常发生在 `fork` 之后的子进程调用 `set_num_threads` 时。父进程已初始化 OpenMP 线程池，fork 出的 EngineCore 继承了无效的池对象；因此把 `OMP_NUM_THREADS` 调成 1 无法规避——崩溃取决于池对象状态，与线程数无关。下一轮应改多进程启动方式（例如 `VLLM_WORKER_MULTIPROC_METHOD=spawn`），而不是继续调线程数。该改法尚未验证。
+
+本轮未执行严格比较：收集器退出 1、`checks.ok=false`，按门槛不进入 `verify-recapture.sh`。原始产物、`collector.log`、`collection_manifest.json`、`workload.log` 均保留在上述目录。
