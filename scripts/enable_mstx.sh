@@ -40,5 +40,12 @@ for db in sorted(root.rglob("*.db")):
             found = True
 if not found:
     print(f"{root}: 未找到带 MSTX_EVENTS 的数据库，请检查进程内 profiler 配置", file=sys.stderr)
+    # 常见原因：在线 stop_profile 的导出被 RPC 超时打断（cancelled），但 raw 仍在
+    raws = sorted({path.parent for path in root.rglob("PROF_*") if path.is_dir()})
+    for parent in raws:
+        print(
+            f"  检测到 raw 数据，可离线导出：bash scripts/mstx/export_offline.sh {parent} --with-text",
+            file=sys.stderr,
+        )
     sys.exit(1)
 PY
