@@ -323,6 +323,14 @@ def test_scope_rejects_overflowing_window_duration() -> None:
         )
 
 
+@pytest.mark.parametrize("start", (True, "1000.0"))
+def test_scope_rejects_non_numeric_serialized_window_boundary(start) -> None:
+    payload = _scope().to_dict()
+    payload["window"]["start_us"] = start
+    with pytest.raises(TypeError, match="window.start_us"):
+        AnalysisScope.from_dict(payload)
+
+
 def test_dependency_rejects_empty_evidence_or_field_names() -> None:
     with pytest.raises(ValueError):
         DependencyEvidence(
@@ -397,6 +405,30 @@ def test_derived_evidence_is_accepted_and_edges_have_no_implicit_weight() -> Non
     assert edge.evidence.provenance is Provenance.DERIVED
     assert "weight" not in edge.to_dict()
     assert "weight_us" not in edge.to_dict()
+
+
+@pytest.mark.parametrize("reverse", (False, True))
+def test_submission_path_checks_direction_and_accepts_overlapping_host_call(reverse) -> None:
+    host = _node(2, activity=ActivityKind.HOST_CALL, stream_id=None, start_us=1100.0)
+    device = _node(3, start_us=1150.0)
+    source, target = (device, host) if reverse else (host, device)
+    edge = DependencyEdge(
+        source.node_id,
+        target.node_id,
+        DependencyType.HOST_DEVICE_SUBMISSION,
+        _evidence(EvidenceBasis.CONNECTION_ID, Provenance.DERIVED, fields=("connectionId",)),
+    )
+    kwargs = {
+        "scope": _scope(stream_ids=() if reverse else (47,)),
+        "status": CriticalPathStatus.PARTIAL,
+        "path_nodes": (source, target),
+        "path_edges": (edge,),
+    }
+    if reverse:
+        with pytest.raises(ValueError, match="host_call to device_task"):
+            CriticalPathResult(**kwargs)
+    else:
+        assert CriticalPathResult(**kwargs).path_edges == (edge,)
 
 
 def test_unresolved_rejects_empty_reason_and_empty_ids() -> None:

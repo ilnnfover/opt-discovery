@@ -547,8 +547,9 @@ class AnalysisScope:
     """What a result claims to cover.
 
     Empty ``ranks`` / ``stream_ids`` mean "unspecified", not "covers all".
-    ``stream_ids`` are interpreted under each selected rank.  ``clock_domain``
-    is only a common-axis label; it never proves that ranks are comparable.
+    ``stream_ids`` are interpreted under each selected rank.  Device tasks
+    must identify a selected stream. Host calls and markers may lack a stream
+    ID. ``clock_domain`` labels a common axis; it does not establish alignment.
     """
 
     capture_id: str
@@ -608,6 +609,8 @@ class AnalysisScope:
             window_data = data["window"]
             if not isinstance(window_data, Mapping):
                 raise ValueError("window must be a JSON object or null")
+            for boundary in ("start_us", "end_us"):
+                _finite(window_data[boundary], f"window.{boundary}")
             window = Window.from_dict(dict(window_data))
         return cls(
             capture_id=data["capture_id"],
@@ -699,9 +702,8 @@ class CriticalPathResult:
                 raise ValueError("path node capture_id does not match scope.capture_id")
             if rank_filter and (node.rank is None or node.rank not in rank_filter):
                 raise ValueError("path node rank is outside scope.ranks")
-            if stream_filter and (
-                node.stream_id is None or node.stream_id not in stream_filter
-            ):
+            stream_scoped = node.activity is ActivityKind.DEVICE_TASK or node.stream_id is not None
+            if stream_filter and stream_scoped and node.stream_id not in stream_filter:
                 raise ValueError("path node stream_id is outside scope.stream_ids")
 
         if len(edges) != max(0, len(nodes) - 1):
@@ -716,6 +718,11 @@ class CriticalPathResult:
                 raise ValueError(
                     "path_edges are not adjacent to the ordered path_nodes"
                 )
+            if edge.dependency_type is DependencyType.HOST_DEVICE_SUBMISSION and (
+                source.activity is not ActivityKind.HOST_CALL
+                or target.activity is not ActivityKind.DEVICE_TASK
+            ):
+                raise ValueError("host_device_submission edges must link host_call to device_task")
             if edge.dependency_type is not DependencyType.STREAM_ORDER:
                 continue
             if (

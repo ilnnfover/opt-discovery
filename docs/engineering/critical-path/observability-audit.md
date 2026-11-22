@@ -6,6 +6,8 @@
 
 ## 当前事件与来源
 
+PR #9 将 MSTX 采集、采集完整性检查和 2026-11-21 回归契约合入 `main`。`7757169` 与本审计的源码基线 `a67bf64` 文件树一致。采集验收确认产物与批次身份，依赖端点仍需逐事件关联证据。
+
 | 来源 | 读者/契约 | 直接观测与限制 |
 |---|---|---|
 | `op_summary*.csv` | [events.py](../../../opt_discovery/events.py) 的 `normalize_instance_row` / `iter_op_summary_events` 输出 `KernelEvent(operator, rank, start_us, duration_us, task_type, source, stream_id)`，`TaskType` 区分 Kernel、通信、搬运、同步及其他。流式读取，Rank 由调用方提供，来源可定位 CSV 记录号。 | 三份均含 `Device_id, Model ID, Task ID, Stream ID, Context ID, Op Name, OP Type, Task Type, Task Start Time(us), Task Duration(us), Task Wait Time(us)`。三个探针的 9 条 CSV 记录均为 `Task Type=N/A`，每份在相同 Stream/Task ID 上与 TASK 起点以十进制精度逐条相等。通用任务模型/上下文的 `4294967295` 为这批中的占位值。现读者不保留 Task/Model/Context/Device ID 或 Wait Time。Wait Time 即使有数值也没有等待对象或边端点。 |

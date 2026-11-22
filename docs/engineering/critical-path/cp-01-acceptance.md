@@ -81,3 +81,20 @@ CodeBuddy（`deepseek-v4.1-flash`）实现 Schema 和测试。Codex 按真实样
 ## 13. 最终验收结论
 
 **PASS**。可观测性审计、Schema 契约、证据与质量约束、序列化、旧接口兼容性和 CPU 回归符合 CP-01 验收标准。四组双 Rank 历史基线回归仍为 **BLOCKED**，验证摘要保留该状态。
+
+## 同步 PR #9 后复验
+
+最新 `origin/main` 为 `7757169`，其文件树与原审计基线 `a67bf64` 相同。CP-01 分支合入该提交时无冲突。MSTX 与采集契约变化已纳入原基线，真实回归仍以 2026-11-21 四组采集的身份为准。
+
+复审定位两项 P1。提交边需要验证 Host → Device 的端点方向，同时允许没有 Stream ID 的 Host 调用出现在所选设备 Stream 的路径中。窗口反序列化须在调用共用 `Window` 前拒绝布尔值及字符串时间。四个回归用例在修复前失败、修复后通过。时间单位和既有 `Window`、事件读者、CLI 接口沿用原约定。
+
+| 实际命令 | 退出码 | 状态 | 日志或结果 |
+|---|---:|---|---|
+| `"$CP01_PYTHON" -m pytest tests/test_critical_path_schema.py`（修复前） | 1 | FAIL | 4 失败 / 43 通过，`out/cp01-sync-review/schema-before.log` |
+| `"$CP01_PYTHON" -m pytest tests/test_critical_path_schema.py`（修复后） | 0 | PASS | 47 通过，`out/cp01-sync-review/schema-after.log` |
+| `make check PYTHON="$CP01_PYTHON"`（摘要执行） | 0 | PASS | `out/cp01-sync-verified/logs/check.log` |
+| `make verify PYTHON="$CP01_PYTHON" DEMO_OUT="$PWD/out/cp01-sync-verified/demo"`（摘要执行） | 0 | PASS | 602 通过 / 29 跳过，四组合成 demo，`out/cp01-sync-verified/logs/verify.log` |
+| `"$CP01_PYTHON" scripts/verify_real.py`（摘要执行） | 2 | BLOCKED | 缺四组正式导出，`out/cp01-sync-verified/logs/real.log` |
+| `"$CP01_PYTHON" scripts/verify_summary.py --out out/cp01-sync-verified --real` | 2 | BLOCKED | 两项 CPU 检查通过，真实回归阻塞，`out/cp01-sync-verified/verification_summary.json` |
+
+两项真实探针核对命令复跑均退出 0。共 9 条 HostToDevice 关联通过原始证据复核，18 个节点及 9 条关联通过 JSON 往返。日志位于 `out/cp01-sync-review/`。同步后 CP-01 技术验收 **PASS**，Schema 变更须人工审阅后合并。
