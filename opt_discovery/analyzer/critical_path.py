@@ -1,7 +1,7 @@
-"""CP-02A: evidence-constrained task-stream DAG and longest-path solver.
+"""CP-02: evidence-constrained task-stream DAG and longest-path solver.
 
-Scope is deliberately narrow: one capture, one rank, one device, one stream.
-A stream-order edge is emitted only when every local precondition is observed:
+CP-02A covers one capture/rank/device/stream. A stream-order edge is emitted
+only when every local precondition is observed:
 
 * the rows are adjacent records in the selected stream window;
 * both are known serial task types (:data:`~opt_discovery.events.TASK_SERIAL_TYPES`);
@@ -13,10 +13,16 @@ A stream-order edge is emitted only when every local precondition is observed:
 The official CANN FIFO contract is the ordering basis; timestamps only check
 consistency.  A gap is not a dependency and is never given weight.  There is no
 trusted denominator for dependency coverage, so it is always ``None``.
+
+CP-02B adds explicit cross-stream ``EVENT_RECORD``/``EVENT_WAIT`` edges.  Such
+an edge exists only when a caller supplies an independently observed
+:class:`SyncBinding` for both TASK rows with the same explicit handle and
+generation.  Time, names, connection IDs and binding absence never create one.
 """
 
 from __future__ import annotations
 
+import posixpath
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -25,6 +31,7 @@ from typing import Iterable, Sequence
 from ..events import (
     TASK_SERIAL_TYPES,
     EventReadError,
+    SourceReference,
     TaskExecutionEvent,
     iter_task_execution_events,
     task_relative_window,
@@ -45,8 +52,11 @@ from ..schemas.quality import QualityFlag, blocking
 
 __all__ = [
     "ScopeError",
+    "SyncBinding",
     "TaskDag",
     "analyze_task_stream",
+    "analyze_task_streams",
+    "build_synchronized_task_dag",
     "build_task_dag",
     "solve_task_dag",
 ]
@@ -56,18 +66,122 @@ class ScopeError(ValueError):
     """Raised when a scope is not a single rank/stream or lacks a window."""
 
 
+#: TASK types that can act as sync endpoints once an explicit binding proves it.
+_SYNC_TYPES = frozenset({"EVENT_RECORD", "EVENT_WAIT"})
+
+
+def _text(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string, got {type(value).__name__}")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field} must not be empty")
+    return text
+
+
+def _capture_relative(path: str, field: str) -> str:
+    text = path.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    if text.startswith("/") or (len(text) >= 2 and text[0].isalpha() and text[1] == ":"):
+        raise ValueError(f"{field} must be capture-relative, not absolute")
+    logical = posixpath.normpath(text)
+    if logical in ("", "."):
+        raise ValueError(f"{field} must identify a record, not the current directory")
+    if logical == ".." or logical.startswith("../"):
+        raise ValueError(f"{field} must not escape the capture root")
+    return logical
+
+
+def _source_key(source: SourceReference) -> tuple[str, str, int | None]:
+    """Index a source by location only; ``note`` is descriptive, not identity."""
+
+    return (source.kind, source.path, source.row)
+
+
+def _binding_source_key(source: object, field: str) -> tuple[str, str, int]:
+    if not isinstance(source, SourceReference):
+        raise TypeError(f"{field} must be SourceReference, got {type(source).__name__}")
+    kind = _text(source.kind, f"{field}.kind")
+    path = _text(source.path, f"{field}.path")
+    row = source.row
+    if row is None:
+        raise ValueError(f"{field}.row is required to locate a binding record")
+    if isinstance(row, bool) or not isinstance(row, int):
+        raise TypeError(f"{field}.row must be a positive integer")
+    if row <= 0:
+        raise ValueError(f"{field}.row must be a positive integer, got {row}")
+    return (kind, _capture_relative(path, f"{field}.path"), row)
+
+
+@dataclass(frozen=True)
+class SyncBinding:
+    """One independently observed TASK-row to event-handle binding.
+
+    The caller supplies and verifies the underlying rows.  This record only
+    checks structure: both sources are locatable rows, the evidence row is not
+    the TASK row it claims to bind, and an explicit handle/generation is
+    carried verbatim.  The TASK type of the row named by ``task_source``
+    decides whether it acts as ``EVENT_RECORD`` or ``EVENT_WAIT``.
+    """
+
+    capture_id: str
+    task_source: SourceReference
+    event_handle: str | None
+    generation: int | None
+    evidence_source: SourceReference
+
+    def __post_init__(self) -> None:
+        capture_id = _text(self.capture_id, "capture_id")
+        task_key = _binding_source_key(self.task_source, "task_source")
+        evidence_key = _binding_source_key(self.evidence_source, "evidence_source")
+        if task_key == evidence_key:
+            raise ValueError("evidence_source must not be the TASK row being bound")
+
+        handle = self.event_handle
+        if handle is not None:
+            if not isinstance(handle, str):
+                raise TypeError("event_handle must be a string or None")
+            handle = handle.strip()
+            if not handle:
+                raise ValueError("event_handle must be non-empty or None")
+
+        generation = self.generation
+        if generation is not None:
+            if isinstance(generation, bool) or not isinstance(generation, int):
+                raise TypeError("generation must be an integer or None")
+            if generation < 0:
+                raise ValueError("generation must be non-negative")
+
+        object.__setattr__(self, "capture_id", capture_id)
+        object.__setattr__(
+            self, "task_source", replace(self.task_source, kind=task_key[0], path=task_key[1])
+        )
+        object.__setattr__(
+            self, "evidence_source", replace(self.evidence_source, kind=evidence_key[0], path=evidence_key[1])
+        )
+        object.__setattr__(self, "event_handle", handle)
+        object.__setattr__(self, "generation", generation)
+
+
 @dataclass(frozen=True)
 class TaskDag:
-    """Small, auditable DAG fragment for one stream."""
+    """Auditable DAG fragment for the selected streams of one rank."""
 
     nodes: tuple[ExecutionNode, ...]
     edges: tuple[DependencyEdge, ...]
     unresolved: tuple[UnresolvedDependency, ...]
 
 
-def _serial(event: TaskExecutionEvent) -> bool:
+def _serial(event: TaskExecutionEvent, *, promoted: bool = False) -> bool:
     name = (event.task_type_name or "").strip().upper()
-    return name in TASK_SERIAL_TYPES
+    if name in TASK_SERIAL_TYPES:
+        return True
+    return promoted and name in _SYNC_TYPES
+
+
+def _event_key(event: TaskExecutionEvent) -> tuple[str, str, int | None]:
+    return _source_key(event.source)
 
 
 def _unique(values: Iterable[str]) -> list[str]:
@@ -121,6 +235,8 @@ def _eligibility_reasons(
     stream_id: int,
     task_counts: Counter[int],
     gid_counts: Counter[int],
+    *,
+    promoted: bool = False,
 ) -> list[str]:
     reasons: list[str] = list(event.reasons)
     if event.node is None:
@@ -151,7 +267,7 @@ def _eligibility_reasons(
         reasons.append("missing_end")
     if event.crosses_boundary:
         reasons.append("window_crossing")
-    if not _serial(event):
+    if not _serial(event, promoted=promoted):
         reasons.append("task_type_not_serial")
     if event.model_id_state == "graph":
         reasons.append("model_is_graph")
@@ -209,8 +325,6 @@ def _pair_reason(
         or previous.context_id != current.context_id
     ):
         return "context_mismatch"
-    if not _serial(previous) or not _serial(current):
-        return "task_type_not_serial"
     if previous.model_id_state == "graph" or current.model_id_state == "graph":
         return "model_is_graph"
     if (
@@ -278,10 +392,580 @@ def _edge(previous: TaskExecutionEvent, current: TaskExecutionEvent) -> Dependen
     )
 
 
+def _require_sync_scope(scope: AnalysisScope) -> int:
+    if not isinstance(scope, AnalysisScope):
+        raise TypeError("scope must be AnalysisScope")
+    if len(scope.ranks) != 1:
+        raise ScopeError("scope_not_single_rank")
+    if not scope.stream_ids:
+        raise ScopeError("scope_no_stream")
+    if len(set(scope.stream_ids)) != len(scope.stream_ids):
+        raise ScopeError("scope_stream_not_distinct")
+    return scope.ranks[0]
+
+
+def _dedup_events(
+    events: Iterable[TaskExecutionEvent],
+) -> tuple[list[TaskExecutionEvent], tuple[TaskExecutionEvent, ...]]:
+    seen: dict[tuple[str, str, int | None], TaskExecutionEvent] = {}
+    result: list[TaskExecutionEvent] = []
+    for event in events:
+        key = _event_key(event)
+        if event.source.row is not None:
+            prior = seen.get(key)
+            if prior is not None:
+                if prior != event:
+                    return [], (prior, event)
+                continue
+            seen[key] = event
+        result.append(event)
+    return result, ()
+
+
+def _sync_role(event: TaskExecutionEvent) -> str:
+    return (event.task_type_name or "").strip().upper()
+
+
+def _sync_unresolved(
+    reason_code: str,
+    *,
+    detail: str | None = None,
+    events: Sequence[TaskExecutionEvent] = (),
+    source_node_id: str | None = None,
+    target_node_id: str | None = None,
+) -> UnresolvedDependency:
+    return UnresolvedDependency(
+        dependency_type=DependencyType.EXPLICIT_EVENT_WAIT,
+        reason_code=reason_code,
+        source_node_id=source_node_id,
+        target_node_id=target_node_id,
+        source_refs=tuple(event.source for event in events),
+        detail=detail,
+    )
+
+
+def _binding_unresolved(
+    reason_code: str, binding: SyncBinding, *, detail: str | None = None
+) -> UnresolvedDependency:
+    return UnresolvedDependency(
+        dependency_type=DependencyType.EXPLICIT_EVENT_WAIT,
+        reason_code=reason_code,
+        source_refs=(binding.task_source, binding.evidence_source),
+        detail=detail,
+    )
+
+
+def _sync_pair_reason(
+    record: TaskExecutionEvent, wait: TaskExecutionEvent, rank: int
+) -> str | None:
+    """Cross-stream guard.  Time never selects a partner or a generation."""
+
+    if record.capture_id != wait.capture_id:
+        return "capture_mismatch"
+    if record.rank != rank or wait.rank != rank:
+        return "rank_mismatch"
+    if record.source.kind != "task_table" or wait.source.kind != "task_table":
+        return "source_mismatch"
+    if record.source.path != wait.source.path:
+        return "source_mismatch"
+    if (
+        record.device_id is None
+        or wait.device_id is None
+        or record.device_id != wait.device_id
+    ):
+        return "device_mismatch"
+    if (
+        record.global_pid is None
+        or wait.global_pid is None
+        or record.global_pid != wait.global_pid
+    ):
+        return "global_pid_mismatch"
+    if record.stream_id is None or wait.stream_id is None:
+        return "stream_mismatch"
+    if record.stream_id == wait.stream_id:
+        return "same_stream"
+    if record.raw_end_ns is None or wait.raw_end_ns is None:
+        return "invalid_sync_time"
+    if record.raw_end_ns > wait.raw_end_ns:
+        return "record_after_wait_completion"
+    if record.node is None or record.node.duration_us is None or wait.raw_end_us is None:
+        return "invalid_sync_time"
+    if record.node.duration_us > wait.raw_end_us - record.node.start_us:
+        return "sync_coordinate_precision"
+    return None
+
+
+def _sync_edge(
+    record: TaskExecutionEvent,
+    record_binding: SyncBinding,
+    wait: TaskExecutionEvent,
+    wait_binding: SyncBinding,
+) -> DependencyEdge:
+    assert record.node is not None
+    assert wait.node is not None
+    detail = (
+        f"capture={record.capture_id} rank={record.rank} "
+        f"device={record.device_id} globalPid={record.global_pid} "
+        f"streams={record.stream_id}->{wait.stream_id} "
+        f"recordTaskId={record.task_id} waitTaskId={wait.task_id} "
+        f"generation={record_binding.generation} waitStartNs={wait.raw_start_ns} "
+        f"waitEndNs={wait.raw_end_ns} waitWeightUs=0"
+    )
+    return DependencyEdge(
+        source_node_id=record.node.node_id,
+        target_node_id=wait.node.node_id,
+        dependency_type=DependencyType.EXPLICIT_EVENT_WAIT,
+        evidence=DependencyEvidence(
+            source_refs=(
+                record.source,
+                record_binding.evidence_source,
+                wait.source,
+                wait_binding.evidence_source,
+            ),
+            basis=EvidenceBasis.EVENT_HANDLE,
+            fields=("eventHandle", "generation"),
+            provenance=Provenance.DERIVED,
+            detail=detail,
+        ),
+    )
+
+
+def _wait_milestone(event: TaskExecutionEvent) -> ExecutionNode:
+    assert event.node is not None
+    assert event.raw_end_us is not None
+    return ExecutionNode(
+        capture_id=event.capture_id,
+        source=event.source,
+        activity=event.node.activity,
+        start_us=event.raw_end_us,
+        duration_us=0.0,
+        rank=event.node.rank,
+        stream_id=event.node.stream_id,
+        operator=event.node.operator,
+        task_type=event.node.task_type,
+    )
+
+
+def _dedup_unresolved(
+    items: Sequence[UnresolvedDependency],
+) -> tuple[UnresolvedDependency, ...]:
+    seen: set[tuple[object, ...]] = set()
+    result: list[UnresolvedDependency] = []
+    for item in items:
+        key = (
+            item.dependency_type,
+            item.reason_code,
+            item.source_node_id,
+            item.target_node_id,
+            tuple(_source_key(ref) for ref in item.source_refs),
+            item.detail,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return tuple(result)
+
+
+def build_synchronized_task_dag(
+    events: Iterable[TaskExecutionEvent],
+    scope: AnalysisScope,
+    *,
+    bindings: Iterable[SyncBinding] = (),
+) -> TaskDag:
+    """Compose explicit cross-stream waits over disjoint CP-02A local DAGs.
+
+    Only a unique ``EVENT_RECORD`` matched to an ``EVENT_WAIT`` through the same
+    explicit handle/generation, capture, TASK DB, rank, device and process can
+    form a cross-stream edge.  Every other sync row is an unresolved barrier.
+    """
+    rank = _require_sync_scope(scope)
+    items, conflict = _dedup_events(events)
+    if conflict:
+        return TaskDag((), (), (_sync_unresolved("conflicting_task_observations", events=conflict),))
+    binding_items = tuple(bindings)
+    for binding in binding_items:
+        if not isinstance(binding, SyncBinding):
+            raise TypeError("bindings must contain SyncBinding values")
+
+    if not items:
+        return TaskDag(
+            nodes=(),
+            edges=(),
+            unresolved=tuple(
+                _binding_unresolved(
+                    "binding_task_not_observed",
+                    binding,
+                    detail="binding names a TASK row that is not in the supplied events",
+                )
+                for binding in binding_items
+            ),
+        )
+
+    identities = {
+        (
+            event.capture_id,
+            event.rank,
+            event.origin_ns,
+            event.source.kind,
+            event.source.path,
+        )
+        for event in items
+    }
+    devices = {event.device_id for event in items if event.device_id is not None}
+    if len(identities) != 1 or len(devices) > 1:
+        return TaskDag(
+            nodes=(),
+            edges=(),
+            unresolved=(
+                _sync_unresolved(
+                    "mixed_sync_scope",
+                    detail="events mix capture/rank/device/origin/source",
+                    events=items[:1],
+                ),
+            ),
+        )
+    if any(event.source.kind != "task_table" for event in items):
+        return TaskDag(
+            nodes=(),
+            edges=(),
+            unresolved=(
+                _sync_unresolved(
+                    "source_mismatch",
+                    detail="synchronized task rows must come from a TASK table",
+                    events=items[:1],
+                ),
+            ),
+        )
+
+    by_key = {_event_key(event): event for event in items}
+    unknown_stream = [event for event in items if event.stream_id is None]
+    stream_items = {stream: list(unknown_stream) for stream in scope.stream_ids}
+    for event in items:
+        if event.stream_id is not None and event.stream_id in stream_items:
+            stream_items[event.stream_id].append(event)
+    task_counts = {
+        stream: Counter(
+            event.task_id for event in rows if event.task_id is not None
+        )
+        for stream, rows in stream_items.items()
+    }
+    gid_counts = {
+        stream: Counter(
+            event.global_task_id
+            for event in rows
+            if event.global_task_id is not None
+        )
+        for stream, rows in stream_items.items()
+    }
+
+    def endpoint_reasons(event: TaskExecutionEvent) -> list[str]:
+        stream = event.stream_id
+        if stream is None or stream not in stream_items:
+            return ["stream_mismatch"]
+        return _eligibility_reasons(
+            event,
+            replace(scope, stream_ids=(stream,)),
+            rank,
+            stream,
+            task_counts[stream],
+            gid_counts[stream],
+            promoted=True,
+        )
+
+    unresolved: list[UnresolvedDependency] = []
+
+    bindings_by_task: dict[
+        tuple[str, str, int | None], list[SyncBinding]
+    ] = {}
+    for binding in binding_items:
+        bindings_by_task.setdefault(
+            _source_key(binding.task_source), []
+        ).append(binding)
+
+    binding_for_task: dict[tuple[str, str, int | None], SyncBinding] = {}
+    ambiguous_keys: set[tuple[str, int]] = set()
+    for key, binding_group in bindings_by_task.items():
+        usable = [binding for binding in binding_group if binding.capture_id == scope.capture_id]
+        for binding in binding_group:
+            if binding.capture_id != scope.capture_id:
+                unresolved.append(
+                    _binding_unresolved(
+                        "binding_capture_mismatch",
+                        binding,
+                        detail=(
+                            f"binding capture {binding.capture_id!r} != "
+                            f"scope capture {scope.capture_id!r}"
+                        ),
+                    )
+                )
+        observed_event = by_key.get(key)
+        if len(usable) > 1:
+            for binding in usable:
+                if (
+                    observed_event is not None and _sync_role(observed_event) == "EVENT_RECORD"
+                    and binding.event_handle is not None and binding.generation is not None
+                ):
+                    ambiguous_keys.add((binding.event_handle, binding.generation))
+                unresolved.append(
+                    _binding_unresolved(
+                        "duplicate_task_binding",
+                        binding,
+                        detail="more than one binding observes the same TASK row",
+                    )
+                )
+            continue
+        if not usable:
+            continue
+        binding = usable[0]
+        if observed_event is None:
+            unresolved.append(
+                _binding_unresolved(
+                    "binding_task_not_observed",
+                    binding,
+                    detail="binding names a TASK row that is not in the supplied events",
+                )
+            )
+        elif observed_event.capture_id != binding.capture_id:
+            unresolved.append(
+                _binding_unresolved(
+                    "binding_capture_mismatch",
+                    binding,
+                    detail="binding capture does not match the TASK row",
+                )
+            )
+        else:
+            binding_for_task[key] = binding
+
+    records_by_key: dict[
+        tuple[str, int], list[tuple[TaskExecutionEvent, SyncBinding]]
+    ] = {}
+    ineligible_records: set[tuple[str, str, int | None]] = set()
+    for event in items:
+        if _sync_role(event) != "EVENT_RECORD":
+            continue
+        key = _event_key(event)
+        record_observation = binding_for_task.get(key)
+        if record_observation is None:
+            unresolved.append(
+                _sync_unresolved(
+                    "missing_sync_binding",
+                    detail="EVENT_RECORD has no independently observed sync binding",
+                    events=(event,),
+                )
+            )
+            continue
+        if record_observation.event_handle is None or record_observation.generation is None:
+            unresolved.append(
+                _sync_unresolved(
+                    "missing_sync_identity",
+                    detail="binding lacks an explicit event handle or generation",
+                    events=(event,),
+                )
+            )
+            continue
+        composite = (record_observation.event_handle, record_observation.generation)
+        records_by_key.setdefault(composite, []).append((event, record_observation))
+        reasons = endpoint_reasons(event)
+        if reasons:
+            ineligible_records.add(key)
+            unresolved.append(
+                _sync_unresolved(
+                    "sync_endpoint_ineligible",
+                    detail=",".join(reasons),
+                    events=(event,),
+                )
+            )
+    pending_records: set[tuple[str, int]] = set()
+    for composite, group in records_by_key.items():
+        if len(group) > 1:
+            ambiguous_keys.add(composite)
+            for event, _ in group:
+                unresolved.append(
+                    _sync_unresolved(
+                        "ambiguous_record_key",
+                        detail=(
+                            f"handle={composite[0]!r} generation={composite[1]!r} "
+                            f"matches {len(group)} TASK records"
+                        ),
+                        events=(event,),
+                    )
+                )
+        elif composite not in ambiguous_keys and _event_key(group[0][0]) not in ineligible_records:
+            pending_records.add(composite)
+
+    verified: set[tuple[str, str, int | None]] = set()
+    verified_records: set[tuple[str, int]] = set()
+    milestones: dict[str, ExecutionNode] = {}
+    cross_edges: list[DependencyEdge] = []
+
+    for event in items:
+        if _sync_role(event) != "EVENT_WAIT":
+            continue
+        key = _event_key(event)
+        wait_binding = binding_for_task.get(key)
+        if wait_binding is None:
+            unresolved.append(
+                _sync_unresolved(
+                    "missing_sync_binding",
+                    detail="EVENT_WAIT has no independently observed sync binding",
+                    events=(event,),
+                )
+            )
+            continue
+        if wait_binding.event_handle is None or wait_binding.generation is None:
+            unresolved.append(
+                _sync_unresolved(
+                    "missing_sync_identity",
+                    detail="binding lacks an explicit event handle or generation",
+                    events=(event,),
+                )
+            )
+            continue
+        reasons = endpoint_reasons(event)
+        if reasons:
+            unresolved.append(
+                _sync_unresolved(
+                    "sync_endpoint_ineligible",
+                    detail=",".join(reasons),
+                    events=(event,),
+                )
+            )
+            continue
+        composite = (wait_binding.event_handle, wait_binding.generation)
+        group = records_by_key.get(composite, [])
+        if composite in ambiguous_keys:
+            unresolved.append(
+                _sync_unresolved(
+                    "ambiguous_record_key",
+                    detail=(
+                        f"handle={composite[0]!r} generation={composite[1]!r} "
+                        "has conflicting record observations"
+                    ),
+                    events=(event,),
+                )
+            )
+            continue
+        if not group:
+            unresolved.append(
+                _sync_unresolved(
+                    "missing_record",
+                    detail=(
+                        f"handle={composite[0]!r} generation={composite[1]!r} "
+                        "has no eligible EVENT_RECORD"
+                    ),
+                    events=(event,),
+                )
+            )
+            continue
+        record, record_binding = group[0]
+        pair_reason = (
+            "sync_record_ineligible" if _event_key(record) in ineligible_records
+            else _sync_pair_reason(record, event, rank)
+        )
+        if pair_reason is not None:
+            unresolved.append(
+                _sync_unresolved(
+                    pair_reason,
+                    detail="explicit handle/generation matched but the cross-stream guard failed",
+                    events=(record, event),
+                )
+            )
+            continue
+        cross_edges.append(
+            _sync_edge(record, record_binding, event, wait_binding)
+        )
+        verified_records.add(composite)
+        verified.add(_event_key(record))
+        verified.add(key)
+        assert event.node is not None
+        milestones[event.node.node_id] = _wait_milestone(event)
+
+    for composite in records_by_key:
+        if composite not in pending_records or composite in verified_records:
+            continue
+        event, _ = records_by_key[composite][0]
+        unresolved.append(
+            _sync_unresolved(
+                "unmatched_record",
+                detail=(
+                    f"handle={composite[0]!r} generation={composite[1]!r} "
+                    "has no eligible EVENT_WAIT"
+                ),
+                events=(event,),
+            )
+        )
+
+    nodes: list[ExecutionNode] = []
+    edges: list[DependencyEdge] = []
+    local_unresolved: list[UnresolvedDependency] = []
+    for stream in scope.stream_ids:
+        local = _build_task_dag(
+            stream_items[stream],
+            replace(scope, stream_ids=(stream,)),
+            verified_sync_ids=frozenset(verified),
+        )
+        nodes.extend(local.nodes)
+        edges.extend(local.edges)
+        local_unresolved.extend(local.unresolved)
+
+    final_nodes = tuple(milestones.get(node.node_id, node) for node in nodes)
+    node_ids = [node.node_id for node in final_nodes]
+    if len(set(node_ids)) != len(node_ids):
+        return TaskDag(
+            nodes=(),
+            edges=(),
+            unresolved=(
+                _sync_unresolved(
+                    "duplicate_node_identity",
+                    detail="synchronized composition produced duplicate node identity",
+                ),
+            ),
+        )
+
+    all_edges = tuple(edges) + tuple(cross_edges)
+    index = set(node_ids)
+    if any(
+        edge.source_node_id not in index or edge.target_node_id not in index
+        for edge in all_edges
+    ):
+        return TaskDag(
+            nodes=(),
+            edges=(),
+            unresolved=(
+                _sync_unresolved(
+                    "sync_endpoint_not_admitted",
+                    detail="an explicit wait edge references a row that failed admission",
+                ),
+            ),
+        )
+
+    return TaskDag(
+        nodes=final_nodes,
+        edges=all_edges,
+        unresolved=_dedup_unresolved([*local_unresolved, *unresolved]),
+    )
+
+
 def build_task_dag(
     events: Iterable[TaskExecutionEvent], scope: AnalysisScope
 ) -> TaskDag:
     """Build the local stream DAG.  Cross-scope and weak relations stay unresolved."""
+    return _build_task_dag(events, scope)
+
+
+def _build_task_dag(
+    events: Iterable[TaskExecutionEvent],
+    scope: AnalysisScope,
+    *,
+    verified_sync_ids: frozenset[tuple[str, str, int | None]] = frozenset(),
+) -> TaskDag:
+    """Local stream DAG, optionally admitting explicitly verified sync rows.
+
+    The allow set only lifts the serial-type gate.  Every other eligibility
+    rule (identity, scope, graph tag, times, reuse) still applies, so a sync
+    row that fails admission remains an ordinary barrier.
+    """
     rank, stream_id = _require_single_scope(scope)
     items = sorted(events, key=_order_key)
     if not items:
@@ -317,8 +1001,15 @@ def build_task_dag(
     prefix_max_end_ns: int | float = float("-inf")
 
     for index, event in enumerate(items):
+        promoted = _event_key(event) in verified_sync_ids
         reasons = _eligibility_reasons(
-            event, scope, rank, stream_id, task_counts, gid_counts
+            event,
+            scope,
+            rank,
+            stream_id,
+            task_counts,
+            gid_counts,
+            promoted=promoted,
         )
         eligible = not reasons
         for row_reason in reasons:
@@ -587,4 +1278,69 @@ def analyze_task_stream(
         )
 
     dag = build_task_dag(events, relative_scope)
+    return solve_task_dag(dag, relative_scope, quality_flags=flags)
+
+
+def analyze_task_streams(
+    db_path: str | Path,
+    scope: AnalysisScope,
+    *,
+    source_path: str,
+    device_id: int,
+    bindings: Iterable[SyncBinding] = (),
+    quality_flags: Iterable[QualityFlag] = (),
+) -> CriticalPathResult:
+    """Read several explicitly selected streams on one rank and solve one DAG.
+
+    Every stream is read through the existing read-only TASK iterator.  Rows
+    with an unknown stream are yielded once per request and deduplicated by
+    TASK reference, but still act as barriers in every requested stream.
+    """
+    flags = tuple(quality_flags)
+    try:
+        rank = _require_sync_scope(scope)
+    except ScopeError as exc:
+        return _unavailable(scope, str(exc), quality_flags=flags)
+
+    if scope.window is None:
+        return _unavailable(scope, "scope_window_missing", quality_flags=flags)
+
+    relative_window, origin_ns = task_relative_window(scope.window)
+    relative_scope = replace(
+        scope,
+        window=relative_window,
+        clock_domain=(
+            f"{scope.clock_domain or f'device-{device_id}'}:origin_ns={origin_ns}"
+        ),
+    )
+
+    if blocking(flags):
+        return solve_task_dag(
+            TaskDag(nodes=(), edges=(), unresolved=()),
+            relative_scope,
+            quality_flags=flags,
+        )
+
+    events: list[TaskExecutionEvent] = []
+    try:
+        for stream_id in scope.stream_ids:
+            for event in iter_task_execution_events(
+                db_path,
+                capture_id=scope.capture_id,
+                source_path=source_path,
+                rank=rank,
+                device_id=device_id,
+                stream_id=stream_id,
+                window=scope.window,
+            ):
+                events.append(event)
+    except EventReadError as exc:
+        return _unavailable(
+            relative_scope,
+            "source_unavailable",
+            detail=str(exc),
+            quality_flags=flags,
+        )
+
+    dag = build_synchronized_task_dag(events, relative_scope, bindings=bindings)
     return solve_task_dag(dag, relative_scope, quality_flags=flags)
