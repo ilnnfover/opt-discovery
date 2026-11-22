@@ -9,19 +9,19 @@ and analyzers:
   operator identity and is therefore a different type;
 * :class:`HostCall` — ACL/CANN host-side calls (``CANN_API``).
 
-All timestamps are epoch microseconds.  The only unit conversions live in
-``primitives.normalize_duration`` / ``window_span`` (``ns -> us`` for sqlite and
-the COMMUNICATION ``Task Duration`` ns quirk).  Readers are lazy generators;
-callers that need sorting or interval merging materialize the list explicitly.
+Readers return microseconds, using epoch or an explicit relative origin.
+Conversions happen at the source boundary. TASK SQLite timestamps use ns and
+the CSV COMMUNICATION duration quirk belongs to ``normalize_duration``.
 """
 
 from __future__ import annotations
 
 import csv
+import posixpath
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from .primitives import (
     NS_PER_US,
@@ -32,23 +32,30 @@ from .primitives import (
 )
 from .schemas.operator import TaskType
 
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids schemas -> events cycle
+    from .schemas.critical_path import ExecutionNode
+
 __all__ = [
     "EventReadError",
     "HostCall",
     "KernelEvent",
     "SourceReference",
     "NormalizedRow",
+    "TaskExecutionEvent",
     "TaskIntervalEvent",
+    "TASK_SERIAL_TYPES",
     "iter_host_calls",
     "iter_host_spans",
     "iter_op_summary_events",
     "iter_op_summary_intervals",
     "iter_op_summary_spans",
+    "iter_task_execution_events",
     "iter_task_intervals",
     "iter_task_span_rows",
     "iter_task_spans",
     "ns_from_us",
     "task_origin_ns",
+    "task_relative_window",
     "op_summary_paths",
 ]
 
@@ -59,6 +66,27 @@ OP_SUMMARY_OPERATOR = "OP Type"
 OP_SUMMARY_STREAM = "Stream ID"
 
 _KERNEL_TYPES = frozenset({"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV"})
+
+#: TASK types whose stream order is proved by the official CANN FIFO contract.
+#: Everything outside this exact allow list is descriptive only and may not
+#: become a verified path endpoint.
+TASK_SERIAL_TYPES = frozenset({"KERNEL_AICORE", "KERNEL_AIVEC", "MEMCPY_ASYNC"})
+
+#: Observed UINT32_MAX placeholder used by model/context on standalone runs.
+_UINT32_MAX = 4_294_967_295
+
+_TASK_REQUIRED_COLUMNS = (
+    "startNs",
+    "endNs",
+    "deviceId",
+    "globalPid",
+    "contextId",
+    "streamId",
+    "taskId",
+    "globalTaskId",
+    "modelId",
+    "taskType",
+)
 
 
 class EventReadError(ValueError):
@@ -119,6 +147,81 @@ class TaskIntervalEvent:
 
     def interval(self) -> Interval:
         return Interval(self.start_us, self.end_us)
+
+
+@dataclass(frozen=True)
+class TaskExecutionEvent:
+    """One ``TASK`` row with its raw identity and a descriptive node.
+
+    ``raw_*_ns`` keep the exact integer source values; ``start_us`` and
+    ``duration_us`` are relative to :attr:`origin_ns` (normally the selected
+    window start) so an epoch-scale float subtraction cannot hide sub-µs time.
+
+    ``node`` is descriptive: unknown task types and boundary crossers can still
+    be inspected, but only records accepted by
+    :data:`TASK_SERIAL_TYPES` with a known duration may become verified path
+    endpoints. A missing identity stays ``None``. The raw ``context_id`` can
+    carry the observed subgraph placeholder and does not identify a runtime
+    context.
+    """
+
+    capture_id: str
+    source: SourceReference
+    node: ExecutionNode | None
+    rank: int
+    device_id: int | None
+    stream_id: int | None
+    global_pid: int | None
+    context_id: int | None
+    task_id: int | None
+    global_task_id: int | None
+    model_id: int | None
+    task_type_name: str | None
+    task_type: TaskType
+    raw_start_ns: int | None
+    raw_end_ns: int | None
+    origin_ns: int
+    in_window: bool
+    crosses_boundary: bool
+    #: ``non_graph`` only when the raw model ID is the observed UINT32_MAX
+    #: sentinel; ``graph`` when a real model ID exists; ``missing`` otherwise.
+    model_id_state: str = "missing"
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def start_us(self) -> float | None:
+        if self.raw_start_ns is None:
+            return None
+        return (self.raw_start_ns - self.origin_ns) / NS_PER_US
+
+    @property
+    def end_us(self) -> float | None:
+        duration = self.duration_us
+        if duration is None or self.start_us is None:
+            return None
+        return self.start_us + duration
+
+    @property
+    def raw_end_us(self) -> float | None:
+        """Observed end even when the interval crosses the window boundary."""
+        if self.raw_end_ns is None:
+            return None
+        return (self.raw_end_ns - self.origin_ns) / NS_PER_US
+
+    @property
+    def duration_us(self) -> float | None:
+        if not self.duration_valid or self.raw_end_ns is None or self.raw_start_ns is None:
+            return None
+        return (self.raw_end_ns - self.raw_start_ns) / NS_PER_US
+
+    @property
+    def duration_valid(self) -> bool:
+        return (
+            self.raw_start_ns is not None
+            and self.raw_end_ns is not None
+            and self.raw_end_ns >= self.raw_start_ns
+            and not self.crosses_boundary
+        )
 
 
 @dataclass(frozen=True)
@@ -241,6 +344,62 @@ def _optional_int(raw: str | None) -> int | None:
         return int(float(text))
     except ValueError:
         return None
+
+
+def _sqlite_int(value: object) -> int | None:
+    """Use the SQLite integer storage class for exact identities and times."""
+    return value if type(value) is int else None
+
+
+def _identity_id(value: object) -> int | None:
+    """Return a real non-negative ID; sentinels and negatives are not identities."""
+    number = _sqlite_int(value)
+    if number is None or number < 0 or number >= _UINT32_MAX:
+        return None
+    return number
+
+
+def _task_type_for_name(name: str | None) -> TaskType:
+    if name is None:
+        return TaskType.UNKNOWN
+    text = name.strip().upper()
+    if not text:
+        return TaskType.UNKNOWN
+    if text.startswith("KERNEL_"):
+        return TaskType.KERNEL
+    if text.startswith("MEMCPY"):
+        return TaskType.MEMCPY
+    if "COMMUNICATION" in text or text.startswith("HCCL"):
+        return TaskType.COMMUNICATION
+    if any(token in text for token in ("WAIT", "EVENT", "NOTIFY", "SYNC")):
+        return TaskType.SYNC
+    return TaskType.OTHER
+
+
+def _capture_relative_path(path: object) -> str:
+    if not isinstance(path, str):
+        raise EventReadError("source_path 必须是字符串")
+    text = path.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    if (
+        not text
+        or text.startswith("/")
+        or (len(text) >= 2 and text[0].isalpha() and text[1] == ":")
+    ):
+        raise EventReadError(f"source_path 必须是 capture 相对路径: {path!r}")
+    logical = posixpath.normpath(text)
+    if logical in ("", ".", "..") or logical.startswith("../"):
+        raise EventReadError(f"source_path 不能逃逸 capture 根目录: {path!r}")
+    return logical
+
+
+def _task_columns(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute("pragma table_info(TASK)")
+        if len(row) > 1
+    }
 
 
 def _iter_op_rows(
@@ -475,6 +634,272 @@ def iter_task_spans(
     """Interval-only TASK view (timeline fallback)."""
     for start_us, duration_us in _iter_task_rows(db_path, window):
         yield Interval(start_us, start_us + duration_us)
+
+
+def task_relative_window(window: Window) -> tuple[Window, int]:
+    """Rebase an epoch-µs window onto integer-ns origin and return it in µs.
+
+    The integer ``origin_ns`` is exposed so callers can label a clock domain
+    without losing sub-µs precision.  ``round_spans`` are shifted by the same
+    origin; no rounding or rescaling is done here.
+    """
+    if not isinstance(window, Window):
+        raise TypeError("window must be a primitives.Window")
+    origin_ns = ns_from_us(window.start_us)
+    end_ns = ns_from_us(window.end_us)
+    relative_spans = tuple(
+        (
+            index,
+            (ns_from_us(start_us) - origin_ns) / NS_PER_US,
+            (ns_from_us(end_us) - origin_ns) / NS_PER_US,
+        )
+        for index, start_us, end_us in window.round_spans
+    )
+    relative = Window(
+        start_us=0.0,
+        end_us=(end_ns - origin_ns) / NS_PER_US,
+        rounds=window.rounds,
+        policy=window.policy,
+        provenance=window.provenance,
+        source=window.source,
+        round_spans=relative_spans,
+    )
+    return relative, origin_ns
+
+
+def iter_task_execution_events(
+    db_path: str | Path,
+    *,
+    capture_id: str,
+    source_path: str,
+    rank: int,
+    device_id: int,
+    stream_id: int,
+    window: Window,
+) -> Iterator[TaskExecutionEvent]:
+    """Stream one capture/device/stream's ``TASK`` rows intersecting a window.
+
+    The half-open window is ``[start, end)``.  Rows ending at ``start`` or
+    starting at ``end`` are excluded.  Every retained row is yielded, including
+    unknown task types, malformed durations and boundary crossers, so callers
+    cannot silently bridge across them.  Only the exact
+    :data:`TASK_SERIAL_TYPES` allow list can become a verified endpoint later.
+
+    ``source_path`` is the caller-supplied capture-relative logical path stored
+    in :class:`SourceReference`; ``db_path`` is the filesystem location used for
+    the read-only SQLite URI.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        raise EventReadError(f"{path}: 文件不存在")
+    if not isinstance(window, Window):
+        raise TypeError("window must be a primitives.Window")
+    if not isinstance(capture_id, str) or not capture_id.strip():
+        raise ValueError("capture_id must not be empty")
+    for name, value in (
+        ("rank", rank),
+        ("device_id", device_id),
+        ("stream_id", stream_id),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    logical_path = _capture_relative_path(source_path)
+
+    origin_ns = ns_from_us(window.start_us)
+    window_end_ns = ns_from_us(window.end_us)
+
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise EventReadError(f"{path}: 无法打开 sqlite: {exc}") from exc
+    try:
+        if not _has_table(connection, "TASK"):
+            raise EventReadError(f"{path}: 缺少 TASK 表")
+        columns = _task_columns(connection)
+        missing = [name for name in _TASK_REQUIRED_COLUMNS if name not in columns]
+        if missing:
+            raise EventReadError(f"{path}: TASK 缺少列 {', '.join(missing)}")
+
+        # Resolve STRING_IDS once per ID.  Duplicate IDs are ambiguous and stay
+        # unknown instead of taking an arbitrary first row or scanning per row.
+        type_names: dict[int, str | None] = {}
+        if _has_table(connection, "STRING_IDS"):
+            for id_value, total, value in connection.execute(
+                "select id, count(*), min(value) from STRING_IDS group by id"
+            ):
+                key = _sqlite_int(id_value)
+                if key is None or total != 1 or value is None:
+                    continue
+                text = str(value).strip()
+                type_names[key] = text or None
+
+        sql = (
+            "select t.rowid, t.startNs, t.endNs, t.deviceId, t.globalPid, "
+            "t.contextId, t.streamId, t.taskId, t.globalTaskId, t.modelId, "
+            "t.taskType from TASK t "
+            "where (t.deviceId = ? or typeof(t.deviceId) != 'integer' "
+            "       or t.deviceId < 0 or t.deviceId >= 4294967295) "
+            "and (t.streamId = ? or typeof(t.streamId) != 'integer' "
+            "     or t.streamId < 0 or t.streamId >= 4294967295) "
+            # A row whose start is inside the window is kept even when its end
+            # is broken (end <= window start), so it still acts as a barrier.
+            "and (typeof(t.startNs) != 'integer' or t.startNs < ?) "
+            "and (typeof(t.endNs) != 'integer' or t.endNs > ? "
+            "     or (t.startNs is not null and t.startNs >= ?)) "
+            "order by t.startNs, t.rowid"
+        )
+        rows = connection.execute(
+            sql,
+            (device_id, stream_id, window_end_ns, origin_ns, origin_ns),
+        )
+        for row in rows:
+            yield _task_execution_event(
+                row,
+                capture_id=capture_id.strip(),
+                source_path=logical_path,
+                rank=rank,
+                origin_ns=origin_ns,
+                window_end_ns=window_end_ns,
+                type_names=type_names,
+            )
+    except sqlite3.Error as exc:
+        raise EventReadError(f"{path}: 读取 TASK 失败: {exc}") from exc
+    finally:
+        connection.close()
+
+
+def _task_execution_event(
+    row: tuple[object, ...],
+    *,
+    capture_id: str,
+    source_path: str,
+    rank: int,
+    origin_ns: int,
+    window_end_ns: int,
+    type_names: dict[int, str | None],
+) -> TaskExecutionEvent:
+    from .schemas.critical_path import ActivityKind, ExecutionNode
+
+    rowid = _sqlite_int(row[0])
+    source = SourceReference(
+        kind="task_table", path=source_path, row=rowid if rowid is not None and rowid > 0 else None
+    )
+    raw_start_ns = _sqlite_int(row[1])
+    raw_end_ns = _sqlite_int(row[2])
+    row_device = _identity_id(row[3])
+    row_pid = _identity_id(row[4])
+    # contextId is a subgraph distinguishing field, not runtime Context identity.
+    # Keep the raw value, including the explicit UINT32_MAX "subgraph N/A" sentinel.
+    raw_context = _sqlite_int(row[5])
+    row_context = raw_context if raw_context is not None and raw_context >= 0 else None
+    row_stream = _identity_id(row[6])
+    task_id = _identity_id(row[7])
+    global_task_id = _identity_id(row[8])
+    raw_model_id = _sqlite_int(row[9])
+    if raw_model_id is None or raw_model_id < 0:
+        model_id = None
+        model_id_state = "missing"
+    elif raw_model_id == _UINT32_MAX:
+        model_id = None
+        model_id_state = "non_graph"
+    else:
+        model_id = raw_model_id
+        model_id_state = "graph"
+    type_id = _sqlite_int(row[10]) if len(row) > 10 else None
+    type_name = type_names.get(type_id) if type_id is not None else None
+
+    reasons: list[str] = []
+    if source.row is None:
+        reasons.append("invalid_source_row")
+    if raw_start_ns is None:
+        reasons.append("missing_start")
+    if raw_end_ns is None:
+        reasons.append("missing_end")
+    if (
+        raw_start_ns is not None
+        and raw_end_ns is not None
+        and raw_end_ns < raw_start_ns
+    ):
+        reasons.append("invalid_duration")
+    if row_device is None or row_device < 0:
+        reasons.append("invalid_device_id")
+    if row_stream is None or row_stream < 0:
+        reasons.append("invalid_stream_id")
+    if row_pid is None:
+        reasons.append("missing_global_pid")
+    if row_context is None:
+        reasons.append("missing_context_id")
+    if task_id is None:
+        reasons.append("missing_task_id")
+    if global_task_id is None:
+        reasons.append("missing_global_task_id")
+    if model_id_state == "missing":
+        reasons.append("missing_model_id")
+    elif model_id_state == "graph":
+        reasons.append("model_is_graph")
+    if type_name is None:
+        reasons.append("unknown_task_type")
+
+    crosses_boundary = False
+    in_window = False
+    if raw_start_ns is not None and raw_end_ns is not None:
+        crosses_boundary = (
+            raw_start_ns < origin_ns or raw_end_ns > window_end_ns
+        )
+        in_window = (
+            not crosses_boundary
+            and raw_start_ns >= origin_ns
+            and raw_end_ns <= window_end_ns
+            and raw_end_ns >= raw_start_ns
+        )
+        if crosses_boundary:
+            reasons.append("window_crossing")
+
+    node_duration_us: float | None = None
+    if (
+        raw_start_ns is not None
+        and raw_end_ns is not None
+        and raw_end_ns >= raw_start_ns
+        and not crosses_boundary
+    ):
+        node_duration_us = (raw_end_ns - raw_start_ns) / NS_PER_US
+
+    node: ExecutionNode | None = None
+    if raw_start_ns is not None and source.row is not None:
+        node = ExecutionNode(
+            capture_id=capture_id,
+            source=source,
+            activity=ActivityKind.DEVICE_TASK,
+            start_us=(raw_start_ns - origin_ns) / NS_PER_US,
+            duration_us=node_duration_us,
+            rank=rank,
+            stream_id=row_stream,
+            operator=None,
+            task_type=_task_type_for_name(type_name),
+        )
+
+    return TaskExecutionEvent(
+        capture_id=capture_id,
+        source=source,
+        node=node,
+        rank=rank,
+        device_id=row_device,
+        stream_id=row_stream,
+        global_pid=row_pid,
+        context_id=row_context,
+        task_id=task_id,
+        global_task_id=global_task_id,
+        model_id=model_id,
+        task_type_name=type_name,
+        task_type=_task_type_for_name(type_name),
+        raw_start_ns=raw_start_ns,
+        raw_end_ns=raw_end_ns,
+        origin_ns=origin_ns,
+        in_window=in_window,
+        crosses_boundary=crosses_boundary,
+        model_id_state=model_id_state,
+        reasons=tuple(reasons),
+    )
 
 
 def iter_host_spans(
