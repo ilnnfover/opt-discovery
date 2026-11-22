@@ -5,7 +5,7 @@ They assert *口径* (semantics) that were verified manually, not exact timings:
 machine-specific numbers are compared relatively or with a tolerance.
 
 Data root: ``$OPT_DISCOVERY_DATA_ROOT``（未设置时用相对路径，目录不存在则整组 skip）。
-期望布局: ``<root>/qwen35-prefill/PROF_*/mindstudio_profiler_output``。
+期望分组与目录名来自当前真实回归基线。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from opt_discovery.collectors.profiler_dir import profiler_sessions
 from opt_discovery.diagnosis.engine import DiagnosisEngine
 from opt_discovery.diagnosis.rules import RuleSet
 from opt_discovery.discovery.generator import opportunities_from_diagnosis
@@ -23,9 +24,12 @@ from opt_discovery.parsers.csv_mapping import CsvMapping, MappingCsvParser
 from opt_discovery.schemas.evidence import ConfidenceLevel
 from opt_discovery.schemas.operator import TaskType
 from opt_discovery.schemas.workload import WorkloadSpec
+from scripts.verify_real import expected_exports
 
 _DATA_ROOT = Path(os.environ.get("OPT_DISCOVERY_DATA_ROOT", "."))
-PROF_ROOT = _DATA_ROOT / "qwen35-prefill"
+_EXPORTS = expected_exports()
+PROF_ROOT = _DATA_ROOT / _EXPORTS["qwen35-35b-a3b-prefill-eager"]
+DECODE_ROOT = _DATA_ROOT / _EXPORTS["qwen35-35b-a3b-decode-eager"]
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 pytestmark = pytest.mark.skipif(
@@ -40,7 +44,7 @@ WORKLOAD = REPO_ROOT / "configs" / "workloads" / "qwen35-35b-a3b-910b" / "prefil
 
 def _all_prof_dirs() -> list[Path]:
     """磁盘上的全部 PROF_* 目录，包括没有任何输出的「空会话」。"""
-    return sorted(p for p in PROF_ROOT.glob("PROF_*") if p.is_dir())
+    return profiler_sessions(PROF_ROOT)
 
 
 def _rank_dirs() -> list[Path]:
@@ -381,16 +385,11 @@ def test_hotspot_shifts_between_eager_and_graph(bundles):
 from opt_discovery.parsers.sqlite_op_report import SqliteOpReportParser  # noqa: E402
 
 
-def test_sqlite_fallback_equals_exported_op_statistic():
+def test_sqlite_fallback_equals_exported_op_statistic(bundles):
     """rank0 同时有 CSV 和 sqlite：回填结果必须与导出完全一致，否则不能用它补 rank1。"""
-    from opt_discovery.parsers.csv_mapping import CsvMapping, MappingCsvParser
-
-    decode_root = _DATA_ROOT / "qwen35-decode"
-    if not decode_root.is_dir():
-        pytest.skip("qwen35-decode 导出不存在")
-    rank0 = sorted(decode_root.glob("PROF_*"))[0]
-
-    workload = WorkloadSpec.from_yaml(WORKLOAD)
+    bundle = bundles["qwen35-35b-a3b-decode-eager"]
+    rank0 = bundle.rank(0).directory
+    workload = bundle.workload
     parser = MappingCsvParser(CsvMapping.load(STATISTIC_MAPPING))
     csv_table = parser.parse(
         sorted((rank0 / "mindstudio_profiler_output").glob("op_statistic*.csv"))[0], workload
@@ -417,14 +416,12 @@ def test_sqlite_available_for_exported_ranks():
     与「缺 CSV 回填」分开：本用例在任何导出布局下都有意义，且用非空断言
     避免「循环没有匹配项也算通过」。
     """
-    decode_root = _DATA_ROOT / "qwen35-decode"
-    if not decode_root.is_dir():
-        pytest.skip("qwen35-decode 导出不存在")
+    if not DECODE_ROOT.is_dir():
+        pytest.skip("Decode Eager 导出不存在")
     exported = [
         prof
-        for prof in sorted(decode_root.glob("PROF_*"))
-        if prof.is_dir()
-        and list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+        for prof in profiler_sessions(DECODE_ROOT)
+        if list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
     ]
     assert exported, "应有至少一个带 op_statistic CSV 的 rank"
     for prof in exported:
@@ -440,14 +437,12 @@ def test_sqlite_fallback_fills_rank1_without_csv():
     此时显式 skip 并指向 CPU 回归（tests/regression/test_r05_rank_merge.py），
     不允许用「有 CSV 的 rank」冒充回填路径。
     """
-    decode_root = _DATA_ROOT / "qwen35-decode"
-    if not decode_root.is_dir():
-        pytest.skip("qwen35-decode 导出不存在")
+    if not DECODE_ROOT.is_dir():
+        pytest.skip("Decode Eager 导出不存在")
     candidates = [
         prof
-        for prof in sorted(decode_root.glob("PROF_*"))
-        if prof.is_dir()
-        and not list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
+        for prof in profiler_sessions(DECODE_ROOT)
+        if not list((prof / "mindstudio_profiler_output").glob("op_statistic*.csv"))
         and list(prof.glob("device_*/sqlite/op_counter.db"))
     ]
     if not candidates:

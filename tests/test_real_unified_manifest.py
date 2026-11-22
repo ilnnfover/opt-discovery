@@ -136,7 +136,7 @@ def test_manifest_identity_matches_checked_in_fixture(workload_id: str, bundles)
 
     bundle = bundles[workload_id]
     assert bundle.workload.verified is True
-    assert bundle.workload.labels.get("export_dir") == spec["export_dir"]
+    assert bundle.workload.labels.get("collection_run_id") == spec["run_id"]
     assert bundle.run_log is not None
     assert bundle.run_log.round_indices == tuple(FIXTURE["active_rounds"])
 
@@ -292,8 +292,8 @@ def test_host_acl_busy_union_matches_cann_api_window_scan(bundles) -> None:
     assert summary.host_acl_busy_us == pytest.approx(union_ns / 1000.0, abs=0.001)
 
 
-def test_decode_records_differ_but_deduped_bytes_are_comparable(bundles) -> None:
-    """两种 decode 模式：记录数随图合并骤降，去重字节量保持可比。"""
+def test_decode_task_counts_differ_but_deduped_bytes_are_comparable(bundles) -> None:
+    """验证新基线的重复 plane、图任务合并和两侧去重字节量。"""
     totals = {}
     for suffix in ("decode-eager", "decode-graph"):
         bundle = bundles[f"qwen35-35b-a3b-{suffix}"]
@@ -321,6 +321,7 @@ def test_decode_records_differ_but_deduped_bytes_are_comparable(bundles) -> None
 
     eager = totals["decode-eager"]
     graph = totals["decode-graph"]
-    assert eager.records > graph.records * 2
-    assert eager.records > eager.unique_tasks
+    assert eager.records == eager.unique_tasks
+    assert graph.records > graph.unique_tasks * 2
+    assert eager.unique_tasks > graph.unique_tasks * 2
     assert eager.bytes_total == pytest.approx(graph.bytes_total, rel=0.15)

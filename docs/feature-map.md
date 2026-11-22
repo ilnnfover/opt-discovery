@@ -22,7 +22,7 @@
 | 阈值标定 / 留出验证 | 独立：`calibrate`、`validate-thresholds`；组合：`analyze` 自动叠加覆盖文件 | `experiment/calibration.py`、`experiment/validation.py`、`diagnosis/thresholds.py` | `out/steady/*/operator_table.json` 与可选 `timeline.json`；规则 YAML；设备档案 JSON | 阈值覆盖 YAML（`--out`）、`threshold_validation.json`；`validate` 读取覆盖 | `tests/test_calibration.py`、`tests/test_validation.py`、`tests/regression/test_supplementary_gates.py` | 至少 3 个 Workload；设备档案标定门槛 12 样本；不足时 `insufficient_samples`，不猜值 |
 | Benchmark 执行 / 对比 | 独立：`bench`、`bench-compare` | `experiment/runner.py`、`experiment/analyzer.py` | `--harness` 脚本（打印 `ACTIVE_ROUND`）；两次 `benchmark.json` | `benchmark.json`、`bench_compare.json` | `tests/test_p0.py::test_run_benchmark_executes_stub_and_writes_json`、`test_compare_benchmarks_verdicts` | 真正执行 harness 需要模型/NPU 环境；`--print-only` 不执行 |
 | 报告 / 汇总 / 清单 | 独立：`report`、`summary`、`check-manifest` | `report/generator.py`、`report/summary_csv.py`、`experiment/run_manifest.py` | `analyze` 输出目录 + `run_manifest.json`（或显式 `--manifest`；旧目录需 `--allow-legacy`） | `report.md`、`workload_summary.csv`、`operator_summary.csv`；清单校验 stdout/退出码 | `tests/test_p0.py::test_summary_csv_matches_artifacts`、`tests/test_run_contract.py::test_downstream_summary_and_report_ignore_stale_artifacts` | CPU；默认拒绝无清单的旧目录扫描 |
-| 采集审计 | 独立：`check-collection`、`check-ranks` | `analyzer/collection_audit.py`、`analyzer/rank_quality.py` | 带采集清单的补采目录 / flat 或 `PROF/` 布局的单 Workload 导出 | stdout + 退出码（0/1/2）；`--out` 可写审计 JSON | `tests/test_collection_audit.py`、`tests/regression/test_r05_rank_merge.py`、`tests/test_real_unified_manifest.py` | 真实四组统一补采；缺数据为 `incomplete`/非零，不是 PASS |
+| 采集审计 | 独立：`check-collection`、`check-ranks` | `analyzer/collection_audit.py`、`analyzer/acceptance.py`、`analyzer/rank_quality.py` | 带清单、日志与实采双 rank 产物的目录；支持 flat 或 `PROF/` 布局 | stdout + 退出码（0/1/2）；`--out` 写参数审计，`--acceptance` 写产物验收，`--comparison` 核对比较来源 | `tests/test_collection_audit.py`、`tests/test_acceptance.py`、`tests/regression/test_r05_rank_merge.py`、`tests/test_real_unified_manifest.py` | 完整审计需要契约四组；提供的比较报告必须绑定本批采集 |
 | 合成流水线自测 | 独立：`demo` | `parsers/synthetic.py`、`diagnosis/engine.py`、`discovery/generator.py` | `--scenario`、Workload YAML | `<out>/<workload>/{operator_table,diagnosis,opportunities}.json` | `tests/test_pipeline.py::test_cli_demo_writes_outputs`、`test_rich_data_produces_candidates_and_opportunities` | CPU；**合成数据，不代表真实性能** |
 
 ## 2. 组合流程：`analyze` 实际做了什么
@@ -43,7 +43,7 @@
 | 条件 | 影响的命令 | 说明 |
 |---|---|---|
 | CPU-only | `validate`、`demo`、`parse-csv`、`parse-sqlite`、`rounds`、`diagnose`、`compare`、`check-runs`、`graph-coverage`、`source-map`、`report`、`summary`、`check-manifest`、`feedback`（有现成输入时）、`calibrate`/`validate-thresholds`（有现成表时）、`make check`、`make verify` | 不需要 NPU 或真实数据；`demo` 使用合成数据 |
-| 真实导出 | `timeline`、`comm`、`check-ranks`、`check-collection`、`analyze`、`make verify-real` | 根目录由 `OPT_DISCOVERY_DATA_ROOT` 指定；`verify_real.py` 缺数据必须 BLOCKED（直接脚本退出 2，Make 包装把任何非零折叠为 2），不是 PASS |
+| 真实导出 | `timeline`、`comm`、`check-ranks`、`check-collection`、`analyze`、`make verify-real` | 根目录由 `OPT_DISCOVERY_DATA_ROOT` 指定。真实回归使用 [11 月 21 日四组基线](../configs/collection_fixtures/qwen35-35b-a3b-910b-unified-20261121.json)，缺数据为 BLOCKED（直接脚本退出 2，Make 包装把任何非零折叠为 2） |
 | 外部源码 | `source-map`、`analyze --source-map` | 默认在当前目录找 `vllm-ascend`、`vllm`；也可用 `OPT_DISCOVERY_REPOS`（路径分隔符分隔）或 `--repos`；可选 binding 文件 |
 | MSTX | `timeline`、`analyze` 的同步归因 | 读取 `MsprofTx` 或 `MSTX_EVENTS` 的窗口内区间；枚举表和空表无打点证据 |
 | NPU / 模型 | `bench`（真实执行）、`feedback --validation` 引用真实实验产物 | 本轮不运行 NPU；未执行时验证摘要必须写 `NOT_RUN` 或 `BLOCKED`，不能写 PASS |

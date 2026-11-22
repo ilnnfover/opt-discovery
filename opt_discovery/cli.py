@@ -457,8 +457,8 @@ def cmd_check_collection(args: argparse.Namespace) -> int:
 
     comparison = getattr(args, "comparison", None)
     acceptance_path = getattr(args, "acceptance", None)
-    if comparison or acceptance_path:
-        acceptance = build_acceptance(args.dir, comparison)
+    acceptance = build_acceptance(args.dir, comparison)
+    if comparison or acceptance_path or acceptance.verdict == "fail":
         print(f"  [验收] verdict={acceptance.verdict}")
         for run in acceptance.runs:
             covered = ",".join(flag for flag, hit in run.metrics.items() if hit) or "none"
@@ -471,13 +471,15 @@ def cmd_check_collection(args: argparse.Namespace) -> int:
             for problem in run.problems:
                 print(f"      ! {problem}")
         print(f"    比较: {acceptance.comparison['status']}")
+        if error := acceptance.comparison.get("error"):
+            print(f"      ! {error}")
         if acceptance_path:
             target = write_json_file(acceptance_path, acceptance.to_dict())
             print(f"-> {target}")
-        # 报告存在阻断项时，退出码与审计结论取更严重的一侧
-        severity = {"pass": 0, "incomplete": 1, "fail": 2, "no_data": 2}
-        worst = max(severity[report.verdict], severity[acceptance.verdict])
-        code = {0: 0, 1: 2, 2: 1}[worst]
+    if acceptance.verdict in ("fail", "no_data"):
+        return 1
+    if acceptance_path and acceptance.verdict == "incomplete" and code == 0:
+        return 2
     return code
 
 

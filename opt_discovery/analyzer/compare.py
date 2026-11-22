@@ -31,7 +31,7 @@ from ..schemas.quality import (
     parse_meta_flags,
 )
 from ..schemas.workload import WorkloadSpec
-from .contract import GRAPH_ONLY_PARAMS, compare_contracts
+from .contract import GRAPH_ONLY_PARAMS, collection_identity, compare_contracts
 
 __all__ = ["OperatorDelta", "ComparisonReport", "compare_tables"]
 
@@ -82,6 +82,7 @@ class ComparisonReport:
     generated_at: str = ""
     #: 两侧表携带的质量标记（blocking 时 comparable 必为 False）
     quality_flags: tuple[QualityFlag, ...] = ()
+    collections: dict[str, dict[str, str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.generated_at:
@@ -97,6 +98,7 @@ class ComparisonReport:
             "warnings": list(self.warnings),
             "same_window": self.same_window,
             "window": self.window,
+            **({"collections": self.collections} if self.collections else {}),
             "total_a_us": self.total_a_us,
             "total_b_us": self.total_b_us,
             # 不可比时不得提供可直接引用的比值（保留两侧原始量）
@@ -325,6 +327,11 @@ def compare_tables(
         window=window_a if same_window else None,
         total_a_us=a.total_operator_time_us(),
         total_b_us=b.total_operator_time_us(),
+        collections={
+            side: identity
+            for side, table in (("a", a), ("b", b))
+            if (identity := collection_identity(table.meta.extra.get("collection"))) is not None
+        },
     )
     if not comparable:
         if blocking_flags:
