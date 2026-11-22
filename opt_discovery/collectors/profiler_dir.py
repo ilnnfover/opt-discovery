@@ -32,6 +32,8 @@ __all__ = [
     "ProfileBundle",
     "discover_bundle",
     "discover_all",
+    "resolve_export_dir",
+    "profiler_sessions",
     "inspect_ranks",
     "EXPORT_DIR_LABEL",
 ]
@@ -131,8 +133,8 @@ def discover_bundle(workload_path: str | Path, export_dir: str | Path | None = N
     return _build(workload, Path(export_dir))
 
 
-def inspect_ranks(export_dir: Path) -> tuple[tuple[RankExport, ...], dict[str, str]]:
-    """Select usable sessions per device for both collection checks and analysis."""
+def profiler_sessions(export_dir: Path) -> list[Path]:
+    """List raw sessions in either supported layout, including empty sessions."""
     if not export_dir.is_dir():
         raise ExportError(f"{export_dir}: 目录不存在")
     prof_dirs = sorted(p for p in export_dir.glob("PROF_*") if p.is_dir())
@@ -142,10 +144,14 @@ def inspect_ranks(export_dir: Path) -> tuple[tuple[RankExport, ...], dict[str, s
     prof_dirs = prof_dirs or nested
     if not prof_dirs:
         raise ExportError(f"{export_dir}: 未找到 PROF_* 导出目录")
+    return prof_dirs
 
+
+def inspect_ranks(export_dir: Path) -> tuple[tuple[RankExport, ...], dict[str, str]]:
+    """Select usable sessions per device for both collection checks and analysis."""
     by_rank: dict[int, RankExport] = {}
     excluded: dict[str, str] = {}
-    for position, prof_dir in enumerate(prof_dirs):
+    for position, prof_dir in enumerate(profiler_sessions(export_dir)):
         output = prof_dir / "mindstudio_profiler_output"
         device_dirs = sorted(path for path in prof_dir.glob("device_*") if path.is_dir())
         device = device_dirs[0].name if device_dirs else f"device_{position}"
@@ -198,22 +204,25 @@ def _read_manifest(path: Path) -> dict:
     return manifest
 
 
+def resolve_export_dir(capture_dir: Path, manifest: dict) -> Path:
+    relative = manifest.get("export_dir", ".")
+    if (
+        not isinstance(relative, str)
+        or Path(relative).is_absolute()
+        or not (capture_dir / relative).resolve().is_relative_to(capture_dir.resolve())
+    ):
+        path = capture_dir / COLLECTION_MANIFEST
+        raise ExportError(f"{path}: export_dir 必须指向本次采集目录内的路径")
+    return capture_dir / relative
+
+
 def _build(
     workload: WorkloadSpec, capture_dir: Path, manifest: dict | None = None
 ) -> ProfileBundle:
-    export_dir = capture_dir
     manifest_path = capture_dir / COLLECTION_MANIFEST
     if manifest is None and manifest_path.is_file():
         manifest = _read_manifest(manifest_path)
-    if manifest is not None:
-        relative = manifest.get("export_dir", ".")
-        if (
-            not isinstance(relative, str)
-            or Path(relative).is_absolute()
-            or not (capture_dir / relative).resolve().is_relative_to(capture_dir.resolve())
-        ):
-            raise ExportError(f"{manifest_path}: export_dir 必须指向本次采集目录内的路径")
-        export_dir = capture_dir / relative
+    export_dir = capture_dir if manifest is None else resolve_export_dir(capture_dir, manifest)
     ranks, excluded = inspect_ranks(export_dir)
     if not ranks:
         raise ExportError(f"{export_dir}: 未找到可用的 op_summary*.csv")

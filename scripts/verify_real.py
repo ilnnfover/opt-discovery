@@ -32,12 +32,18 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Sequence
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
-WORKLOAD_DIR = REPO_ROOT / "configs" / "workloads" / "qwen35-35b-a3b-910b"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from opt_discovery.collectors.profiler_dir import (  # noqa: E402
+    ExportError,
+    profiler_sessions,
+    resolve_export_dir,
+)
+
 MANIFEST_FIXTURE = (
-    REPO_ROOT / "configs" / "collection_fixtures" / "qwen35-35b-a3b-910b-unified-v1.json"
+    REPO_ROOT / "configs" / "collection_fixtures" / "qwen35-35b-a3b-910b-unified-20261121.json"
 )
 REAL_TESTS = (
     REPO_ROOT / "tests" / "test_real_data.py",
@@ -83,15 +89,8 @@ class TestRun:
 
 
 def expected_exports() -> dict[str, str]:
-    """workload_id -> labels.export_dir（四组统一补采的目录名）。"""
-    mapping: dict[str, str] = {}
-    for path in sorted(WORKLOAD_DIR.glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        label = (raw.get("labels") or {}).get("export_dir")
-        if not label:
-            continue
-        mapping[str(raw.get("workload_id") or path.stem)] = str(label)
-    return mapping
+    """Map workload IDs to the four entry names used by the active fixture."""
+    return {key: spec["export_dir"] for key, spec in load_manifest_fixture()["runs"].items()}
 
 
 def load_manifest_fixture(path: str | Path | None = None) -> dict:
@@ -119,6 +118,10 @@ def manifest_identity_problems(
     if manifest.get("run_id") != spec.get("run_id"):
         problems.append(
             f"run_id 期望 {spec.get('run_id')!r}，实际 {manifest.get('run_id')!r}"
+        )
+    if "started_at" in spec and manifest.get("started_at") != spec["started_at"]:
+        problems.append(
+            f"started_at 期望 {spec['started_at']!r}，实际 {manifest.get('started_at')!r}"
         )
     if manifest.get("contract_id") != data.get("contract_id"):
         problems.append(
@@ -203,7 +206,7 @@ def manifest_identity_problems(
 
 def rank_layout_problems(
     export_dir: str | Path,
-    manifest: Mapping,
+    manifest: dict,
     rank_sources: Mapping[str, str | Path],
 ) -> list[str]:
     """核对「发现的 rank 目录」与采集 manifest 声明的同 rank 源目录。
@@ -217,7 +220,11 @@ def rank_layout_problems(
     log_path = export / "workload.log"
     if not log_path.is_file():
         return [f"{export}: 缺 workload.log，无法定位真实采集目录"]
-    capture = log_path.resolve().parent
+    try:
+        capture = resolve_export_dir(log_path.resolve().parent, manifest)
+        sessions = {path.name: path.resolve() for path in profiler_sessions(capture)}
+    except (ExportError, OSError) as exc:
+        return [str(exc)]
 
     checks = manifest.get("checks") or {}
     declared = checks.get("ranks")
@@ -235,11 +242,10 @@ def rank_layout_problems(
         if not device or not isinstance(dir_name, str) or not dir_name:
             problems.append(f"rank 记录缺少 device/dir：{item!r}")
             continue
-        source = (capture / "PROF" / dir_name).resolve()
-        if not source.is_dir():
-            problems.append(
-                f"rank {device}: manifest 声明的源目录不存在 {capture / 'PROF' / dir_name}"
-            )
+        source = sessions.get(dir_name)
+        if source is None:
+            problems.append(f"rank {device}: manifest 声明的源目录不存在 {dir_name}")
+            continue
         expected.setdefault(device, []).append(source)
 
     for device, directory in sorted(rank_sources.items()):
@@ -275,31 +281,45 @@ def data_gaps(root: str | Path, *, expected: Mapping[str, str] | None = None) ->
         log_path = export / "workload.log"
         if not log_path.is_file():
             gaps.append(f"{workload}: 缺 workload.log")
-        else:
-            capture = log_path.resolve().parent
-            manifest_path = capture / "collection_manifest.json"
-            if not manifest_path.is_file():
-                gaps.append(f"{workload}: workload.log 同目录缺 collection_manifest.json")
-            else:
-                try:
-                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    payload = None
-                ranks = ((payload or {}).get("checks") or {}).get("ranks")
-                if isinstance(ranks, list):
-                    for item in ranks:
-                        if not isinstance(item, Mapping):
-                            continue
-                        dir_name = item.get("dir")
-                        if not isinstance(dir_name, str) or not dir_name:
-                            continue
-                        if not (capture / "PROF" / dir_name).is_dir():
-                            gaps.append(
-                                f"{workload}: manifest 声明的 rank 源目录缺失 {dir_name}"
-                            )
-        if not any(
-            export.glob("PROF_*/mindstudio_profiler_output/op_summary*.csv")
-        ):
+            continue
+        capture = log_path.resolve().parent
+        manifest_path = capture / "collection_manifest.json"
+        if not manifest_path.is_file():
+            gaps.append(f"{workload}: workload.log 同目录缺 collection_manifest.json")
+            continue
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        manifest = payload if isinstance(payload, dict) else {}
+        try:
+            sessions = {
+                path.name: path for path in profiler_sessions(resolve_export_dir(capture, manifest))
+            }
+        except (ExportError, OSError) as exc:
+            gaps.append(f"{workload}: {exc}")
+            continue
+        ranks = (manifest.get("checks") or {}).get("ranks")
+        minimums: dict[str, int] = {}
+        if isinstance(ranks, list):
+            for item in ranks:
+                if not isinstance(item, Mapping):
+                    continue
+                name = item.get("dir")
+                if isinstance(name, str) and name:
+                    count = item.get("op_summary_csv")
+                    minimums[name] = max(count, 1) if type(count) is int else 1
+        summary_counts = {
+            name: sum(item.is_file() for item in path.glob("mindstudio_profiler_output/op_summary*.csv"))
+            for name, path in sessions.items()
+        }
+        for name, minimum in sorted(minimums.items()):
+            count = summary_counts.get(name)
+            if count is None:
+                gaps.append(f"{workload}: manifest 声明的 rank 源目录缺失 {name}")
+            elif count < minimum:
+                gaps.append(f"{workload}: {name} 缺 op_summary*.csv，实际 {count}，期望 {minimum}")
+        if not minimums and not any(summary_counts.values()):
             gaps.append(f"{workload}: 无 op_summary*.csv（导出不完整）")
     return gaps
 

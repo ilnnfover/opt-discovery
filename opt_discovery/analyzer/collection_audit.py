@@ -23,7 +23,7 @@ DEFAULT_CONTRACT = (
     Path(__file__).resolve().parents[2] / "configs" / "collection_contract.yaml"
 )
 
-__all__ = ["AuditItem", "CollectionAudit", "audit_collection"]
+__all__ = ["AuditItem", "CollectionAudit", "audit_collection", "load_collection_runs"]
 
 ALLOWED_VARIABLES = {"mode", "graph_mode", "output_length"}
 
@@ -54,28 +54,23 @@ class CollectionAudit:
         }
 
 
-def _load_manifests(root: Path) -> list[dict]:
-    """扫描全部 manifest，同名 run 取时间最新的一份。
-
-    不依赖 collection_summary.json：分组重跑时 summary 只含最后一批，
-    审计仍必须覆盖全部四组。
-    """
-    paths = sorted(root.glob("*/collection_manifest.json"))
-    latest: dict[str, Path] = {}
+def load_collection_runs(root: Path) -> list[tuple[Path, dict]]:
+    """Select the latest directory per run ID for both audit and acceptance."""
+    direct = root / "collection_manifest.json"
+    paths = [direct] if direct.is_file() else sorted(root.glob("*/collection_manifest.json"))
+    latest: dict[str, tuple[Path, dict]] = {}
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        run_id = payload.get("run_id") or path.parent.name
-        key = str(run_id)
-        if key not in latest or path.parent.name > latest[key].parent.name:
-            latest[key] = path
-    return [json.loads(latest[key].read_text(encoding="utf-8")) for key in sorted(latest)]
+        key = str(payload.get("run_id") or path.parent.name)
+        latest[key] = (path.parent, payload)
+    return [latest[key] for key in sorted(latest)]
 
 
 def audit_collection(
     root: str | Path, contract_path: str | Path | None = None
 ) -> CollectionAudit:
     path = Path(root)
-    manifests = _load_manifests(path)
+    manifests = [payload for _, payload in load_collection_runs(path)]
     items: list[AuditItem] = []
     if not manifests:
         return CollectionAudit(

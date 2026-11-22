@@ -14,15 +14,24 @@ SITE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/mstx" && pwd)"
 mkdir -p -- "$(dirname -- "$DEST")"
 mkdir -- "$DEST"
 DEST="$(cd -- "$DEST" && pwd)"
+OFFLINE_EXPORT="$SITE/export_offline.sh"
+
+hint_offline_export() {
+    while IFS= read -r -d '' profile_dir; do
+        printf '  检测到 raw 数据，可离线导出。\n  bash %q %q --with-text\n' \
+            "$OFFLINE_EXPORT" "$profile_dir" >&2
+    done < <(find "$DEST" -type d -name 'PROF_*' -prune -print0)
+}
 
 PYTHONPATH="$SITE${PYTHONPATH:+:$PYTHONPATH}" VLLM_MSTX_PATCH=1 MSTX_TRACE_DIR="$DEST" \
     "$@" > "$DEST/workload.log" 2>&1 || {
         code=$?
         echo "采集失败（退出 $code），见 $DEST/workload.log" >&2
+        hint_offline_export
         exit "$code"
     }
 
-"${PYTHON:-python3}" - "$DEST" <<'PY'
+if "${PYTHON:-python3}" - "$DEST" <<'PY'
 import sqlite3
 import sys
 from contextlib import closing
@@ -42,3 +51,10 @@ if not found:
     print(f"{root}: 未找到带 MSTX_EVENTS 的数据库，请检查进程内 profiler 配置", file=sys.stderr)
     sys.exit(1)
 PY
+then
+    exit 0
+else
+    code=$?
+    hint_offline_export
+    exit "$code"
+fi

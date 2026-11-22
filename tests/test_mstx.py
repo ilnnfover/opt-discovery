@@ -182,3 +182,107 @@ def test_torch_mstx_ns_uses_table_schema_and_resolves_string_ids(tmp_path):
         12, 18, "sync_wait", 17, "python",
     )
     assert second.category == ""
+
+
+# ---------------------------------------------------------------------------
+# 打点挂点：vLLM-Ascend 用子类覆盖了前向，必须挂在 NPUWorker / NPUModelRunner 上
+# ---------------------------------------------------------------------------
+def test_mstx_targets_cover_ascend_worker_and_runner():
+    from scripts.mstx import sitecustomize as sc
+
+    modules = {item[0] for item in sc.TARGETS}
+    assert "vllm_ascend.worker.worker" in modules
+    assert "vllm_ascend.worker.model_runner_v1" in modules
+    labels = {item[3] for item in sc.TARGETS}
+    assert {"engine_step", "worker_execute", "execute_model"} <= labels
+
+
+def test_install_wraps_ascend_runner_once(monkeypatch):
+    import sys
+    import types
+
+    from scripts.mstx import sitecustomize as sc
+
+    calls = []
+
+    class Mstx:
+        def range_start(self, label, *args, **kwargs):
+            calls.append(("start", label))
+            return 1
+
+        def range_end(self, range_id, *args, **kwargs):
+            calls.append(("end", range_id))
+
+    fake_torch_npu = types.ModuleType("torch_npu")
+    fake_torch_npu.npu = types.SimpleNamespace(mstx=Mstx())
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+
+    # 用假 torch 顶替，避免测试真的初始化 NPU 运行时（进程退出时会段错误）
+    class _Stream:
+        def synchronize(self):
+            return None
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.npu = types.SimpleNamespace(Stream=_Stream, synchronize=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class NPUModelRunner:
+        def execute_model(self, value):
+            return value + 1
+
+    class NPUWorker:
+        def execute_model(self, value):
+            return value * 2
+
+    runner_module = types.ModuleType("vllm_ascend.worker.model_runner_v1")
+    runner_module.NPUModelRunner = NPUModelRunner
+    worker_module = types.ModuleType("vllm_ascend.worker.worker")
+    worker_module.NPUWorker = NPUWorker
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.model_runner_v1", runner_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.worker.worker", worker_module)
+    # 上游路径不装真包：缺类时 _install 必须静默跳过
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core", types.ModuleType("vllm.v1.engine.core"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", types.ModuleType("vllm"))
+
+    monkeypatch.setenv("VLLM_MSTX_PATCH", "1")
+    sc._install()
+
+    assert NPUWorker().execute_model(3) == 6
+    assert NPUModelRunner().execute_model(3) == 4
+    assert ("start", "worker_execute") in calls
+    assert ("start", "execute_model") in calls
+
+    sc._install()  # 幂等：不得重复包装
+    assert [c for c in calls if c == ("start", "worker_execute")] == [("start", "worker_execute")]
+
+
+def test_install_enables_modern_and_legacy_profiler_configs(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from scripts.mstx import sitecustomize as sc
+
+    class ModernConfig:
+        def __init__(self, mstx=False, export_type="text"):
+            self.mstx, self.export_type = mstx, export_type
+
+    class LegacyConfig:
+        def __init__(self, msprof_tx=False, export_type="text"):
+            self.msprof_tx, self.export_type = msprof_tx, export_type
+
+    monkeypatch.setattr(sc, "TARGETS", ())
+    monkeypatch.setattr(sc, "SYNC_TARGETS", ())
+    monkeypatch.setenv("VLLM_MSTX_PATCH", "1")
+    for config, flag in ((ModernConfig, "mstx"), (LegacyConfig, "msprof_tx")):
+        profiler = SimpleNamespace(_ExperimentalConfig=config, ExportType=SimpleNamespace(Db="db"))
+        monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+            npu=SimpleNamespace(mstx=object()),
+            profiler=profiler,
+        ))
+        sc._install()
+        sc._install()
+
+        value = config(False, ["text"])
+        assert getattr(value, flag) is True
+        assert value.export_type == ["text", "db"]
+        assert config(export_type="db").export_type == ["db"]

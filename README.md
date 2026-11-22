@@ -23,9 +23,9 @@ source .env.local              # 之后所有命令可直接用 $PROF_ROOT
 
 ```bash
 # 1) 一条命令跑完四组：解析 → 诊断 → 机会 → 热点矩阵 → 两两对比
-#    exports-root 下的目录名须与 workload YAML 的 labels.export_dir 一致
-python -m opt_discovery.cli analyze --exports-root $PROF_ROOT/unified-run \
-    --workloads-dir configs/workloads/qwen35-35b-a3b-910b --rounds 0-2 --out out/steady --source-map
+#    OPT_DISCOVERY_DATA_ROOT 指向含 decode-eager、decode-graph、prefill-eager、prefill-graph 的根目录
+python -m opt_discovery.cli analyze --exports-root "$OPT_DISCOVERY_DATA_ROOT" \
+    --workloads-dir configs/workloads/qwen35-35b-a3b-910b --out out/steady --source-map
 
 # 2) 看结果
 cat out/steady/report.md                     # 可读报告
@@ -33,8 +33,8 @@ column -s, -t out/steady/workload_summary.csv   # 每组一行
 column -s, -t out/steady/operator_summary.csv   # 每算子一行
 
 # 3) 单点排查（按需）
-python -m opt_discovery.cli timeline --export $PROF_ROOT/unified-run/qwen35-prefill \
-    --workload configs/workloads/qwen35-35b-a3b-910b/prefill_eager.yaml --rounds 0-2
+python -m opt_discovery.cli timeline --export "$OPT_DISCOVERY_DATA_ROOT/prefill-eager" \
+    --workload configs/workloads/qwen35-35b-a3b-910b/prefill_eager.yaml --rounds 0-3
 ```
 
 `analyze` 约 90 秒（decode 单窗口有 357 万条 Host 事件），产出：
@@ -195,19 +195,20 @@ ACL 覆盖描述主库 Host 活动与已分析设备空洞的时间重叠。图�
 Graph 下发与同步提示仅写入 workload 的 `diagnosis.json` 说明及 `timeline.json`。
 CANN_API 和 TASK 的 `connectionId` 无法提供可用的逐算子关联。
 
-PyTorch MSTX 需要在发出打点的进程中启用
-`torch_npu.profiler._ExperimentalConfig(mstx=True)`（旧版使用 `msprof_tx=True`），
-并启用 DB 导出。若由 vLLM-Ascend WorkerProfiler 启停采集，须在 worker 的配置中启用该开关。
-应用可以使用 `MSTX_TRACE_DIR` 作为 trace handler 的输出目录。
+用 `enable_mstx.sh` 启动配置了进程内 torch profiler 的 harness。补丁会挂到
+vLLM-Ascend 的 worker 和 runner，在 `_ExperimentalConfig` 中启用 MSTX 和 DB 导出。
+应用可以使用 `MSTX_TRACE_DIR` 作为 profiler 输出目录。
 [Ascend PyTorch Profiler](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/devaids/Profiling/atlasprofiling_16_0033.html)
 
 ```bash
 ./scripts/enable_mstx.sh /path/to/new-trace -- python /path/to/configured_harness.py
+./scripts/mstx/export_offline.sh /path/to/new-trace/rank_dir --with-text
 opt-discovery timeline --export /path/to/capture --workload configs/workloads/qwen35-35b-a3b-910b/decode_graph.yaml \
   --mstx-db /path/to/same-rank-trace/ascend_pytorch_profiler_0.db --out /path/to/timeline.json
 ```
 
-`enable_mstx.sh` 启动已配置的 harness 并检查是否导出实际 MSTX 记录。
+在线导出失败且保留 `PROF_*` 时，启动脚本会打印离线导出命令。离线导出会写入
+指定目录，对要保留的原始采集，可将该目录复制到工作目录后执行。
 独立库须来自同次采集的同一 rank，并有落在分析窗口内的有效区间。
 单独复跑的 MSTX trace 应按它自己的采集窗口审阅。
 
@@ -391,7 +392,14 @@ python -m opt_discovery.cli check-collection --dir $PROF_ROOT/unified
 
 脚本会：① 从 `$NPU_STACK` 复制 harness 并注入统一参数（**不改原文件**）；
 ② 串行采四组；③ 每组写 `collection_manifest.json`（契约 sha256、实际命令、环境变量清理、
-两 rank CSV 与轮数自检）。`check-collection` 据此判定 `pass/fail`，不再靠人工填 YAML 核对。
+两 rank CSV 与轮数自检）。`check-collection` 同时核对清单、磁盘上的双 rank 导出（含 CSV 分片数）
+和实采日志。
+Decode 每轮 token 必须等于契约的 `output_length`，Prefill 可只记录 sample。
+
+用 `--acceptance <JSON>` 保存产物验收，用 `--comparison <compare JSON>` 核对可比性和轮次窗口。
+比较报告会携带两侧算子表的采集身份（run ID、契约哈希、采集开始时间）。
+已有报告缺少采集身份时，可用本批次带采集信息的算子表重新执行 `compare --strict`。
+验收失败返回 1。缺少契约分组，或请求输出验收报告但没有提供比较报告时，返回 2。
 
 唯一允许不同的仍是自变量：`mode`、`graph_mode`、`output_length`。
 
@@ -482,8 +490,12 @@ python -m opt_discovery.cli validate     # 规则/阈值/Workload/列映射自�
 python -m opt_discovery.cli demo         # 合成数据跑通全链路（不代表真实性能）
 ```
 
-`verify-real` 需要设置 `OPT_DISCOVERY_DATA_ROOT` 指向四组统一补采的根目录；目录不全会
-直接 `BLOCKED`。判定基于 pytest 的 `--junitxml` 结构化计数（不解析文本摘要）：全部/部分用例
+`verify-real` 使用 [11 月 21 日真实回归基线](configs/collection_fixtures/qwen35-35b-a3b-910b-unified-20261121.json)。
+将 `OPT_DISCOVERY_DATA_ROOT` 指向包含 `decode-eager`、`decode-graph`、`prefill-eager`、
+`prefill-graph` 的目录。四个入口可以是指向实际采集目录的软链接。
+回归需要采集清单、日志、双 rank 的 `op_summary`、`op_statistic`、合并 DB 和
+`op_counter.db`。预检发现必要目录或导出缺失时会得到 `BLOCKED`。
+判定基于 pytest 的 `--junitxml` 结构化计数（不解析文本摘要）：全部/部分用例
 skip 时退出码为 3，未收集到用例或失败为 1，绝不把跳过显示为 PASS。CI 用
 `--expect-blocked` 断言「缺数据时必须 BLOCKED」（内部状态判定，与 pytest 退出码 2 解耦）。
 回归矩阵（历史问题 → 测试节点 → 独立预期）见 `docs/engineering/regression-matrix.md`。

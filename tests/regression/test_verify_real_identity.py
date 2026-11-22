@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from opt_discovery.schemas.workload import WorkloadSpec
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -30,6 +32,7 @@ def _valid_manifest(fixture: dict) -> dict:
     spec = fixture["runs"][WORKLOAD_ID]
     return {
         "run_id": spec["run_id"],
+        "started_at": spec["started_at"],
         "dataset_id": fixture["dataset_id"],
         "contract_id": fixture["contract_id"],
         "contract_sha256": fixture["collection_contract_sha256"],
@@ -67,6 +70,7 @@ def test_valid_manifest_has_no_identity_problems(fixture: dict) -> None:
     ("mutation", "expected"),
     [
         (("run_id", "decode-eager"), "run_id"),
+        (("started_at", "2026-11-21T06:15:43+00:00"), "started_at"),
         (("contract_id", "other-contract"), "contract_id"),
         (("contract_sha256", "0000000000000000"), "contract_sha256"),
         (("checks", {"ok": False, "active_rounds": 5}), "checks.ok"),
@@ -124,11 +128,11 @@ def test_complete_layout_has_no_gaps(tmp_path: Path) -> None:
     assert verify_real.data_gaps(tmp_path) == []
 
 
-def _make_capture(tmp_path: Path) -> tuple[Path, dict[str, str]]:
-    """临时采集根：``workload.log`` 与 ``PROF/PROF_*`` 两个 rank 源目录。"""
+def _make_capture(tmp_path: Path, *, layout: str = "PROF") -> tuple[Path, dict[str, str]]:
+    """临时采集根：日志和两个实采 rank 源目录。"""
     capture = tmp_path / "capture"
-    (capture / "PROF" / "PROF_a").mkdir(parents=True)
-    (capture / "PROF" / "PROF_b").mkdir(parents=True)
+    (capture / layout / "PROF_a").mkdir(parents=True)
+    (capture / layout / "PROF_b").mkdir(parents=True)
     (capture / "workload.log").write_text(
         "ACTIVE_ROUND 0 start 1.0 end 2.0\n", encoding="utf-8"
     )
@@ -147,11 +151,12 @@ def _rank_manifest(dirs: dict[str, str]) -> dict:
 
 
 @pytest.mark.parametrize("alias_log", [False, True])
+@pytest.mark.parametrize("layout", [".", "PROF"])
 def test_rank_layout_accepts_original_and_alias_capture(
-    tmp_path: Path, alias_log: bool
+    tmp_path: Path, alias_log: bool, layout: str
 ) -> None:
     """原目录和 alias（workload.log 指向临时采集根）都必须能绑定 rank 源。"""
-    capture, dirs = _make_capture(tmp_path)
+    capture, dirs = _make_capture(tmp_path, layout=layout)
     if alias_log:
         export = tmp_path / "export"
         export.mkdir()
@@ -160,11 +165,44 @@ def test_rank_layout_accepts_original_and_alias_capture(
         export = capture
 
     sources = {
-        device: capture / "PROF" / dir_name for device, dir_name in dirs.items()
+        device: capture / layout / dir_name for device, dir_name in dirs.items()
     }
     problems = verify_real.rank_layout_problems(export, _rank_manifest(dirs), sources)
 
     assert problems == [], problems
+
+
+@pytest.mark.parametrize("layout", [".", "PROF"])
+def test_preflight_requires_csv_for_each_declared_rank(tmp_path: Path, layout: str) -> None:
+    capture, dirs = _make_capture(tmp_path, layout=layout)
+    (capture / "collection_manifest.json").write_text(
+        json.dumps(_rank_manifest(dirs)), encoding="utf-8"
+    )
+    files = []
+    for directory in dirs.values():
+        csv = capture / layout / directory / "mindstudio_profiler_output" / "op_summary.csv"
+        csv.parent.mkdir()
+        csv.touch()
+        files.append(csv)
+    export = tmp_path / "prefill-eager"
+    export.symlink_to(capture, target_is_directory=True)
+    expected = {WORKLOAD_ID: export.name}
+    assert verify_real.data_gaps(tmp_path, expected=expected) == []
+
+    files[1].unlink()
+    assert any(
+        "PROF_b" in gap and "op_summary" in gap
+        for gap in verify_real.data_gaps(tmp_path, expected=expected)
+    )
+
+    files[1].touch()
+    manifest = _rank_manifest(dirs)
+    manifest["checks"]["ranks"][1]["op_summary_csv"] = 2
+    (capture / "collection_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert any(
+        "PROF_b" in gap and "期望 2" in gap
+        for gap in verify_real.data_gaps(tmp_path, expected=expected)
+    )
 
 
 def test_rank_layout_rejects_rank_symlink_to_another_group(tmp_path: Path) -> None:
@@ -221,5 +259,9 @@ def test_fixture_contains_only_logical_ids() -> None:
     text = verify_real.MANIFEST_FIXTURE.read_text(encoding="utf-8")
     payload = json.loads(text)
     assert not any(token in text for token in ("/root/", "PROF_", "\\", ":\\\\"))
-    assert payload["collection_contract_sha256"] == "c6edbf7bb2fddc3d"
-    assert set(payload["runs"]) == set(verify_real.expected_exports())
+    assert payload["collection_contract_sha256"] == "0f972be0b536df91"
+    workload_dir = REPO_ROOT / "configs" / "workloads" / "qwen35-35b-a3b-910b"
+    workloads = [WorkloadSpec.from_yaml(path) for path in sorted(workload_dir.glob("*.yaml"))]
+    assert {w.workload_id: w.labels["collection_run_id"] for w in workloads} == {
+        key: spec["run_id"] for key, spec in payload["runs"].items()
+    }

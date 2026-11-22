@@ -21,7 +21,9 @@ from typing import Any
 #: 只有 graph 模式才存在的采集参数；eager 侧缺失不算"未记录"
 GRAPH_ONLY_PARAMS = frozenset({"cudagraph_capture_sizes"})
 
-__all__ = ["ContractCheck", "ContractReport", "compare_contracts", "load_table_json"]
+__all__ = [
+    "ContractCheck", "ContractReport", "collection_identity", "compare_contracts", "load_table_json",
+]
 
 FAIL = "fail"
 WARN = "warn"
@@ -30,6 +32,19 @@ INFO = "info"
 
 #: 通信字节量允许的相对偏差（超出则说明通信工作量不同）
 COMM_BYTES_TOLERANCE = 0.25
+
+
+def collection_identity(metadata: object) -> dict[str, str] | None:
+    """Identify one capture, even across reruns of the same collection contract."""
+    if not isinstance(metadata, dict):
+        return None
+    identity = {}
+    for key in ("run_id", "contract_sha256", "started_at"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        identity[key] = value
+    return identity
 
 
 @dataclass(frozen=True)
