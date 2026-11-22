@@ -80,7 +80,7 @@ CodeBuddy（`deepseek-v4.1-flash`）实现 Schema 和测试。Codex 按真实样
 
 ## 13. 最终验收结论
 
-**PASS**。可观测性审计、Schema 契约、证据与质量约束、序列化、旧接口兼容性和 CPU 回归符合 CP-01 验收标准。四组双 Rank 历史基线回归仍为 **BLOCKED**，验证摘要保留该状态。
+**PASS**。可观测性审计、Schema 契约、证据与质量约束、序列化、旧接口兼容性和 CPU 回归符合 CP-01 验收标准。初验的四组双 Rank 回归为 **BLOCKED**，补齐输入后的结果见下文。
 
 ## 同步 PR #9 后复验
 
@@ -98,3 +98,7 @@ CodeBuddy（`deepseek-v4.1-flash`）实现 Schema 和测试。Codex 按真实样
 | `"$CP01_PYTHON" scripts/verify_summary.py --out out/cp01-sync-verified --real` | 2 | BLOCKED | 两项 CPU 检查通过，真实回归阻塞，`out/cp01-sync-verified/verification_summary.json` |
 
 两项真实探针核对命令复跑均退出 0。共 9 条 HostToDevice 关联通过原始证据复核，18 个节点及 9 条关联通过 JSON 往返。日志位于 `out/cp01-sync-review/`。同步后 CP-01 技术验收 **PASS**，Schema 变更须人工审阅后合并。
+
+收到四组双 Rank 导出后，复核了四组采集身份和八个合并 SQLite 的事件、通信与 MSTX 表结构。检查使用只读连接，详见[可观测性审计](observability-audit.md)。
+
+`OPT_DISCOVERY_DATA_ROOT="$CP01_DATA_ROOT" "$CP01_PYTHON" scripts/verify_summary.py --out out/cp01-sync-real --no-check --no-verify --real` 退出 **3，SKIPPED**。真实回归 28 通过、1 跳过、0 失败。跳过的是历史 Decode Eager Rank 缺 `op_summary` 时的 SQLite 回填场景，本批两个 Rank 都有 CSV。复核日志为 `out/cp01-sync-review/real-skip-reason.log`，真实回归摘要为 `out/cp01-sync-real/verification_summary.json`。CPU 结果保存在前一份摘要中。

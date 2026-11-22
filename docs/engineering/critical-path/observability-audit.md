@@ -2,7 +2,7 @@
 
 ## 审计边界
 
-源码基线为 `a67bf64`。直接只读检查本地忽略目录 `export_only_prof_dir/` 下三份 2026-11-15 单设备探针，包括合并 SQLite、CSV、Trace JSON 和辅助 SQLite。以下表格用合并 DB 文件名标识探针。三个 DB 的 `RANK_DEVICE_MAP` 均为 `(-1, 0)`，每份有 3 条任务且都在 Stream 47，属于未知分布式 Rank 的单设备样本。2026-11-21 四组双 Rank 回归使用[采集身份 fixture](../../../configs/collection_fixtures/qwen35-35b-a3b-910b-unified-20261121.json)，本机未发现该批原始导出且未配置 `OPT_DISCOVERY_DATA_ROOT`，该部分为 **BLOCKED**。已归档的分析 JSON 与 CPU fixture 只能说明既有契约和历史风险。
+源码基线为 `a67bf64`。直接只读检查本地忽略目录 `export_only_prof_dir/` 下三份 2026-11-15 单设备探针，包括合并 SQLite、CSV、Trace JSON 和辅助 SQLite。以下表格用合并 DB 文件名标识探针。三个 DB 的 `RANK_DEVICE_MAP` 均为 `(-1, 0)`，每份有 3 条任务且都在 Stream 47，属于未知分布式 Rank 的单设备样本。复审另只读检查了 2026-11-21 四组双 Rank 导出的合并 SQLite 表结构，八个导出对应的四份采集清单与[采集身份 fixture](../../../configs/collection_fixtures/qwen35-35b-a3b-910b-unified-20261121.json)一致。下文分别标注两批样本的证据范围。
 
 ## 当前事件与来源
 
@@ -19,6 +19,12 @@ PR #9 将 MSTX 采集、采集完整性检查和 2026-11-21 回归契约合入 `
 
 口径出处还包括 [profiler_dir.py](../../../opt_discovery/collectors/profiler_dir.py) 的分片/Rank 发现与 [op_summary 映射](../../../configs/parsers/)。`op_statistic` 和 SQLite `op_report` 是聚合表，只能用于既有算子分析。真实通信、Graph 覆盖与双 Rank 检查的测试契约见 [test_real_data.py](../../../tests/test_real_data.py) 和 [test_real_unified_manifest.py](../../../tests/test_real_unified_manifest.py)。
 
+### 四组双 Rank 导出的结构复核
+
+- 八个合并库均有 `TASK`、`CANN_API`、`COMMUNICATION_OP` 和 `COMMUNICATION_TASK_INFO`。MSTX 只有 `ENUM_MSTX_EVENT_TYPE`，合并库无区间表。`RANK_DEVICE_MAP` 提供设备编号 0/1，分布式 `rankId` 为 `-1`。
+- `STRING_IDS` 可见 `aclrtRecordEvent` 和 `aclrtStreamWaitEvent` 的名称。`CANN_API` 列没有事件句柄、代次或对应 Stream 字段，单凭名称与 `connectionId` 无法配对这两类调用。生产导出的 Host 提交关联基数本轮仍待逐记录验证。
+- 通信表提供 `groupName`、`opId`，任务表另有 `globalTaskId`、`notifyId`、`srcRank` 和 `dstRank`。这些是候选关联字段，本轮仅核对列的存在，尚无跨 Rank 唯一性、执行代次或消费者阻塞的证据。
+
 ## 依赖来源与验证结论
 
 | 依赖 | 证据与结论 |
@@ -27,7 +33,7 @@ PR #9 将 MSTX 采集、采集完整性检查和 2026-11-21 回归契约合入 `
 | 同 Stream 的执行顺序 | **样本内顺序已验证，普适约束 NOT_VERIFIED**。每份 Stream 47 的 3 个 TASK 有同一设备和进程范围，Task ID 随执行起点递增，区间互不重叠。CP-02 需在同采集/进程/设备/Rank/Stream 范围验证执行类型、FIFO 或顺序字段、非重叠和重复身份，再建有条件的顺序边。等时、重叠、未知通道身份或序号复用无法解决时记录 unresolved。 |
 | Record → Wait、跨 Stream 同步 | **unresolved**。API 名称可证实调用存在，缺事件句柄和代次、记录/等待端 Stream 及完成条件。MSTX range ID、名称、调用时长、时间邻接或重叠无法补足端点证据。任何跨 Stream 边都需显式可复核的关联键及语义。 |
 | Wait 返回/设备同步 → 后续活动 | **unresolved**。探针可见同步 API 但缺受等待对象及后继关系。Phase marker 只能界定观测范围。 |
-| 通信 → 消费者 / 跨 Rank Collective | **unresolved**。通信覆盖、未重叠时间以及按任务去重的字节属于观测量。缺 communicator、collective 序号、成员身份和消费者/完成同步信息，无法证明通信阻塞。 |
+| 通信 → 消费者 / 跨 Rank Collective | **unresolved**。通信覆盖、未重叠时间以及按任务去重的字节属于观测量。四组导出有候选关联字段，跨 Rank 键的作用域、collective 代次及消费者/完成同步关系仍未验证，无法证明通信阻塞。 |
 | Graph Replay 和内部依赖 | **NOT_VERIFIED**。探针没有有效 Model ID 或 replay 身份。Graph 记录会融合或收缩。算子名、Task ID 或 Model ID 单独不能标识 replay 实例。缺少逐 replay/capture 序号及内部映射时保留原始记录身份，未单独出现的节点留作不可观测。 |
 
 最小复核查询（每个合并库以 SQLite URI 的 `mode=ro` 打开），Trace 按 `cat=HostToDevice` 与相同 `id` 配对 `ph=s/f` 后用十进制做核对。
